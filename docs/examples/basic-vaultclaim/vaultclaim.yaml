@@ -1,0 +1,40 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultClaim
+metadata:
+  name: ec8a00
+  namespace: dlputi1u
+spec:
+  vaultConfigRef:
+    name: default
+
+  clusterRef:
+    name: ec8a00
+    # kubeconfigSecret подставится автоматически → "ec8a00-infra-kubeconfig"
+
+  secretsPrefix: clusters/ec8a00
+
+  auth:
+    mountPath: kubernetes-ec8a00
+    autoCreate: true
+    tokenReviewer:
+      serviceAccount:
+        namespace: beget-vault-system
+        name: vault-token-reviewer
+        autoCreate: true
+      ttl: 24h
+
+  policies:
+    - name: ec8a00-vmauth-reader
+      rules: |
+        path "secret/data/clusters/ec8a00/monitoring/vmauth/*" {
+          capabilities = ["read", "list"]
+        }
+
+  roles:
+    - name: vmauth-reader
+      boundServiceAccounts:
+        name: vmauth
+        namespace: monitoring
+      policies:
+        - ec8a00-vmauth-reader
+      tokenTTL: 1h

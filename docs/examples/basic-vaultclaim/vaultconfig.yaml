@@ -1,0 +1,12 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultConfig
+metadata:
+  name: default
+spec:
+  address: https://vault.beget.com:8200
+  managerAuth:
+    method: kubernetes
+    mountPath: kubernetes-mgmt
+    role: vault-operator
+  storage:
+    kvMountPath: secret
