@@ -111,6 +111,13 @@ func New(cfg Config) (*Client, error) {
 		if !pool.AppendCertsFromPEM(cfg.CABundle) {
 			return nil, fmt.Errorf("vault: CABundle does not contain valid PEM certificates")
 		}
+		nowFn := cfg.Now
+		if nowFn == nil {
+			nowFn = time.Now
+		}
+		if err := checkCABundleExpiry(cfg.CABundle, nowFn()); err != nil {
+			return nil, fmt.Errorf("vault: %w", err)
+		}
 		tlsCfg.RootCAs = pool
 	}
 
