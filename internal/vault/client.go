@@ -348,6 +348,9 @@ func (r *Response) Decode(v any) error {
 // *APIError without tripping; 5xx and transport errors trip the breaker.
 func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 	if !c.breaker.Allow() {
+		if le := c.breaker.LastError(); le != nil {
+			return nil, fmt.Errorf("%w: last error: %v", ErrCircuitOpen, le)
+		}
 		return nil, ErrCircuitOpen
 	}
 
@@ -356,7 +359,7 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		var err error
 		token, err = c.ensureToken(ctx)
 		if err != nil {
-			c.breaker.OnFailure()
+			c.breaker.OnFailure(err)
 			return nil, err
 		}
 	}
@@ -381,14 +384,14 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.StatusCode >= 500 {
-				c.breaker.OnFailure()
+				c.breaker.OnFailure(err)
 			} else {
 				// 4xx is success from the breaker's POV — Vault is reachable.
 				c.breaker.OnSuccess()
 			}
 			return nil, err
 		}
-		c.breaker.OnFailure()
+		c.breaker.OnFailure(err)
 		return nil, err
 	}
 

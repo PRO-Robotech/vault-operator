@@ -11,6 +11,7 @@ You may obtain a copy of the License at
 package vault
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -21,7 +22,7 @@ func TestCircuitBreaker_TripsAfterThreshold(t *testing.T) {
 		if !cb.Allow() {
 			t.Fatalf("call %d should be allowed", i)
 		}
-		cb.OnFailure()
+		cb.OnFailure(nil)
 	}
 	// Two failures, breaker should still be closed.
 	if cb.State() != StateClosed {
@@ -32,7 +33,7 @@ func TestCircuitBreaker_TripsAfterThreshold(t *testing.T) {
 	if !cb.Allow() {
 		t.Fatalf("third call should still be allowed (counting fails)")
 	}
-	cb.OnFailure()
+	cb.OnFailure(nil)
 	if cb.State() != StateOpen {
 		t.Fatalf("expected open after 3 failures, got %s", cb.State())
 	}
@@ -47,7 +48,7 @@ func TestCircuitBreaker_HalfOpenAfterWindow(t *testing.T) {
 	cb.now = func() time.Time { return now }
 
 	cb.Allow()
-	cb.OnFailure()
+	cb.OnFailure(nil)
 	if cb.State() != StateOpen {
 		t.Fatalf("expected open, got %s", cb.State())
 	}
@@ -84,13 +85,13 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 	cb.now = func() time.Time { return now }
 
 	cb.Allow()
-	cb.OnFailure()
+	cb.OnFailure(nil)
 
 	now = now.Add(2 * time.Minute)
 	if !cb.Allow() {
 		t.Fatalf("should allow half-open probe")
 	}
-	cb.OnFailure()
+	cb.OnFailure(nil)
 	if cb.State() != StateOpen {
 		t.Fatalf("expected re-open after half-open failure, got %s", cb.State())
 	}
@@ -103,7 +104,7 @@ func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
 	cb := NewCircuitBreaker(3, time.Minute)
 	for i := 0; i < 2; i++ {
 		cb.Allow()
-		cb.OnFailure()
+		cb.OnFailure(nil)
 	}
 	// Reset via success.
 	cb.Allow()
@@ -113,7 +114,7 @@ func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
 		if !cb.Allow() {
 			t.Fatalf("call %d after reset should be allowed", i)
 		}
-		cb.OnFailure()
+		cb.OnFailure(nil)
 	}
 	if cb.State() != StateClosed {
 		t.Fatalf("expected still closed after 2 failures post-reset, got %s", cb.State())
@@ -127,5 +128,33 @@ func TestCircuitBreaker_DefaultsApplied(t *testing.T) {
 	}
 	if cb.openWindow != DefaultBreakerOpenWindow {
 		t.Fatalf("expected default window %s, got %s", DefaultBreakerOpenWindow, cb.openWindow)
+	}
+}
+
+func TestCircuitBreaker_LastError(t *testing.T) {
+	cb := NewCircuitBreaker(2, time.Minute)
+	if got := cb.LastError(); got != nil {
+		t.Fatalf("LastError before any failure should be nil, got %v", got)
+	}
+
+	wantErr := errors.New("dial tcp: i/o timeout")
+	cb.Allow()
+	cb.OnFailure(wantErr)
+	if got := cb.LastError(); got != wantErr {
+		t.Fatalf("LastError after OnFailure: got %v, want %v", got, wantErr)
+	}
+
+	// Newer failure overwrites.
+	newer := errors.New("connection refused")
+	cb.Allow()
+	cb.OnFailure(newer)
+	if got := cb.LastError(); got != newer {
+		t.Fatalf("LastError should be the most recent: got %v, want %v", got, newer)
+	}
+
+	// Success clears it.
+	cb.OnSuccess()
+	if got := cb.LastError(); got != nil {
+		t.Fatalf("LastError after OnSuccess should be nil, got %v", got)
 	}
 }

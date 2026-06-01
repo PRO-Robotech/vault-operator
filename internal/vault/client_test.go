@@ -13,6 +13,7 @@ package vault
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -306,9 +307,9 @@ func TestClient_Do_5xxTripsBreaker(t *testing.T) {
 	if c.Breaker().State() != "open" {
 		t.Fatalf("breaker should trip after %d 5xx, got %s", DefaultBreakerFailureThreshold, c.Breaker().State())
 	}
-	// Next call short-circuits with ErrCircuitOpen.
+	// Next call short-circuits with ErrCircuitOpen wrapped around the last underlying error.
 	_, err := c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"})
-	if err != ErrCircuitOpen {
+	if !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("expected ErrCircuitOpen, got %v", err)
 	}
 }
