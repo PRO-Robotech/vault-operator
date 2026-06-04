@@ -1,0 +1,9 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: vault-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: vaultconfig-sample
+spec:
+  # TODO(user): Add fields here

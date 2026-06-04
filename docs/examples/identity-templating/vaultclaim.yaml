@@ -1,0 +1,50 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultClaim
+metadata:
+  name: ec8a00-shared
+  namespace: dlputi1u
+spec:
+  vaultConfigRef:
+    name: default
+
+  clusterRef:
+    name: ec8a00
+
+  secretsPrefix: clusters/ec8a00
+
+  auth:
+    mountPath: kubernetes-ec8a00
+    autoCreate: true
+    tokenReviewer:
+      serviceAccount:
+        namespace: beget-vault-system
+        name: vault-token-reviewer
+        autoCreate: true
+      ttl: 24h
+
+  policies:
+    # Один шаблон политики — namespace pod'а подставляется Vault'ом на login.
+    # Двойное экранирование: внешний {{ .AuthMountAccessor }} — Go-template
+    # оператора; внутренний {{`{{`}} ... {{`}}`}} → доезжает до Vault как
+    # {{ identity.entity.aliases.<accessor>.metadata.service_account_namespace }}.
+    - name: ec8a00-namespace-scoped
+      rules: |
+        path "secret/data/clusters/ec8a00/{{`{{`}} identity.entity.aliases.{{ .AuthMountAccessor }}.metadata.service_account_namespace {{`}}`}}/*" {
+          capabilities = ["read", "list"]
+        }
+
+  # По одной роли на каждый SA, который должен получить доступ к "своему" namespace.
+  # Все используют одну и ту же policy.
+  roles:
+    - name: namespace-reader-monitoring
+      boundServiceAccounts: { name: vmauth, namespace: monitoring }
+      policies: [ec8a00-namespace-scoped]
+      tokenTTL: 1h
+    - name: namespace-reader-billing
+      boundServiceAccounts: { name: svc, namespace: billing }
+      policies: [ec8a00-namespace-scoped]
+      tokenTTL: 1h
+    - name: namespace-reader-loki
+      boundServiceAccounts: { name: loki, namespace: observability }
+      policies: [ec8a00-namespace-scoped]
+      tokenTTL: 1h
