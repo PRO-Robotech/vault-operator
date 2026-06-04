@@ -112,12 +112,19 @@ spec:
                     type: string
                 type: object
               tls:
-                description: TLSSpec describes TLS settings for connecting to Vault.
+                description: |-
+                  TLSSpec describes TLS settings for connecting to Vault. At most one of
+                  caBundleSecretRef, caBundleConfigMapRef, or caBundleFile may be set; an empty
+                  spec uses the system CA pool.
                 properties:
-                  caBundleRef:
-                    description: LocalObjectRef references a Secret/ConfigMap (used
-                      for CA bundle, etc.).
+                  caBundleConfigMapRef:
+                    description: CABundleConfigMapRef references a ConfigMap containing
+                      the CA bundle.
                     properties:
+                      key:
+                        default: ca.crt
+                        minLength: 1
+                        type: string
                       name:
                         minLength: 1
                         type: string
@@ -128,9 +135,44 @@ spec:
                     - name
                     - namespace
                     type: object
+                  caBundleFile:
+                    description: |-
+                      CABundleFile is a filesystem path inside the operator pod where the CA
+                      bundle is mounted (e.g. via a volume from a cluster-wide CA Secret).
+                    type: string
+                  caBundleSecretRef:
+                    description: |-
+                      CABundleSecretRef references a Secret containing the CA bundle used to
+                      verify the Vault server certificate.
+                    properties:
+                      key:
+                        default: ca.crt
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  insecureSkipVerify:
+                    description: InsecureSkipVerify disables certificate verification.
+                      Dev only.
+                    type: boolean
                   serverName:
+                    description: ServerName overrides the hostname used in TLS SNI/verification.
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: at most one of caBundleSecretRef, caBundleConfigMapRef
+                    or caBundleFile may be set
+                  rule: '[has(self.caBundleSecretRef), has(self.caBundleConfigMapRef),
+                    (has(self.caBundleFile) && self.caBundleFile != '''')].filter(x,
+                    x).size() <= 1'
             required:
             - address
             type: object
