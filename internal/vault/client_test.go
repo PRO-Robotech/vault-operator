@@ -314,6 +314,115 @@ func TestClient_Do_5xxTripsBreaker(t *testing.T) {
 	}
 }
 
+// tripBreaker logs in and drives the breaker open via 5xx on sys/health.
+func tripBreaker(t *testing.T) *Client {
+	t.Helper()
+	fv := newFakeVault(t)
+	fv.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == pathHealth {
+			http.Error(w, `{"errors":["boom"]}`, http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	c := newTestClient(t, fv)
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	for i := 0; i < DefaultBreakerFailureThreshold; i++ {
+		_, _ = c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"})
+	}
+	if c.Breaker().State() != StateOpen {
+		t.Fatalf("expected breaker open, got %s", c.Breaker().State())
+	}
+	return c
+}
+
+// P2: AuthOptional probes bypass the breaker and don't reset it.
+func TestClient_Do_AuthOptionalBypassesOpenBreaker(t *testing.T) {
+	c := tripBreaker(t)
+
+	// seal-status (AuthOptional) still reaches Vault despite the open breaker.
+	ss, err := c.SealStatus(context.Background())
+	if err != nil {
+		t.Fatalf("seal-status should bypass the open breaker, got %v", err)
+	}
+	if ss == nil || ss.Sealed {
+		t.Fatalf("unexpected seal status: %+v", ss)
+	}
+
+	// A successful probe must not silently close the breaker guarding auth calls.
+	if c.Breaker().State() != StateOpen {
+		t.Fatalf("AuthOptional success must not close the breaker, got %s", c.Breaker().State())
+	}
+
+	// Authenticated calls remain short-circuited with the typed error.
+	_, err = c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"})
+	var co *CircuitOpenError
+	if !errors.As(err, &co) {
+		t.Fatalf("expected *CircuitOpenError, got %v", err)
+	}
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("CircuitOpenError must satisfy errors.Is(ErrCircuitOpen)")
+	}
+}
+
+// P1: short-circuit error carries LastErr + RetryAfter and says no request sent.
+func TestClient_Do_CircuitOpenErrorCarriesContext(t *testing.T) {
+	c := tripBreaker(t)
+
+	_, err := c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"})
+	var co *CircuitOpenError
+	if !errors.As(err, &co) {
+		t.Fatalf("expected *CircuitOpenError, got %v", err)
+	}
+	if co.LastErr == nil {
+		t.Fatalf("CircuitOpenError.LastErr should carry the tripping error")
+	}
+	if co.RetryAfter <= 0 || co.RetryAfter > DefaultBreakerOpenWindow {
+		t.Fatalf("RetryAfter should be within (0, window], got %s", co.RetryAfter)
+	}
+	if !strings.Contains(err.Error(), "no request sent") {
+		t.Fatalf("error should state no request was sent, got %q", err.Error())
+	}
+}
+
+// P3: a marshal error must not consume the half-open probe slot.
+func TestClient_Do_MarshalErrorDoesNotConsumeProbe(t *testing.T) {
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.Breaker().now = func() time.Time { return now }
+	for i := 0; i < DefaultBreakerFailureThreshold; i++ {
+		c.Breaker().Allow()
+		c.Breaker().OnFailure(errors.New("boom"))
+	}
+	if c.Breaker().State() != StateOpen {
+		t.Fatalf("expected breaker open, got %s", c.Breaker().State())
+	}
+
+	// Advance past the window so the next Allow() *would* admit the probe.
+	now = now.Add(DefaultBreakerOpenWindow + time.Second)
+
+	_, err := c.Do(context.Background(), &Request{
+		Method: http.MethodPost,
+		Path:   "sys/policies/acl/x",
+		Body:   make(chan int), // channels are not JSON-marshalable
+	})
+	if err == nil || !strings.Contains(err.Error(), "marshal request body") {
+		t.Fatalf("expected marshal error, got %v", err)
+	}
+
+	// Breaker must still be open — the marshal error didn't consume the probe slot.
+	if c.Breaker().State() != StateOpen {
+		t.Fatalf("breaker must stay open after a marshal error, got %s", c.Breaker().State())
+	}
+	if !c.Breaker().Allow() {
+		t.Fatalf("half-open probe should still be available after a marshal error")
+	}
+}
+
 func TestClient_ClearToken(t *testing.T) {
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)

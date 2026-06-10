@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // APIError represents a non-2xx HTTP response from Vault. The parsed Errors
@@ -72,3 +73,25 @@ var (
 	ErrCircuitOpen   = errors.New("vault circuit breaker is open")
 	ErrNotLoggedIn   = errors.New("vault client is not logged in")
 )
+
+// CircuitOpenError is returned when the breaker short-circuits a call before any
+// request is sent. LastErr is the stale error that tripped it; RetryAfter is the
+// time until the next probe. Unwraps to ErrCircuitOpen.
+type CircuitOpenError struct {
+	LastErr    error
+	RetryAfter time.Duration
+}
+
+func (e *CircuitOpenError) Error() string {
+	if e.LastErr != nil {
+		return fmt.Sprintf("%s (no request sent; next probe in %s): last error: %v",
+			ErrCircuitOpen.Error(), e.RetryAfter.Round(time.Second), e.LastErr)
+	}
+	return fmt.Sprintf("%s (no request sent; next probe in %s)",
+		ErrCircuitOpen.Error(), e.RetryAfter.Round(time.Second))
+}
+
+func (e *CircuitOpenError) Unwrap() error { return ErrCircuitOpen }
+
+// IsCircuitOpen reports whether err is, or wraps, a breaker short-circuit.
+func IsCircuitOpen(err error) bool { return errors.Is(err, ErrCircuitOpen) }

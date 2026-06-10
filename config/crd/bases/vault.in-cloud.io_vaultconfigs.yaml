@@ -171,7 +171,7 @@ spec:
                 - message: at most one of caBundleSecretRef, caBundleConfigMapRef
                     or caBundleFile may be set
                   rule: '[has(self.caBundleSecretRef), has(self.caBundleConfigMapRef),
-                    (has(self.caBundleFile) && self.caBundleFile != '''')].filter(x,
+                    (has(self.caBundleFile) && size(self.caBundleFile) > 0)].filter(x,
                     x).size() <= 1'
             required:
             - address

@@ -82,10 +82,13 @@ type StorageSpec struct {
 	KvMountPath string `json:"kvMountPath,omitempty"`
 }
 
+// CEL below uses size(self.caBundleFile) > 0, not an empty-string literal:
+// gofmt rewrites a single-quote pair in doc comments into a curly quote.
+
 // TLSSpec describes TLS settings for connecting to Vault. At most one of
 // caBundleSecretRef, caBundleConfigMapRef, or caBundleFile may be set; an empty
 // spec uses the system CA pool.
-// +kubebuilder:validation:XValidation:rule="[has(self.caBundleSecretRef), has(self.caBundleConfigMapRef), (has(self.caBundleFile) && self.caBundleFile != '')].filter(x, x).size() <= 1",message="at most one of caBundleSecretRef, caBundleConfigMapRef or caBundleFile may be set"
+// +kubebuilder:validation:XValidation:rule="[has(self.caBundleSecretRef), has(self.caBundleConfigMapRef), (has(self.caBundleFile) && size(self.caBundleFile) > 0)].filter(x, x).size() <= 1",message="at most one of caBundleSecretRef, caBundleConfigMapRef or caBundleFile may be set"
 type TLSSpec struct {
 	// CABundleSecretRef references a Secret containing the CA bundle used to
 	// verify the Vault server certificate.

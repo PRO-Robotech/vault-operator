@@ -121,6 +121,36 @@ func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
 	}
 }
 
+func TestCircuitBreaker_RetryAfter(t *testing.T) {
+	cb := NewCircuitBreaker(1, time.Minute)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cb.now = func() time.Time { return now }
+
+	// Closed: nothing pending.
+	if d := cb.RetryAfter(); d != 0 {
+		t.Fatalf("closed breaker RetryAfter should be 0, got %s", d)
+	}
+
+	// Trip it; the full window remains.
+	cb.Allow()
+	cb.OnFailure(errors.New("boom"))
+	if d := cb.RetryAfter(); d != time.Minute {
+		t.Fatalf("just-opened RetryAfter should be the full window, got %s", d)
+	}
+
+	// Partway through the window.
+	now = now.Add(20 * time.Second)
+	if d := cb.RetryAfter(); d != 40*time.Second {
+		t.Fatalf("RetryAfter should be 40s, got %s", d)
+	}
+
+	// Past the window: a probe is due now.
+	now = now.Add(time.Minute)
+	if d := cb.RetryAfter(); d != 0 {
+		t.Fatalf("elapsed-window RetryAfter should be 0, got %s", d)
+	}
+}
+
 func TestCircuitBreaker_DefaultsApplied(t *testing.T) {
 	cb := NewCircuitBreaker(0, 0)
 	if cb.failureThreshold != DefaultBreakerFailureThreshold {

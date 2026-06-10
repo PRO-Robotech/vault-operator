@@ -124,6 +124,20 @@ func (b *CircuitBreaker) LastError() error {
 	return b.lastErr
 }
 
+// RetryAfter reports the time until the next half-open probe; zero when not open.
+func (b *CircuitBreaker) RetryAfter() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != stateOpen {
+		return 0
+	}
+	remaining := b.openWindow - b.now().Sub(b.openedAt)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 const (
 	StateClosed   = "closed"
 	StateOpen     = "open"
