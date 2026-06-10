@@ -22,6 +22,7 @@ import (
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
+	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
 
 // stepResolveConfigAndLogin (Step 1, OPERATOR-SPEC §4.1): resolves VaultConfig,
@@ -70,8 +71,12 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	state.Vault = vc
 
 	if err := vc.Login(ctx); err != nil {
+		reason := "LoginFailed"
+		if vault.IsCircuitOpen(err) {
+			reason = ReasonCircuitOpen
+		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			"LoginFailed", err.Error())
+			reason, err.Error())
 		return Proceed, fmt.Errorf("vault login: %w", err)
 	}
 

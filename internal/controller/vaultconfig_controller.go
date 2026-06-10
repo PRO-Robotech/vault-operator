@@ -212,11 +212,12 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 
 	if err := vc.Login(ctx); err != nil {
 		logger.Error(err, "vault login failed")
+		reason, requeue := classifyVaultErr(err, "LoginFailed")
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionManagerLoggedIn, metav1.ConditionFalse, cfg.Generation,
-			"LoginFailed", err.Error())
+			reason, err.Error())
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionSharedMountFound, metav1.ConditionUnknown, cfg.Generation,
-			"LoginFailed", "skipped: login required")
-		return ctrl.Result{RequeueAfter: RequeueUnreachable}
+			reason, "skipped: login required")
+		return ctrl.Result{RequeueAfter: requeue}
 	}
 	setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionManagerLoggedIn, metav1.ConditionTrue, cfg.Generation,
 		"LoggedIn", "manager-auth login succeeded")
@@ -230,9 +231,10 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 				"Forbidden", "operator lacks read access to sys/mounts")
 			return ctrl.Result{RequeueAfter: RequeueHealthy}
 		}
+		reason, requeue := classifyVaultErr(err, "ProbeFailed")
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionSharedMountFound, metav1.ConditionFalse, cfg.Generation,
-			"ProbeFailed", err.Error())
-		return ctrl.Result{RequeueAfter: RequeueUnreachable}
+			reason, err.Error())
+		return ctrl.Result{RequeueAfter: requeue}
 	}
 	if !exists {
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionSharedMountFound, metav1.ConditionFalse, cfg.Generation,

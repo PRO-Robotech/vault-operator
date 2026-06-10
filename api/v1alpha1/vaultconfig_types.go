@@ -30,12 +30,26 @@ const VaultConfigFinalizer = "vault.in-cloud.io/vaultconfig-finalizer"
 // AuthMethodKubernetes is the only supported manager auth method in v1alpha1.
 const AuthMethodKubernetes = "kubernetes"
 
-// LocalObjectRef references a Secret/ConfigMap (used for CA bundle, etc.).
-type LocalObjectRef struct {
+// SecretKeySelector references a Secret and a specific key within it.
+type SecretKeySelector struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 	// +kubebuilder:validation:MinLength=1
 	Namespace string `json:"namespace"`
+	// +kubebuilder:default=ca.crt
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key,omitempty"`
+}
+
+// ConfigMapKeySelector references a ConfigMap and a specific key within it.
+type ConfigMapKeySelector struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
+	// +kubebuilder:default=ca.crt
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key,omitempty"`
 }
 
 // ManagerAuthSpec describes how the operator authenticates to Vault. This
@@ -68,13 +82,35 @@ type StorageSpec struct {
 	KvMountPath string `json:"kvMountPath,omitempty"`
 }
 
-// TLSSpec describes TLS settings for connecting to Vault.
-type TLSSpec struct {
-	// +optional
-	CABundleRef *LocalObjectRef `json:"caBundleRef,omitempty"`
+// CEL below uses size(self.caBundleFile) > 0, not an empty-string literal:
+// gofmt rewrites a single-quote pair in doc comments into a curly quote.
 
+// TLSSpec describes TLS settings for connecting to Vault. At most one of
+// caBundleSecretRef, caBundleConfigMapRef, or caBundleFile may be set; an empty
+// spec uses the system CA pool.
+// +kubebuilder:validation:XValidation:rule="[has(self.caBundleSecretRef), has(self.caBundleConfigMapRef), (has(self.caBundleFile) && size(self.caBundleFile) > 0)].filter(x, x).size() <= 1",message="at most one of caBundleSecretRef, caBundleConfigMapRef or caBundleFile may be set"
+type TLSSpec struct {
+	// CABundleSecretRef references a Secret containing the CA bundle used to
+	// verify the Vault server certificate.
+	// +optional
+	CABundleSecretRef *SecretKeySelector `json:"caBundleSecretRef,omitempty"`
+
+	// CABundleConfigMapRef references a ConfigMap containing the CA bundle.
+	// +optional
+	CABundleConfigMapRef *ConfigMapKeySelector `json:"caBundleConfigMapRef,omitempty"`
+
+	// CABundleFile is a filesystem path inside the operator pod where the CA
+	// bundle is mounted (e.g. via a volume from a cluster-wide CA Secret).
+	// +optional
+	CABundleFile string `json:"caBundleFile,omitempty"`
+
+	// ServerName overrides the hostname used in TLS SNI/verification.
 	// +optional
 	ServerName string `json:"serverName,omitempty"`
+
+	// InsecureSkipVerify disables certificate verification. Dev only.
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
 }
 
 // VaultConfigSpec is the cluster-scoped Vault connection. One VaultConfig

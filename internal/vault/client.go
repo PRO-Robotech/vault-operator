@@ -111,6 +111,13 @@ func New(cfg Config) (*Client, error) {
 		if !pool.AppendCertsFromPEM(cfg.CABundle) {
 			return nil, fmt.Errorf("vault: CABundle does not contain valid PEM certificates")
 		}
+		nowFn := cfg.Now
+		if nowFn == nil {
+			nowFn = time.Now
+		}
+		if err := checkCABundleExpiry(cfg.CABundle, nowFn()); err != nil {
+			return nil, fmt.Errorf("vault: %w", err)
+		}
 		tlsCfg.RootCAs = pool
 	}
 
@@ -344,55 +351,67 @@ func (r *Response) Decode(v any) error {
 	return json.Unmarshal(r.Body, v)
 }
 
-// Do issues a Vault request through the circuit breaker. 4xx propagates as
-// *APIError without tripping; 5xx and transport errors trip the breaker.
+// Do issues a Vault request through the circuit breaker: 4xx propagates without
+// tripping, 5xx and transport errors trip it. AuthOptional probes bypass it.
 func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
-	if !c.breaker.Allow() {
-		return nil, ErrCircuitOpen
-	}
-
-	var token string
-	if !req.AuthOptional {
-		var err error
-		token, err = c.ensureToken(ctx)
-		if err != nil {
-			c.breaker.OnFailure()
-			return nil, err
-		}
-	}
-
-	path := "/v1/" + strings.TrimLeft(req.Path, "/")
-	if len(req.Query) > 0 {
-		path += "?" + req.Query.Encode()
-	}
-
+	// Marshal before the breaker so a marshal error can't consume the probe slot.
 	var body []byte
 	if req.Body != nil {
-		var err error
-		body, err = json.Marshal(req.Body)
+		b, err := json.Marshal(req.Body)
 		if err != nil {
-			// Marshal errors are caller bugs; don't trip the breaker.
 			return nil, fmt.Errorf("marshal request body: %w", err)
+		}
+		body = b
+	}
+
+	if req.AuthOptional { // reachability probes stay callable; never trip the breaker
+		return c.send(ctx, req, body, "")
+	}
+
+	if !c.breaker.Allow() {
+		return nil, &CircuitOpenError{
+			LastErr:    c.breaker.LastError(),
+			RetryAfter: c.breaker.RetryAfter(),
 		}
 	}
 
-	respBody, err := c.doRaw(ctx, req.Method, path, body, token)
+	token, err := c.ensureToken(ctx)
+	if err != nil {
+		c.breaker.OnFailure(err)
+		return nil, err
+	}
+
+	resp, err := c.send(ctx, req, body, token)
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.StatusCode >= 500 {
-				c.breaker.OnFailure()
+				c.breaker.OnFailure(err)
 			} else {
 				// 4xx is success from the breaker's POV — Vault is reachable.
 				c.breaker.OnSuccess()
 			}
 			return nil, err
 		}
-		c.breaker.OnFailure()
+		c.breaker.OnFailure(err)
 		return nil, err
 	}
 
 	c.breaker.OnSuccess()
+	return resp, nil
+}
+
+// send issues the raw HTTP call with no breaker accounting; callers decide whether the outcome counts.
+func (c *Client) send(ctx context.Context, req *Request, body []byte, token string) (*Response, error) {
+	path := "/v1/" + strings.TrimLeft(req.Path, "/")
+	if len(req.Query) > 0 {
+		path += "?" + req.Query.Encode()
+	}
+
+	respBody, err := c.doRaw(ctx, req.Method, path, body, token)
+	if err != nil {
+		return nil, err
+	}
 	return &Response{StatusCode: http.StatusOK, Body: respBody}, nil
 }
 

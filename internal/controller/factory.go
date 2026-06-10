@@ -13,10 +13,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -90,24 +90,25 @@ func (f *DefaultVaultClientFactory) For(ctx context.Context, cli client.Client, 
 
 	var caBundle []byte
 	var serverName string
+	var insecure bool
 	if cfg.Spec.TLS != nil {
 		serverName = cfg.Spec.TLS.ServerName
-		if cfg.Spec.TLS.CABundleRef != nil {
-			bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS.CABundleRef)
-			if err != nil {
-				return nil, fmt.Errorf("load CA bundle: %w", err)
-			}
-			caBundle = bundle
+		insecure = cfg.Spec.TLS.InsecureSkipVerify
+		bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("load CA bundle: %w", err)
 		}
+		caBundle = bundle
 	}
 
 	vc, err := vault.New(vault.Config{
-		Address:    cfg.Spec.Address,
-		AuthPath:   cfg.Spec.ManagerAuth.MountPath,
-		Role:       cfg.Spec.ManagerAuth.Role,
-		JWTSource:  jwtSrc,
-		CABundle:   caBundle,
-		ServerName: serverName,
+		Address:            cfg.Spec.Address,
+		AuthPath:           cfg.Spec.ManagerAuth.MountPath,
+		Role:               cfg.Spec.ManagerAuth.Role,
+		JWTSource:          jwtSrc,
+		CABundle:           caBundle,
+		ServerName:         serverName,
+		InsecureSkipVerify: insecure,
 	})
 	if err != nil {
 		return nil, err
@@ -123,26 +124,40 @@ func (f *DefaultVaultClientFactory) Invalidate(name string) {
 	delete(f.entries, name)
 }
 
-// loadCABundle reads "ca.crt" from a Secret, falling back to a ConfigMap.
-func loadCABundle(ctx context.Context, cli client.Client, ref *vaultv1alpha1.LocalObjectRef) ([]byte, error) {
-	const key = "ca.crt"
-
-	secret := &corev1.Secret{}
-	if err := cli.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err == nil {
-		if data, ok := secret.Data[key]; ok && len(data) > 0 {
-			return data, nil
+// loadCABundle resolves the CA bundle from whichever source the spec selects.
+// Returns nil bytes (system CAs) if no source is set.
+func loadCABundle(ctx context.Context, cli client.Client, tls *vaultv1alpha1.TLSSpec) ([]byte, error) {
+	switch {
+	case tls.CABundleSecretRef != nil:
+		ref := tls.CABundleSecretRef
+		secret := &corev1.Secret{}
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
+			return nil, fmt.Errorf("get secret %s/%s: %w", ref.Namespace, ref.Name, err)
 		}
-		return nil, fmt.Errorf("secret %s/%s has no %q entry", ref.Namespace, ref.Name, key)
-	} else if !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("get secret %s/%s: %w", ref.Namespace, ref.Name, err)
-	}
+		data, ok := secret.Data[ref.Key]
+		if !ok || len(data) == 0 {
+			return nil, fmt.Errorf("secret %s/%s has no %q entry", ref.Namespace, ref.Name, ref.Key)
+		}
+		return data, nil
 
-	cm := &corev1.ConfigMap{}
-	if err := cli.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, cm); err != nil {
-		return nil, fmt.Errorf("get CA bundle from %s/%s: %w", ref.Namespace, ref.Name, err)
-	}
-	if data, ok := cm.Data[key]; ok && data != "" {
+	case tls.CABundleConfigMapRef != nil:
+		ref := tls.CABundleConfigMapRef
+		cm := &corev1.ConfigMap{}
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, cm); err != nil {
+			return nil, fmt.Errorf("get configmap %s/%s: %w", ref.Namespace, ref.Name, err)
+		}
+		data, ok := cm.Data[ref.Key]
+		if !ok || data == "" {
+			return nil, fmt.Errorf("configmap %s/%s has no %q entry", ref.Namespace, ref.Name, ref.Key)
+		}
 		return []byte(data), nil
+
+	case tls.CABundleFile != "":
+		data, err := os.ReadFile(tls.CABundleFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA bundle file %q: %w", tls.CABundleFile, err)
+		}
+		return data, nil
 	}
-	return nil, fmt.Errorf("configmap %s/%s has no %q entry", ref.Namespace, ref.Name, key)
+	return nil, nil
 }

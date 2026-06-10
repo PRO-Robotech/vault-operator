@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
+	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
 
 const (
@@ -81,12 +83,18 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 	for i, s := range steps {
 		res, err := s.fn(ctx, claim, state)
 		if err != nil {
-			logger.Info("pipeline step failed (transient, will retry)", "step", s.name, "error", err.Error())
+			// Short-circuit: requeue at the next probe, not the fixed step interval.
+			requeue := s.waitInterval
+			var co *vault.CircuitOpenError
+			if errors.As(err, &co) {
+				requeue = requeueForCircuit(co.RetryAfter)
+			}
+			logger.Info("pipeline step failed (will retry)", "step", s.name, "error", err.Error(), "requeueAfter", requeue.String())
 			if r.Recorder != nil {
 				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "StepRetrying",
 					"Step %s failed (transient): %v", s.name, err)
 			}
-			return ctrl.Result{RequeueAfter: s.waitInterval}
+			return ctrl.Result{RequeueAfter: requeue}
 		}
 		if res == Wait {
 			logger.V(1).Info("pipeline step waiting", "step", s.name)

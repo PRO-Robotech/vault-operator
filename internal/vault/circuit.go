@@ -43,6 +43,7 @@ type CircuitBreaker struct {
 	failures    int
 	openedAt    time.Time
 	probePinned bool
+	lastErr     error
 }
 
 // NewCircuitBreaker constructs a breaker. Zero values fall back to
@@ -92,11 +93,14 @@ func (b *CircuitBreaker) OnSuccess() {
 	b.failures = 0
 	b.state = stateClosed
 	b.probePinned = false
+	b.lastErr = nil
 }
 
-func (b *CircuitBreaker) OnFailure() {
+func (b *CircuitBreaker) OnFailure(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	b.lastErr = err
 
 	switch b.state {
 	case stateClosed:
@@ -110,6 +114,28 @@ func (b *CircuitBreaker) OnFailure() {
 		b.openedAt = b.now()
 		b.probePinned = false
 	}
+}
+
+// LastError returns the error that most recently tripped or hit the breaker.
+// Nil before the first OnFailure call. Safe for concurrent use.
+func (b *CircuitBreaker) LastError() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastErr
+}
+
+// RetryAfter reports the time until the next half-open probe; zero when not open.
+func (b *CircuitBreaker) RetryAfter() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != stateOpen {
+		return 0
+	}
+	remaining := b.openWindow - b.now().Sub(b.openedAt)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 const (
