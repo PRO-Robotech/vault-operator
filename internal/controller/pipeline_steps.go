@@ -25,7 +25,7 @@ import (
 	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
 
-// stepResolveConfigAndLogin (Step 1, OPERATOR-SPEC §4.1): resolves VaultConfig,
+// stepResolveConfigAndLogin (Step 1): resolves VaultConfig,
 // verifies it is Reachable + SharedMountFound, and refreshes the cached token.
 func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	configName := claim.Spec.VaultConfigRef.Name
@@ -71,7 +71,7 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	state.Vault = vc
 
 	if err := vc.Login(ctx); err != nil {
-		reason := "LoginFailed"
+		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
 		}
@@ -139,8 +139,8 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 }
 
 // stepIssueReviewerJWT (Step 4): rotates the reviewer JWT only when past the
-// 30%-of-TTL threshold (D9). JWT bytes are never persisted to status — only
-// timestamps (OPERATOR-SPEC §9.3).
+// 30%-of-TTL threshold. JWT bytes are never persisted to status — only
+// timestamps.
 func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}

@@ -95,6 +95,11 @@ test-e2e-pipeline: manifests generate fmt vet envtest ## Run pipeline e2e (envte
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1
 
+.PHONY: test-e2e-secret-pipeline
+test-e2e-secret-pipeline: manifests generate fmt vet envtest ## Run VaultSecretClaim e2e only (envtest k8s + `vault server -dev`). Skips if `vault` is not in PATH.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		go test -tags=e2e ./test/e2e_pipeline/... -run TestSecretPipelineE2E -v -count=1
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run
@@ -110,8 +115,9 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: manifests generate fmt vet ## Build manager binaries.
 	go build -o bin/manager cmd/main.go
+	go build -o bin/vault-secret-manager cmd/vaultsecret/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

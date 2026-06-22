@@ -94,4 +94,6 @@ func (e *CircuitOpenError) Error() string {
 func (e *CircuitOpenError) Unwrap() error { return ErrCircuitOpen }
 
 // IsCircuitOpen reports whether err is, or wraps, a breaker short-circuit.
-func IsCircuitOpen(err error) bool { return errors.Is(err, ErrCircuitOpen) }
+func IsCircuitOpen(err error) bool {
+	return errors.Is(err, ErrCircuitOpen)
+}

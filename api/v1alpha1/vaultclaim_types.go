@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Phase constants for VaultClaim lifecycle (OPERATOR-SPEC §9.1).
+// Phase constants for VaultClaim lifecycle.
 const (
 	PhasePending     = "Pending"
 	PhaseConfiguring = "Configuring"
@@ -23,7 +23,7 @@ const (
 	PhaseDeleting    = "Deleting"
 )
 
-// Condition type constants for VaultClaim (OPERATOR-SPEC §9.2).
+// Condition type constants for VaultClaim.
 const (
 	ConditionReady                 = "Ready"
 	ConditionConfigResolved        = "ConfigResolved"
@@ -152,13 +152,13 @@ type RoleSpec struct {
 
 // PolicySpec defines an ACL policy written as HCL into Vault. Names should
 // be prefixed with "{metadata.name}-" because Vault OSS policies live in a
-// global namespace (OPERATOR-SPEC §2.4).
+// global namespace.
 type PolicySpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-	// templating (OPERATOR-SPEC §10).
+	// templating.
 	// +kubebuilder:validation:MinLength=1
 	Rules string `json:"rules"`
 }

@@ -41,7 +41,7 @@ const (
 )
 
 // VaultConfigReconciler probes Vault health (seal-status → login → shared
-// mount), maintains conditions defined in OPERATOR-SPEC §2.5, tracks
+// mount), maintains health conditions, tracks
 // referencedBy, and cascade-reconciles dependent VaultClaims.
 type VaultConfigReconciler struct {
 	client.Client
@@ -49,6 +49,11 @@ type VaultConfigReconciler struct {
 	Recorder            record.EventRecorder
 	VaultFactory        VaultClientFactory
 	ClaimReconcilerName string
+
+	// VaultConfigOwner scopes which VaultConfigs this reconciler owns by the
+	// vault.in-cloud.io/owner label. Empty (or "vault-operator") owns label-less
+	// + vault-operator configs; "vault-secret" owns the secret operator's config.
+	VaultConfigOwner string
 }
 
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -69,6 +74,12 @@ func (r *VaultConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("get VaultConfig: %w", err)
+	}
+
+	// Ignore configs owned by the other operator process — a request can still
+	// arrive via a claim-cascade watch, so the gate lives in Reconcile.
+	if !ownerMatches(cfg.Labels[vaultv1alpha1.LabelVaultConfigOwner], r.VaultConfigOwner) {
+		return ctrl.Result{}, nil
 	}
 
 	if !cfg.DeletionTimestamp.IsZero() {
@@ -212,7 +223,7 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 
 	if err := vc.Login(ctx); err != nil {
 		logger.Error(err, "vault login failed")
-		reason, requeue := classifyVaultErr(err, "LoginFailed")
+		reason, requeue := classifyVaultErr(err, ReasonLoginFailed)
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionManagerLoggedIn, metav1.ConditionFalse, cfg.Generation,
 			reason, err.Error())
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionSharedMountFound, metav1.ConditionUnknown, cfg.Generation,
@@ -247,15 +258,26 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 	return ctrl.Result{RequeueAfter: RequeueHealthy}
 }
 
-// countReferences plain-lists VaultClaims and filters client-side: O(N) on
-// claim count, dwarfed by the Vault probe, and works without a field indexer
-// so uncached test clients pass.
+// countReferences plain-lists the owning claim type and filters client-side
 func (r *VaultConfigReconciler) countReferences(ctx context.Context, name string) (int32, error) {
+	var count int32
+	if r.VaultConfigOwner == vaultv1alpha1.OwnerVaultSecretOperator {
+		var claims vaultv1alpha1.VaultSecretClaimList
+		if err := r.List(ctx, &claims); err != nil {
+			return 0, fmt.Errorf("list VaultSecretClaims: %w", err)
+		}
+		for i := range claims.Items {
+			if claims.Items[i].Spec.VaultConfigRef.Name == name {
+				count++
+			}
+		}
+		return count, nil
+	}
+
 	var claims vaultv1alpha1.VaultClaimList
 	if err := r.List(ctx, &claims); err != nil {
 		return 0, fmt.Errorf("list VaultClaims: %w", err)
 	}
-	var count int32
 	for i := range claims.Items {
 		if claims.Items[i].Spec.VaultConfigRef.Name == name {
 			count++
@@ -272,15 +294,22 @@ func (r *VaultConfigReconciler) updateStatusIfChanged(ctx context.Context, cfg *
 }
 
 func (r *VaultConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.VaultConfig{}).
-		Watches(
+	b := ctrl.NewControllerManagedBy(mgr).
+		For(&vaultv1alpha1.VaultConfig{}, builder.WithPredicates(vaultConfigOwnerPredicate(r.VaultConfigOwner)))
+
+	if r.VaultConfigOwner == vaultv1alpha1.OwnerVaultSecretOperator {
+		b = b.Watches(
+			&vaultv1alpha1.VaultSecretClaim{},
+			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForSecretClaim),
+		)
+	} else {
+		b = b.Watches(
 			&vaultv1alpha1.VaultClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForClaim),
-			builder.WithPredicates(),
-		).
-		Named("vaultconfig").
-		Complete(r)
+		)
+	}
+
+	return b.Named("vaultconfig").Complete(r)
 }
 
 func (r *VaultConfigReconciler) findVaultConfigForClaim(_ context.Context, obj client.Object) []reconcile.Request {

@@ -40,7 +40,7 @@ type IssuedJWT struct {
 // --service-account-issuer). We therefore mint WITHOUT an explicit
 // audience override — TokenRequest will issue with the apiserver's default
 // audience, which the apiserver itself accepts. Setting Audiences=["vault"]
-// (a misreading of OPERATOR-SPEC §3.2) produces a JWT Vault stores happily
+// produces a JWT Vault stores happily
 // but the apiserver rejects with 401 during TokenReview → consumer pods
 // see "permission denied".
 func IssueReviewerJWT(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClaim) (*IssuedJWT, error) {
@@ -86,7 +86,7 @@ func IssueReviewerJWT(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.V
 }
 
 // ShouldRotateReviewerJWT returns true when the recorded reviewer JWT is past
-// the 30%-of-TTL freshness threshold (OPERATOR-SPEC D9), is missing, or has
+// the 30%-of-TTL freshness threshold, is missing, or has
 // expired. Pure function — pass time.Now in production, a fixed time in tests.
 func ShouldRotateReviewerJWT(status *vaultv1alpha1.TokenReviewerJWTStatus, now time.Time) bool {
 	if status == nil || status.IssuedAt == nil || status.ExpiresAt == nil {

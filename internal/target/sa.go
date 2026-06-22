@@ -93,7 +93,7 @@ func EnsureTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alp
 }
 
 // DeleteTokenReviewerSA removes the SA and CRB; the namespace is left alone
-// because it may host other resources. Best-effort (D12): NotFound is fine.
+// because it may host other resources. Best-effort: NotFound is fine.
 func DeleteTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClaim) error {
 	ref := claim.Spec.Auth.TokenReviewer.ServiceAccount
 	if ref.Namespace == "" || ref.Name == "" {

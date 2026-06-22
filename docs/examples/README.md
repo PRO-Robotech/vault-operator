@@ -6,6 +6,7 @@
 |--------|----------|
 | [basic-vaultclaim](basic-vaultclaim/) | Минимальная рабочая конфигурация: VaultConfig + один VaultClaim с одной policy и одной role |
 | [identity-templating](identity-templating/) | Одна policy, одна role-шаблон → доступ N namespace'ов через `{{ .AuthMountAccessor }}` |
+| [vaultsecretclaim](vaultsecretclaim/) | VaultSecretClaim: генерация паролей + копирование секретов в Vault (отдельный vault-secret-operator) |
 
 ## Как использовать примеры
 

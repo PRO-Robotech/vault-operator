@@ -27,7 +27,7 @@ import (
 )
 
 // templateAccessorVar must match the variable name Vault expects when policies
-// interpolate the auth-mount accessor (OPERATOR-SPEC §10).
+// interpolate the auth-mount accessor.
 const templateAccessorVar = ".AuthMountAccessor"
 
 func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {

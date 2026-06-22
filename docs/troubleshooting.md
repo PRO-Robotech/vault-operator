@@ -257,8 +257,95 @@ kubectl rollout restart deploy/vault-operator-controller-manager -n vault-operat
 
 ---
 
+## VaultSecretClaim
+
+`vault-secret-operator` — отдельный контроллер (наполнение Vault значениями). Диагностика та же — через conditions и события, но условия другие.
+
+```bash
+kubectl describe vaultsecretclaim -n <ns> <name>
+
+kubectl get vaultsecretclaim <name> -n <ns> \
+  -o jsonpath='{range .status.conditions[?(@.status=="False")]}{.type}: {.reason} — {.message}{"\n"}{end}'
+
+# Статусы по элементам:
+kubectl get vaultsecretclaim <name> -n <ns> \
+  -o jsonpath='{range .status.items[*]}{.name}: {.state} {.message}{"\n"}{end}'
+```
+
+### Phase=Pending — не дошли до записи
+
+| condition (False) | reason | причина | действие |
+|---|---|---|---|
+| `ConfigResolved` | `NotFound` | VaultConfig `vault-secret` не существует | создать VaultConfig (`examples/vaultsecretclaim/vaultconfig.yaml`) |
+| `ConfigResolved` | `VaultUnavailable` | у VaultConfig `Reachable=False` / `SharedMountFound=False` | `kubectl describe vaultconfig vault-secret` — смотрите его conditions |
+| `VaultReachable` | `LoginFailed` | секрет-оператор не вошёл в Vault | проверить role `vault-secret-operator` (binding на SA секрет-оператора) и policy `vault-secret-operator-admin` |
+| `VaultReachable` | `CircuitOpen` | breaker открыт после 5 ошибок | см. [Circuit breaker](#circuit-breaker); подождать 2 мин |
+
+> Если `VaultConfig vault-secret` вообще не реконсилится (нет conditions) — проверьте label `vault.in-cloud.io/owner: vault-secret`. Без него конфиг подхватывает `vault-operator`, а не секрет-процесс (owner-scoping).
+
+### Phase=Failed — запись не прошла
+
+| condition (False) | reason | причина | действие |
+|---|---|---|---|
+| `SourcesResolved` | `MissingSource` | для `copy` источник `source.path#source.key` отсутствует в Vault | завести источник (`vault kv put …`); до этого **ни один** элемент не пишется (all-or-nothing на pre-validate) |
+| `ItemsApplied` | `DuplicateDestination` | два элемента пишут в один `destination.path + key` | поправить spec — пара path+key уникальна в пределах CR |
+| `ItemsApplied` | `ApplyFailed` | хотя бы один элемент не записался | смотреть `status.items[].message` (часто 403 — недостаточно прав в `vault-secret-operator-admin`) |
+
+Поправьте причину — оператор повторит запись по событию обновления CR (или через RequeueAfter 1m).
+
+### Phase=Deleting (только при deletionPolicy: Purge)
+
+`Retain` (дефолт) снимает finalizer сразу. `Purge` сначала удаляет записанные ключи из Vault.
+
+#### Событие DeletionStuck
+
+```
+DeletionStuck: Purge requested but Vault is unavailable; retrying
+DeletionStuck: purge failed: vault DELETE ...: 403 ...
+```
+
+- **Vault недоступен** → починить Vault, оператор подхватит.
+- **Нет `delete`-права** → добавить в `vault-secret-operator-admin`:
+  ```hcl
+  path "secret/data/clusters/+/*"     { capabilities = ["delete"] }
+  path "secret/metadata/clusters/+/*" { capabilities = ["delete"] }
+  ```
+
+#### Аварийная разблокировка
+
+```bash
+kubectl patch vaultsecretclaim -n <ns> <name> --type=merge -p '{"metadata":{"finalizers":null}}'
+```
+
+> Оставит записанные значения в Vault как «orphan». Ручная чистка: `vault kv metadata delete secret/clusters/ec8a00/argocd`.
+
+### Часто задаваемые вопросы
+
+#### Значение не обновляется, хотя я поменял источник для copy
+
+`copy` перекопирует только при смене **значения** источника (детект по `hash(path+key+value)`). Сверьте `status.items[].sourceHash` — он должен поменяться. Изменение `destination` — это изменение spec, применяется по событию обновления CR.
+
+#### Сгенерированный пароль не меняется после редактирования CR
+
+`generate` работает **create-once**: значение перегенерируется только если ключа нет в Vault или сменились критерии (`length`/`charset`/`hash`). Намеренно — пароль уже прочитали consumer'ы. Чтобы форсировать новый — поменяйте критерий (например `length`) или удалите ключ в Vault.
+
+#### Секрет удалили в Vault руками — оператор не восстанавливает
+
+By design: reconcile событийный, без поллинга значений. Восстановление зависит от типа:
+
+- **generate** — тригерните reconcile (`kubectl annotate vaultsecretclaim <name> -n <ns> reconcile=$(date +%s) --overwrite`): ключа нет → перегенерируется, но **новым** значением (старое было случайным и невосстановимо — consumer'ы должны перечитать).
+- **copy** — обычный reconcile НЕ восстановит (источник не менялся → no-op по `sourceHash`). Восстановить: пересоздать CR (пустой статус → copy перекопирует) либо сменить значение источника.
+
+#### Consumer получает 403 на чтение записанного секрета
+
+Путь `destination` не покрыт consumer-policy. Эти policy пишет `VaultClaim` (`vault-operator`), а не секрет-оператор. Проверьте, что `secretsPrefix` у `VaultSecretClaim` совпадает с `VaultClaim.secretsPrefix`, и что в `VaultClaim` есть policy на `secret/data/clusters/{cluster}/{app}/*`.
+
+---
+
 ## Связанные документы
 
 - [Концепции / Pipeline](concepts/pipeline.md) — как шаги pipeline'а связаны с conditions
+- [Концепции / VaultSecretClaim](concepts/vaultsecretclaim.md) — генерация/копирование значений
+- [Развёртывание vault-secret-operator](user-guide/deploying-vault-secret-operator.md)
 - [user-guide/monitoring.md](user-guide/monitoring.md) — мониторинг и алёрты
 - [reference/api.md](reference/api.md) — все conditions и метрики

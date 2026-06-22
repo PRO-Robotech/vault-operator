@@ -1,0 +1,11 @@
+namespace: vault-secret-operator-system
+namePrefix: vault-secret-operator-
+
+resources:
+- manager.yaml
+- rbac.yaml
+
+images:
+- name: controller
+  newName: controller
+  newTag: latest

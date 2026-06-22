@@ -30,10 +30,10 @@ import (
 
 const RequeueDeletionStuck = 1 * time.Minute
 
-// handleDeletion drives the reverse pipeline (OPERATOR-SPEC §7.1): Roles →
+// handleDeletion drives the reverse pipeline: Roles →
 // Policies → AuthMethod → Target SA → finalizer. Vault-side failures keep
 // the finalizer + requeue (premature removal would orphan Vault objects).
-// Target cleanup is best-effort (D12).
+// Target cleanup is best-effort.
 func (r *VaultClaimReconciler) handleDeletion(ctx context.Context, claim *vaultv1alpha1.VaultClaim) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("vaultclaim", client.ObjectKeyFromObject(claim))
 
@@ -162,8 +162,8 @@ func policyNamesForDeletion(claim *vaultv1alpha1.VaultClaim) []string {
 	return out
 }
 
-// deleteTargetObjects best-effort cleans up the token-reviewer SA + CRB
-// (D12). Failures never block the finalizer — a missing kubeconfig Secret
+// deleteTargetObjects best-effort cleans up the token-reviewer SA + CRB.
+// Failures never block the finalizer — a missing kubeconfig Secret
 // or unreachable infra apiserver is preferable to leaving the VaultClaim
 // stuck in Deleting.
 func (r *VaultClaimReconciler) deleteTargetObjects(ctx context.Context, claim *vaultv1alpha1.VaultClaim) {

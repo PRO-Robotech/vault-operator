@@ -140,7 +140,7 @@ spec:
                   description: |-
                     PolicySpec defines an ACL policy written as HCL into Vault. Names should
                     be prefixed with "{metadata.name}-" because Vault OSS policies live in a
-                    global namespace (OPERATOR-SPEC §2.4).
+                    global namespace.
                   properties:
                     name:
                       minLength: 1
@@ -148,7 +148,7 @@ spec:
                     rules:
                       description: |-
                         Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-                        templating (OPERATOR-SPEC §10).
+                        templating.
                       minLength: 1
                       type: string
                   required:

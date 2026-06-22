@@ -50,7 +50,7 @@ type BootstrapConfig struct {
 //  1. Enable kubernetes auth at sys/auth/{ManagerAuthPath}.
 //  2. Write its config (kubernetes_host, kubernetes_ca_cert, token_reviewer_jwt).
 //  3. Write policy `vault-operator-admin` allowing the operator everything
-//     it needs (matches OPERATOR-SPEC §3.3 — namespace policy).
+//     it needs (namespace policy).
 //  4. Create role {ManagerRole} bound to (SABoundNames, SABoundNamespaces)
 //     with `vault-operator-admin` policy.
 func BootstrapVaultDev(ctx context.Context, srv *VaultDevServer, cfg BootstrapConfig) error {
@@ -73,7 +73,7 @@ func BootstrapVaultDev(ctx context.Context, srv *VaultDevServer, cfg BootstrapCo
 		return fmt.Errorf("write auth config: %w", err)
 	}
 
-	// 3. Write operator policy (matches OPERATOR-SPEC §3.3 exactly).
+	// 3. Write operator policy.
 	if err := vaultPut(ctx, srv, "/v1/sys/policies/acl/vault-operator-admin", map[string]string{
 		"policy": vaultOperatorAdminPolicy,
 	}); err != nil {
@@ -123,8 +123,8 @@ func EnsureKVMount(ctx context.Context, srv *VaultDevServer, mountPath string) e
 	return fmt.Errorf("shared KV mount %q not found in vault dev", mountPath)
 }
 
-// vaultOperatorAdminPolicy is the HCL body installed by step 3. Matches the
-// production policy from OPERATOR-SPEC §3.3.
+// vaultOperatorAdminPolicy is the HCL body installed by step 3 — the
+// production operator policy.
 //
 // Note on Vault glob syntax: `+` matches a WHOLE path segment (up to `/`),
 // NOT a partial match within a segment. So `sys/auth/kubernetes-+` does

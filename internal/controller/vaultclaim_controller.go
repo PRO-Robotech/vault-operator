@@ -37,8 +37,8 @@ import (
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 )
 
-// VaultClaimReconciler reconciles a VaultClaim through the pipeline described
-// in OPERATOR-SPEC §4.1. VaultFactory and TargetManager are injected so tests
+// VaultClaimReconciler reconciles a VaultClaim through its pipeline.
+// VaultFactory and TargetManager are injected so tests
 // can substitute fakes.
 type VaultClaimReconciler struct {
 	client.Client
