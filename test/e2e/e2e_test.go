@@ -276,7 +276,7 @@ var _ = Describe("Manager", Ordered, func() {
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 	})
 
-	Context("VaultClaim pipeline (Story 011)", Ordered, func() {
+	Context("VaultClaim pipeline", Ordered, func() {
 		const (
 			claimNS          = "default"
 			claimName        = "ec8a00"

@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -52,10 +53,13 @@ func (c *Client) DeletePolicy(ctx context.Context, name string) error {
 	return err
 }
 
+// ListPolicies uses GET ?list=true (the LIST operation) so the operator's
+// `list` capability on sys/policies/acl applies — a plain GET is a read.
 func (c *Client) ListPolicies(ctx context.Context) ([]string, error) {
 	resp, err := c.Do(ctx, &Request{
 		Method: http.MethodGet,
 		Path:   "sys/policies/acl",
+		Query:  url.Values{"list": []string{"true"}},
 	})
 	if err != nil {
 		return nil, err

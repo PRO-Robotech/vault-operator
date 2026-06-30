@@ -720,7 +720,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(got.Status.Vault.TokenReviewerJWT.LastRotationAttempt.Time).To(BeTemporally("==", fixedNow))
 	})
 
-	It("removes finalizer on deletion (Story 007 will implement reverse pipeline)", func() {
+	It("removes finalizer on deletion", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name
 		secretName := name + "-kc"

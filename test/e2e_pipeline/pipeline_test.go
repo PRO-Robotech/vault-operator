@@ -117,7 +117,10 @@ func TestPipelineE2E(t *testing.T) {
 	}
 
 	// Issue a JWT for the operator SA, audience = mgmtAuthPath login url.
-	operatorJWT, err := issueSAJWT(ctx, kc, operatorNS, operatorSA, []string{"vault"})
+	// Default audience (nil): Vault's TokenReview omits audiences, so envtest's
+	// apiserver validates against its default api-audiences. A custom "vault"
+	// audience would need matching apiserver --api-audiences + Vault config.
+	operatorJWT, err := issueSAJWT(ctx, kc, operatorNS, operatorSA, nil)
 	if err != nil {
 		t.Fatalf("issue operator SA JWT: %v", err)
 	}
@@ -346,29 +349,29 @@ func issueSAJWT(ctx context.Context, kc kubernetes.Interface, ns, name string, a
 // `target.ClusterManager` can parse. CertData/KeyData are inlined.
 func renderKubeconfig(cfg *rest.Config) ([]byte, error) {
 	type kubeconfigCluster struct {
-		Server                   string `yaml:"server"`
-		CertificateAuthorityData string `yaml:"certificate-authority-data,omitempty"`
-		InsecureSkipTLSVerify    bool   `yaml:"insecure-skip-tls-verify,omitempty"`
+		Server                   string `json:"server"`
+		CertificateAuthorityData string `json:"certificate-authority-data,omitempty"`
+		InsecureSkipTLSVerify    bool   `json:"insecure-skip-tls-verify,omitempty"`
 	}
 	type clusterEntry struct {
-		Name    string            `yaml:"name"`
-		Cluster kubeconfigCluster `yaml:"cluster"`
+		Name    string            `json:"name"`
+		Cluster kubeconfigCluster `json:"cluster"`
 	}
 	type userEntry struct {
-		Name string                 `yaml:"name"`
-		User map[string]interface{} `yaml:"user"`
+		Name string                 `json:"name"`
+		User map[string]interface{} `json:"user"`
 	}
 	type contextEntry struct {
-		Name    string                 `yaml:"name"`
-		Context map[string]interface{} `yaml:"context"`
+		Name    string                 `json:"name"`
+		Context map[string]interface{} `json:"context"`
 	}
 	type root struct {
-		APIVersion     string         `yaml:"apiVersion"`
-		Kind           string         `yaml:"kind"`
-		Clusters       []clusterEntry `yaml:"clusters"`
-		Users          []userEntry    `yaml:"users"`
-		Contexts       []contextEntry `yaml:"contexts"`
-		CurrentContext string         `yaml:"current-context"`
+		APIVersion     string         `json:"apiVersion"`
+		Kind           string         `json:"kind"`
+		Clusters       []clusterEntry `json:"clusters"`
+		Users          []userEntry    `json:"users"`
+		Contexts       []contextEntry `json:"contexts"`
+		CurrentContext string         `json:"current-context"`
 	}
 	user := map[string]interface{}{}
 	if len(cfg.CertData) > 0 {

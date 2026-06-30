@@ -1,0 +1,15 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultConfig
+metadata:
+  name: vault-secret
+  labels:
+    # Owner-scoping: этот VaultConfig реконсилит только vault-secret-operator.
+    vault.in-cloud.io/owner: vault-secret
+spec:
+  address: https://vault.testinfra.com:8200
+  managerAuth:
+    method: kubernetes
+    mountPath: kubernetes-mgmt
+    role: vault-secret-operator
+  storage:
+    kvMountPath: secret

@@ -2,4 +2,6 @@
 resources:
 - vault_v1alpha1_vaultclaim.yaml
 - vault_v1alpha1_vaultconfig.yaml
+- vault_v1alpha1_vaultsecretclaim.yaml
+- vault_v1alpha1_vaultconfig_secret.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

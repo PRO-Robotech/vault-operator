@@ -9,24 +9,21 @@ You may obtain a copy of the License at
 */
 
 // Package e2e_pipeline contains end-to-end tests that exercise the full
-// VaultClaim pipeline against a real `vault server -dev` instance plus envtest
-// k8s. Build-gated with `e2e` (run via `make test-e2e-pipeline`).
+// VaultClaim / VaultSecretClaim pipelines against a real `vault server -dev`
+// instance plus envtest k8s. Build-gated with `e2e`.
 //
 // These tests skip cleanly when the `vault` binary is not in PATH, so the
 // local dev workflow (`make test`) is unaffected.
 package e2e_pipeline
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"os/exec"
-	"regexp"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -41,28 +38,32 @@ type VaultDevServer struct {
 	// Addr is the http://127.0.0.1:PORT base URL of the Vault HTTP API.
 	Addr string
 
-	// RootToken is the dev-mode root token printed on stdout. Bootstrap helpers
-	// use it; the operator itself logs in as `vault-operator` once bootstrap
-	// is complete.
+	// RootToken is the dev-mode root token (set via -dev-root-token-id).
 	RootToken string
 }
 
-// NewVaultDevServer spawns `vault server -dev -dev-listen-address=127.0.0.1:0`
-// in the background and parses its stdout for the actual listen address and
-// root token. The function blocks until Vault reports it is unsealed (or
-// `startupTimeout` elapses).
-//
-// If the `vault` binary cannot be located in $PATH, an error wrapping
-// ErrVaultBinaryMissing is returned — callers should Skip the test rather
-// than fail.
+// devRootToken is fixed: each test spawns its own isolated Vault.
+const devRootToken = "root-e2e"
+
+// NewVaultDevServer spawns `vault server -dev` on a self-allocated port (Vault's
+// `-dev-listen-address=:0` reports a literal ":0" we can't parse back) with a
+// known root token, then waits until the API answers. A missing `vault` binary
+// returns an error wrapping ErrVaultBinaryMissing — callers should Skip.
 func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 	if _, err := exec.LookPath("vault"); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrVaultBinaryMissing, err)
 	}
 
+	port, err := freePort()
+	if err != nil {
+		return nil, fmt.Errorf("allocate vault port: %w", err)
+	}
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
 	cmd := exec.CommandContext(ctx, "vault", "server",
 		"-dev",
-		"-dev-listen-address=127.0.0.1:0",
+		"-dev-listen-address="+listenAddr,
+		"-dev-root-token-id="+devRootToken,
 	)
 	// Send Vault its own process group so we can kill the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -76,28 +77,18 @@ func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 		return nil, fmt.Errorf("start vault server: %w", err)
 	}
 
-	srv := &VaultDevServer{cmd: cmd, stdoutBuf: stdout, stderrBuf: stderr}
-
-	// Vault dev prints API address + root token to stdout. Wait for both.
-	const startupTimeout = 10 * time.Second
-	deadline := time.Now().Add(startupTimeout)
-	for time.Now().Before(deadline) {
-		if srv.parseStartupBanner() && srv.Addr != "" && srv.RootToken != "" {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if srv.Addr == "" || srv.RootToken == "" {
-		_ = srv.Close()
-		return nil, fmt.Errorf("vault did not announce listen address/root token within %s; stdout=%q stderr=%q",
-			startupTimeout, stdout.String(), stderr.String())
+	srv := &VaultDevServer{
+		cmd:       cmd,
+		stdoutBuf: stdout,
+		stderrBuf: stderr,
+		Addr:      "http://" + listenAddr,
+		RootToken: devRootToken,
 	}
 
-	// Probe the API until it responds. Some seconds may elapse between the
-	// banner and the listener actually accepting connections.
-	if err := srv.waitReady(ctx, 5*time.Second); err != nil {
+	const startupTimeout = 15 * time.Second
+	if err := srv.waitReady(ctx, startupTimeout); err != nil {
 		_ = srv.Close()
-		return nil, err
+		return nil, fmt.Errorf("vault dev not ready: %w; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
 	}
 	return srv, nil
 }
@@ -106,38 +97,16 @@ func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 // PATH. Test fixtures should `errors.Is` this and Skip rather than Fail.
 var ErrVaultBinaryMissing = errors.New("vault binary not found in PATH")
 
-var (
-	// Vault dev banner formats vary slightly across versions; match both
-	// "Api Address: http://..." and "API Address: http://..." plus the
-	// uppercase "Root Token:".
-	addrRegexp  = regexp.MustCompile(`(?i)Api Address:\s*(http[^\s]+)`)
-	tokenRegexp = regexp.MustCompile(`Root Token:\s*(\S+)`)
-)
-
-// parseStartupBanner scans the captured stdout for Vault's startup banner. It
-// is called repeatedly; once both fields are populated they stay set.
-func (s *VaultDevServer) parseStartupBanner() bool {
-	if s.Addr != "" && s.RootToken != "" {
-		return true
+// freePort asks the OS for an unused TCP port on loopback. There is a small
+// race between closing the probe listener and Vault binding it; acceptable for
+// single-host test fixtures.
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
 	}
-	r := bufio.NewReader(bytes.NewReader(s.stdoutBuf.Bytes()))
-	for {
-		line, err := r.ReadString('\n')
-		if s.Addr == "" {
-			if m := addrRegexp.FindStringSubmatch(line); len(m) == 2 {
-				s.Addr = strings.TrimRight(m[1], "/")
-			}
-		}
-		if s.RootToken == "" {
-			if m := tokenRegexp.FindStringSubmatch(line); len(m) == 2 {
-				s.RootToken = m[1]
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-	}
-	return s.Addr != "" && s.RootToken != ""
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // waitReady polls GET /v1/sys/seal-status until it returns 200, or the

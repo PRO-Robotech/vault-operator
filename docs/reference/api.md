@@ -2,9 +2,10 @@
 
 API group: `vault.in-cloud.io/v1alpha1`
 
-Два CRD:
+Три CRD:
 
-- [`VaultClaim`](#vaultclaim) — namespaced, per-cluster конфигурация
+- [`VaultClaim`](#vaultclaim) — namespaced, per-cluster конфигурация **доступа**
+- [`VaultSecretClaim`](#vaultsecretclaim) — namespaced, per-cluster наполнение Vault **значениями**
 - [`VaultConfig`](#vaultconfig) — cluster-scoped, подключение к Vault
 
 ---
@@ -82,6 +83,72 @@ API group: `vault.in-cloud.io/v1alpha1`
 ### Примеры
 
 См. [examples/basic-vaultclaim](../examples/basic-vaultclaim/) и [examples/identity-templating](../examples/identity-templating/).
+
+---
+
+## VaultSecretClaim
+
+| Поле | Scope | Описание |
+|---|---|---|
+| Kind | Namespaced | `vault.in-cloud.io/v1alpha1` |
+| Short name | `vsc` | `kubectl get vsc` |
+| Subresources | `status` | |
+| Print columns | Phase, Cluster, Age | |
+| Контроллер | `vault-secret-operator` | отдельный процесс/SA/роль с write-правом |
+
+### spec
+
+| Поле | Тип | Обязательно | Описание |
+|---|---|:---:|---|
+| `vaultConfigRef.name` | `string` | Да | VaultConfig с write-ролью (обычно `vault-secret`). Мутируемо. |
+| `clusterRef.name` | `string` | Да | Имя кластера. **Immutable.** |
+| `secretsPrefix` | `string` | Да | Базовый префикс per-cluster путей, e.g. `clusters/ec8a00`. == `VaultClaim.secretsPrefix`. **Immutable.** |
+| `deletionPolicy` | `enum` | Нет (default `Retain`) | `Retain` — значения остаются при удалении CR; `Purge` — удаляются. |
+| `secretList[].name` | `string` | Да | Уникальный идентификатор элемента в CR. |
+| `secretList[].type` | `enum` | Да | `generate` или `copy`. |
+| `secretList[].destination.mount` | `string` | Нет | Override `VaultConfig.storage.kvMountPath`. |
+| `secretList[].destination.path` | `string` | Да | Путь относительно `secretsPrefix`. |
+| `secretList[].destination.key` | `string` | Да | Ключ в secret'е. |
+| `secretList[].destination.hashedKey` | `string` | Нет | Куда класть хеш (при `generate.hash != none`). |
+| `secretList[].generate.length` | `int` | Нет (default `24`, min `8`) | Длина пароля (при `type=generate`). |
+| `secretList[].generate.charset` | `string` | Нет (default `[A-Za-z0-9]`) | Алфавит с range-сокращением `X-Y` (`a-zA-Z0-9`). |
+| `secretList[].generate.hash` | `enum` | Нет (default `none`) | `none` или `bcrypt`. |
+| `secretList[].source.path` | `string` | Да* | Путь источника (* при `type=copy`). |
+| `secretList[].source.key` | `string` | Да* | Ключ источника (* при `type=copy`). |
+| `secretList[].source.mount` | `string` | Нет | Override mount источника. |
+
+CEL: `type=generate` требует `generate` и запрещает `source` (и наоборот); `generate.length >= 8`; `secretList` ≥ 1; immutable `secretsPrefix` / `clusterRef.name`.
+
+### status
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `observedGeneration` | `int64` | Последнее обработанное `metadata.generation`. |
+| `phase` | `enum` | `Pending`, `Ready`, `Failed`, `Deleting`. |
+| `conditions[]` | `[]Condition` | См. ниже. |
+| `items[].name` | `string` | Идентификатор элемента. |
+| `items[].state` | `enum` | `Applied`, `Pending`, `Failed`. |
+| `items[].sourceHash` | `string` | Хеш входа для детекта изменений (само **значение** секрета НЕ хранится). |
+| `items[].lastAppliedAt` | `time` | Последняя запись в Vault. |
+| `items[].message` | `string` | Текст ошибки при `Failed`. |
+
+### Conditions VaultSecretClaim
+
+| Type | True значит | False значит |
+|---|---|---|
+| `ConfigResolved` | VaultConfig найден, `Reachable`/`SharedMountFound` | Не найден / Vault недоступен |
+| `VaultReachable` | Login в Vault прошёл | Login failed / circuit open |
+| `SourcesResolved` | Все источники `copy` существуют | Хотя бы один источник отсутствует |
+| `ItemsApplied` | Все элементы записаны | Дубликат destination или ошибка записи |
+| `Ready` | Все элементы применены | Любой шаг провалился или `Deleting` |
+
+### Финализатор
+
+`vault.in-cloud.io/vaultsecretclaim-finalizer`. При `Purge` сначала удаляет записанные ключи из Vault, затем снимает finalizer.
+
+### Примеры
+
+См. [examples/vaultsecretclaim](../examples/vaultsecretclaim/).
 
 ---
 
@@ -170,6 +237,15 @@ API group: `vault.in-cloud.io/v1alpha1`
 |---|---|---|
 | `DeletionBlocked` | Warning | Попытка удалить VaultConfig с `referencedBy > 0` |
 
+### VaultSecretClaim события
+
+| Reason | Type | Когда |
+|---|---|---|
+| `MissingSource` | Warning | Источник `copy` отсутствует в Vault (pre-validate) |
+| `DuplicateDestination` | Warning | Два элемента пишут в один `path + key` |
+| `ItemApplyFailed` | Warning | Элемент не записался |
+| `DeletionStuck` | Warning | `Purge` не смог удалить ключи (Vault недоступен / нет прав) |
+
 ## Метрики
 
 Все метрики Prometheus экспонируются через `/metrics` endpoint controller-runtime (защищён через `--metrics-secure`).
@@ -183,6 +259,8 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed` | Лайфцикл собственного `client_token` оператора |
 
 Подробнее — [user-guide/monitoring.md](../user-guide/monitoring.md).
+
+> **vault-secret-operator** собственных controller-метрик (`vaultsecretclaim_*`) не экспонирует. Доступны общие `vault_api_*` и `vault_client_token_renewal_total` (через тот же `internal/vault` клиент), а также `phase`/`conditions` через kube-state-metrics.
 
 ## Связанные документы
 

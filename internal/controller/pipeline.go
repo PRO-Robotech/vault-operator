@@ -58,7 +58,7 @@ type pipelineStep struct {
 
 // executePipeline runs the VaultClaim pipeline. When the claim was already
 // Ready and spec is unchanged, a drift check after Step 1 may short-circuit
-// Steps 2-7 (OPERATOR-SPEC §5.3).
+// Steps 2-7.
 func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vaultv1alpha1.VaultClaim) ctrl.Result {
 	logger := log.FromContext(ctx)
 	state := &pipelineState{}

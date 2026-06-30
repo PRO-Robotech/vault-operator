@@ -83,33 +83,7 @@ func (f *DefaultVaultClientFactory) For(ctx context.Context, cli client.Client, 
 		return entry.client, nil
 	}
 
-	jwtSrc := f.JWTSource
-	if jwtSrc == nil {
-		jwtSrc = vault.NewFileJWTSource("")
-	}
-
-	var caBundle []byte
-	var serverName string
-	var insecure bool
-	if cfg.Spec.TLS != nil {
-		serverName = cfg.Spec.TLS.ServerName
-		insecure = cfg.Spec.TLS.InsecureSkipVerify
-		bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("load CA bundle: %w", err)
-		}
-		caBundle = bundle
-	}
-
-	vc, err := vault.New(vault.Config{
-		Address:            cfg.Spec.Address,
-		AuthPath:           cfg.Spec.ManagerAuth.MountPath,
-		Role:               cfg.Spec.ManagerAuth.Role,
-		JWTSource:          jwtSrc,
-		CABundle:           caBundle,
-		ServerName:         serverName,
-		InsecureSkipVerify: insecure,
-	})
+	vc, err := buildVaultClient(ctx, cli, cfg, f.JWTSource)
 	if err != nil {
 		return nil, err
 	}

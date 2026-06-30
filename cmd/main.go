@@ -53,6 +53,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var pprofAddr string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -71,6 +72,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&pprofAddr, "pprof-bind-address", "127.0.0.1:8082",
+		"Address for the pprof/diagnostics endpoint. Bind to loopback so it is reachable only via "+
+			"`kubectl port-forward` (access gated by pods/portforward RBAC). Set \"\" or \"0\" to disable.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -132,6 +136,7 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "33d82d36.in-cloud.io",
+		PprofBindAddress:       pprofAddr,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -162,10 +167,11 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.VaultConfigReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		Recorder:     mgr.GetEventRecorderFor("vaultconfig-controller"),
-		VaultFactory: vaultFactory,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         mgr.GetEventRecorderFor("vaultconfig-controller"),
+		VaultFactory:     vaultFactory,
+		VaultConfigOwner: vaultv1alpha1.OwnerVaultOperator,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultConfig")
 		os.Exit(1)

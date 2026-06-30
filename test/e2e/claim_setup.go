@@ -88,7 +88,7 @@ func CreateClusterAdminSA(namespace, name string) (string, error) {
 // GrantAuthDelegator binds `system:auth-delegator` to the given SA via a
 // ClusterRoleBinding. Vault uses this SA's JWT to call TokenReview on each
 // pod login; without `system:auth-delegator` the apiserver denies the call
-// with 403 → Vault returns "permission denied" on /login (OPERATOR-SPEC §3.2).
+// with 403 → Vault returns "permission denied" on /login.
 func GrantAuthDelegator(saNamespace, saName, bindingName string) error {
 	manifest := fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

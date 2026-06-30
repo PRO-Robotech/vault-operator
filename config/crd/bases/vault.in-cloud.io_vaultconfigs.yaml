@@ -59,7 +59,7 @@ spec:
             description: |-
               VaultConfigSpec is the cluster-scoped Vault connection. One VaultConfig
               (typically "default") is referenced by many VaultClaims; multi-Vault is
-              supported via multiple named VaultConfigs (OPERATOR-SPEC §1.1, D13).
+              supported via multiple named VaultConfigs.
             properties:
               address:
                 description: |-
@@ -101,7 +101,7 @@ spec:
                 description: |-
                   StorageSpec describes the shared KV-v2 mount that holds all clusters'
                   secrets. The mount itself is deployed by the platform; the operator only
-                  writes policies referencing paths under it (OPERATOR-SPEC D2).
+                  writes policies referencing paths under it.
                 properties:
                   kvMountPath:
                     default: secret
@@ -254,8 +254,7 @@ spec:
                 format: int32
                 type: integer
               sealStatus:
-                description: SealStatus mirrors GET /v1/sys/seal-status (OPERATOR-SPEC
-                  §3.8).
+                description: SealStatus mirrors GET /v1/sys/seal-status.
                 properties:
                   initialized:
                     type: boolean

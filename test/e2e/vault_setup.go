@@ -220,7 +220,7 @@ func BootstrapVaultInKind(ctx context.Context, kubernetesHost string, kubernetes
 	})
 }
 
-// vaultOperatorAdminKindPolicy is the production policy from OPERATOR-SPEC §3.3.
+// vaultOperatorAdminKindPolicy is the production operator policy.
 //
 // Note on Vault glob syntax: `+` matches a WHOLE path segment (up to `/`),
 // NOT a partial match within a segment. So `sys/auth/kubernetes-+` does

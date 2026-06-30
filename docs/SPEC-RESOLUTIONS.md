@@ -21,6 +21,7 @@
 | **D15** | **Retry — exponential backoff с jitter** на уровне reconciler (30s → 5m, ±20% jitter, reset на success), плюс **circuit breaker** на уровне процесса (5 fail подряд на Vault → 2 min open, half-open пробник). SDK-уровень — 3 встроенных retry на transient errors. | `internal/vault/circuit.go` |
 | **D16** | **При существующих SA/CRB в target-кластере с `autoCreate: true`** — переиспользуем через SSA с `fieldManager: vault-operator-controller`. Если другой fieldManager — Warning event + `Phase=Configuring`, оператор не «отбирает» владение. При `autoCreate: false` — оператор только использует существующие ресурсы. | §3.6, `internal/target/sa.go` |
 | **D17** | **Sealed Vault — обрабатывается при reconcile** (§3.8): `GET sys/seal-status` перед login, conditions `VaultInitialized` и `VaultUnsealed` на VaultConfig, при sealed — пропускаем login, RequeueAfter 1m, cascade `ConfigResolved=False` на VaultClaim'ы. Авто-восстановление при разпечатывании. | `internal/vault/seal.go`, VaultConfig reconciler |
+| **D18** | **VaultClaim создаётся cluster-claim-operator'ом** как Step 8 его pipeline через optional поле `ClusterClaim.spec.vaultClaimTemplateRef`. VaultClaim Phase=Ready — обязательное условие для ClusterClaim Phase=Ready (Step 14 WAIT). Шаги построены по существующим паттернам cluster-claim — infinity wait, deleteAndWait блокировка, status mirroring. Никаких новых механизмов (timeout, bypass, Phase=Degraded). | `cluster-claim-operator/docs/VAULT-INTEGRATION.md`, реализация в Story 010 cluster-claim |
 
 ## Открытые вопросы (не блокирующие)
 

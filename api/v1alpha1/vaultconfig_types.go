@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Condition type constants for VaultConfig (OPERATOR-SPEC §2.5, §3.8).
+// Condition type constants for VaultConfig.
 const (
 	ConditionVaultInitialized = "VaultInitialized"
 	ConditionVaultUnsealed    = "VaultUnsealed"
@@ -73,7 +73,7 @@ type ManagerAuthSpec struct {
 
 // StorageSpec describes the shared KV-v2 mount that holds all clusters'
 // secrets. The mount itself is deployed by the platform; the operator only
-// writes policies referencing paths under it (OPERATOR-SPEC D2).
+// writes policies referencing paths under it.
 type StorageSpec struct {
 	// KvMountPath is immutable — changing it invalidates every previously
 	// written policy.
@@ -115,7 +115,7 @@ type TLSSpec struct {
 
 // VaultConfigSpec is the cluster-scoped Vault connection. One VaultConfig
 // (typically "default") is referenced by many VaultClaims; multi-Vault is
-// supported via multiple named VaultConfigs (OPERATOR-SPEC §1.1, D13).
+// supported via multiple named VaultConfigs.
 //
 // +kubebuilder:validation:XValidation:rule="self.storage.kvMountPath == oldSelf.storage.kvMountPath",message="spec.storage.kvMountPath is immutable"
 type VaultConfigSpec struct {
@@ -135,7 +135,7 @@ type VaultConfigSpec struct {
 	TLS *TLSSpec `json:"tls,omitempty"`
 }
 
-// SealStatus mirrors GET /v1/sys/seal-status (OPERATOR-SPEC §3.8).
+// SealStatus mirrors GET /v1/sys/seal-status.
 type SealStatus struct {
 	// +optional
 	Sealed bool `json:"sealed,omitempty"`

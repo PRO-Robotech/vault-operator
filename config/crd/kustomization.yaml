@@ -4,6 +4,7 @@
 resources:
 - bases/vault.in-cloud.io_vaultclaims.yaml
 - bases/vault.in-cloud.io_vaultconfigs.yaml
+- bases/vault.in-cloud.io_vaultsecretclaims.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

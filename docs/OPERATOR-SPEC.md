@@ -609,7 +609,7 @@ Vault при логине pod'а из namespace `monitoring` сам подста
 
 | Оператор | Связь |
 |----------|-------|
-| `cluster-claim-operator` | Источник `kubeconfig` Secret через `clusterRef`. **VaultClaim создаётся ПОСЛЕ** того, как ClusterClaim достиг Phase=Ready (или хотя бы certset[infra]+kubeconfig готовы). Триггер — пользователь / GitOps, не cluster-claim. |
+| `cluster-claim-operator` | **Создаёт VaultClaim как Step 8 своего pipeline** через optional поле `ClusterClaim.spec.vaultClaimTemplateRef`. VaultClaim Phase=Ready — обязательное условие для ClusterClaim Phase=Ready (Step 14 WAIT). Удаление VaultClaim — первым в reverse pipeline cluster-claim, до удаления CAPI Cluster (чтобы kubeconfig оставался валидным для cleanup token-reviewer SA в infra-кластере). См. `cluster-claim-operator/docs/VAULT-INTEGRATION.md`. Backwards-compat: если `vaultClaimTemplateRef` не указан — vault-интеграция отключена. Также `cluster-claim-operator` — источник `kubeconfig` Secret через `clusterRef`. |
 | `certificate-set` | Опосредовано — kubeconfig Secret приходит из его pipeline. |
 | `addons-operator` | Аддоны в infra-кластере (vmauth, ArgoCD, ...) являются consumer'ами Vault. Их Helm values содержат `VAULT_ADDR` (глобальная константа платформы) и `VAULT_AUTH_PATH = auth/kubernetes-{cluster}` — шаблонные значения, собираются самим чартом из имени кластера. См. K8S-225. |
 | `secret-copy-operator` | Пересекается на задаче раздачи секретов. После запуска Vault Operator — `secret-copy` остаётся для bootstrap-секретов и кейсов, где Vault недоступен. Постепенный мигрейшн. |

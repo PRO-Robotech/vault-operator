@@ -21,6 +21,9 @@ import (
 // open breaker (no request sent), as opposed to a fresh failure.
 const ReasonCircuitOpen = "CircuitOpen"
 
+// ReasonLoginFailed marks a condition whose Vault login failed.
+const ReasonLoginFailed = "LoginFailed"
+
 // classifyVaultErr maps a breaker short-circuit to (ReasonCircuitOpen, probe-aligned
 // requeue) and any other error to the fallback reason and unreachable cadence.
 func classifyVaultErr(err error, fallbackReason string) (reason string, requeue time.Duration) {
