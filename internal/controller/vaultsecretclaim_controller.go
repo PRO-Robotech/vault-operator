@@ -358,7 +358,9 @@ func (r *VaultSecretClaimReconciler) updateStatusIfChanged(ctx context.Context, 
 	if apiequality.Semantic.DeepEqual(old, &claim.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, claim)
+	base := claim.DeepCopy()
+	base.Status = *old
+	return r.Status().Patch(ctx, claim, client.MergeFrom(base))
 }
 
 func (r *VaultSecretClaimReconciler) now() time.Time {
