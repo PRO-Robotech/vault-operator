@@ -65,9 +65,10 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server")
-	flag.StringVar(&pprofAddr, "pprof-bind-address", "127.0.0.1:8082",
-		"Address for the pprof/diagnostics endpoint. Bind to loopback so it is reachable only via "+
-			"`kubectl port-forward` (access gated by pods/portforward RBAC). Set \"\" or \"0\" to disable.")
+	flag.StringVar(&pprofAddr, "pprof-bind-address", "",
+		"Address for the pprof/diagnostics endpoint. Empty (default) disables it. "+
+			"Set e.g. 127.0.0.1:8082 to enable, binding to loopback so it is reachable only via "+
+			"`kubectl port-forward` (access gated by pods/portforward RBAC).")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
