@@ -86,8 +86,7 @@ func (r *VaultConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.handleDeletion(ctx, cfg)
 	}
 
-	// AddFinalizer mutates cfg in-memory; the subsequent Update bumps
-	// ResourceVersion so Status().Update on the same copy still succeeds.
+	// AddFinalizer mutates cfg in-memory; persist it before touching status.
 	if controllerutil.AddFinalizer(cfg, vaultv1alpha1.VaultConfigFinalizer) {
 		if err := r.Update(ctx, cfg); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
@@ -290,7 +289,9 @@ func (r *VaultConfigReconciler) updateStatusIfChanged(ctx context.Context, cfg *
 	if apiequality.Semantic.DeepEqual(old, &cfg.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, cfg)
+	base := cfg.DeepCopy()
+	base.Status = *old
+	return r.Status().Patch(ctx, cfg, client.MergeFrom(base))
 }
 
 func (r *VaultConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
