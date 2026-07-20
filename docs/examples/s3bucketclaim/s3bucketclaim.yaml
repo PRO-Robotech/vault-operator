@@ -1,0 +1,20 @@
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: S3BucketClaim
+metadata:
+  name: ec8a00
+  namespace: dlputi1u
+spec:
+  vaultConfigRef:
+    name: vault-bucket
+  clusterRef:
+    name: ec8a00
+  customerLogin: dlputi1u
+  region: ru1
+  bucket:
+    public: false
+    managedBy: SYSTEM
+    configurationId: s3_v1
+  vault:
+    secretsPrefix: clusters/ec8a00
+    destinationPath: backup/s3
+  deletionPolicy: Purge

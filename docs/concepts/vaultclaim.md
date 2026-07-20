@@ -54,8 +54,8 @@ spec:
 | `vault.appliedPolicies[]` | Имена политик, фактически записанных в Vault |
 | `vault.appliedRoles[]` | Имена ролей, фактически созданных в Vault |
 | `vault.tokenReviewerJWT.*` | Timestamps жизненного цикла reviewer JWT (без самого JWT) |
-| `vault.lastReconcileAt` | Время последнего успешного reconcile |
-| `vault.lastDriftCheckAt` | Время последней проверки drift |
+| `vault.lastReconcileAt` | Время последнего reconcile (heartbeat, лаг до 10 мин) |
+| `vault.lastDriftCheckAt` | Время последней проверки drift (heartbeat, лаг до 10 мин) |
 
 ## Жизненный цикл фаз
 

@@ -260,10 +260,22 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 // countReferences plain-lists the owning claim type and filters client-side
 func (r *VaultConfigReconciler) countReferences(ctx context.Context, name string) (int32, error) {
 	var count int32
-	if r.VaultConfigOwner == vaultv1alpha1.OwnerVaultSecretOperator {
+	switch r.VaultConfigOwner {
+	case vaultv1alpha1.OwnerVaultSecretOperator:
 		var claims vaultv1alpha1.VaultSecretClaimList
 		if err := r.List(ctx, &claims); err != nil {
 			return 0, fmt.Errorf("list VaultSecretClaims: %w", err)
+		}
+		for i := range claims.Items {
+			if claims.Items[i].Spec.VaultConfigRef.Name == name {
+				count++
+			}
+		}
+		return count, nil
+	case vaultv1alpha1.OwnerBucketOperator:
+		var claims vaultv1alpha1.S3BucketClaimList
+		if err := r.List(ctx, &claims); err != nil {
+			return 0, fmt.Errorf("list S3BucketClaims: %w", err)
 		}
 		for i := range claims.Items {
 			if claims.Items[i].Spec.VaultConfigRef.Name == name {
@@ -298,12 +310,18 @@ func (r *VaultConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&vaultv1alpha1.VaultConfig{}, builder.WithPredicates(vaultConfigOwnerPredicate(r.VaultConfigOwner)))
 
-	if r.VaultConfigOwner == vaultv1alpha1.OwnerVaultSecretOperator {
+	switch r.VaultConfigOwner {
+	case vaultv1alpha1.OwnerVaultSecretOperator:
 		b = b.Watches(
 			&vaultv1alpha1.VaultSecretClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForSecretClaim),
 		)
-	} else {
+	case vaultv1alpha1.OwnerBucketOperator:
+		b = b.Watches(
+			&vaultv1alpha1.S3BucketClaim{},
+			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForBucketClaim),
+		)
+	default:
 		b = b.Watches(
 			&vaultv1alpha1.VaultClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForClaim),

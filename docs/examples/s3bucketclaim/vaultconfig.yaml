@@ -1,0 +1,17 @@
+# Separate VaultConfig for the bucket-operator, reconciled only by its process
+# (owner label). Points at the same Vault, but the manager-auth role is the
+# bucket-operator role that carries bucket-operator-admin.hcl.
+apiVersion: vault.in-cloud.io/v1alpha1
+kind: VaultConfig
+metadata:
+  name: vault-bucket
+  labels:
+    vault.in-cloud.io/owner: vault-bucket
+spec:
+  address: https://vault.beget.com:8200
+  managerAuth:
+    method: kubernetes
+    mountPath: kubernetes-mgmt
+    role: bucket-operator
+  storage:
+    kvMountPath: secret

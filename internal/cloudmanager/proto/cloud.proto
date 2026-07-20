@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+// Minimal subset of the cloud-manager cloud contract: only create with the s3
+// arm. Field numbers, proto package and RPC name must match the server.
+package beget.internal.cloud.cloudManager.cloud;
+
+import "s3.proto";
+
+option go_package = "github.com/PRO-Robotech/vault-operator/internal/cloudmanager/proto;cloudmanagerpb";
+
+service CloudService {
+  rpc create(CreateRequest) returns (CreateResponse) {}
+}
+
+message CreateRequest {
+  string customer_identifier = 1;
+  string configuration_id = 2;
+  string display_name = 3;
+  string description = 4;
+
+  oneof params {
+    beget.internal.cloud.cloudManager.s3.s3.CreateParams s3_params = 6;
+  }
+
+  string region = 7;
+}
+
+message CreateResponse {
+  Service service = 1 [deprecated = true];
+
+  oneof result {
+    Service service_info = 2;
+    beget.internal.cloud.cloudManager.s3.s3.CreateError s3_error = 3;
+  }
+}
+
+// Credentials are read via CloudS3Service.findAll, so only id is modelled.
+message Service {
+  string id = 1;
+}
