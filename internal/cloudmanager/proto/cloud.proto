@@ -34,7 +34,8 @@ message CreateResponse {
   }
 }
 
-// Credentials are read via CloudS3Service.findAll, so only id is modelled.
+// slug carries the server-assigned full bucket name (with prefix).
 message Service {
   string id = 1;
+  string slug = 6;
 }

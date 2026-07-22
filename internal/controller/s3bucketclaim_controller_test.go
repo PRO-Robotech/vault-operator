@@ -80,10 +80,12 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		_, err = reconcileBucketOnce(recon, "s3ready")
 		Expect(err).NotTo(HaveOccurred())
 
+		realName := cloudmanager.FakePrefix + bucketBaseName(custName, "s3ready")
 		got := &vaultv1alpha1.S3BucketClaim{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3ready"}, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
-		Expect(got.Status.BucketName).To(Equal(bucketBaseName(custName, "s3ready")))
+		// The stored/used name is the server-assigned real name, not the requested one.
+		Expect(got.Status.BucketName).To(Equal(realName))
 		Expect(got.Status.BucketStatus).To(Equal(cloudmanager.StatusRunning))
 		Expect(isConditionTrue(got.Status.Conditions, vaultv1alpha1.ConditionBucketRunning)).To(BeTrue())
 		Expect(isConditionTrue(got.Status.Conditions, vaultv1alpha1.ConditionKeysWritten)).To(BeTrue())
@@ -92,7 +94,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 		vaultData := fakeSV.store["secret|clusters/s3ready/backup/s3"]
 		Expect(vaultData).NotTo(BeNil())
-		Expect(vaultData["bucketName"]).To(Equal(bucketBaseName(custName, "s3ready")))
+		Expect(vaultData["bucketName"]).To(Equal(realName))
 		Expect(vaultData["accessKey"]).To(HavePrefix("AK-"))
 		Expect(vaultData["secretKey"]).To(HavePrefix("SK-"))
 		Expect(vaultData["endpoint"]).To(Equal("https://s3.ru1.storage.beget.cloud"))
@@ -113,8 +115,8 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("fails terminally when the s3 configuration is missing", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-cnf")
-		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) error {
-			return cloudmanager.ErrConfigurationNotFound
+		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) (string, error) {
+			return "", cloudmanager.ErrConfigurationNotFound
 		}
 		makeS3BucketClaim(ctx, "s3cnf", "s3-cfg-cnf", custName, vaultv1alpha1.DeletionPolicyPurge)
 
@@ -131,29 +133,56 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		Expect(cond.Reason).To(Equal("ConfigurationMissing"))
 	})
 
-	It("fails when the bucket already exists but is owned by another customer", func() {
-		makeHealthyVaultConfig(ctx, "s3-cfg-foreign")
-		name := bucketBaseName(custName, "s3foreign")
+	It("adopts an existing bucket on AlreadyExists (crash between create and status write)", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-adopt")
+		requested := bucketBaseName(custName, "s3adopt")
+		realName := "c942bd41757d-" + requested
 		buckets.Seed(cloudmanager.Bucket{
-			Name: name, CustLogin: "someoneelse", Status: cloudmanager.StatusRunning,
-			AccessKey: "x", SecretKey: "y",
+			Name: realName, CustLogin: custName, Status: cloudmanager.StatusRunning,
+			AccessKey: "AK-x", SecretKey: "SK-x",
 		})
-		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) error {
-			return cloudmanager.ErrBucketNameAlreadyExists
+		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) (string, error) {
+			return "", cloudmanager.ErrBucketNameAlreadyExists
 		}
-		makeS3BucketClaim(ctx, "s3foreign", "s3-cfg-foreign", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3adopt", "s3-cfg-adopt", custName, vaultv1alpha1.DeletionPolicyPurge)
 
-		_, err := reconcileBucketOnce(recon, "s3foreign")
+		_, err := reconcileBucketOnce(recon, "s3adopt")
 		Expect(err).NotTo(HaveOccurred())
-		_, err = reconcileBucketOnce(recon, "s3foreign")
+		_, err = reconcileBucketOnce(recon, "s3adopt")
 		Expect(err).NotTo(HaveOccurred())
 
 		got := &vaultv1alpha1.S3BucketClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3foreign"}, got)).To(Succeed())
-		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
-		cond := findCond(got.Status.Conditions, vaultv1alpha1.ConditionBucketRunning)
-		Expect(cond).NotTo(BeNil())
-		Expect(cond.Reason).To(Equal("ForeignBucket"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3adopt"}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(got.Status.BucketName).To(Equal(realName))
+	})
+
+	It("self-heals a claim whose status holds the requested (pre-fix) name", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-heal")
+		requested := bucketBaseName(custName, "s3heal")
+		realName := "c942bd41757d-" + requested
+		// Bucket already exists under the real (prefixed) name.
+		buckets.Seed(cloudmanager.Bucket{
+			Name: realName, CustLogin: custName, Status: cloudmanager.StatusRunning,
+			AccessKey: "AK-x", SecretKey: "SK-x",
+		})
+		makeS3BucketClaim(ctx, "s3heal", "s3-cfg-heal", custName, vaultv1alpha1.DeletionPolicyPurge)
+
+		// Simulate the stuck state: status.BucketName holds the requested name.
+		got := &vaultv1alpha1.S3BucketClaim{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3heal"}, got)).To(Succeed())
+		got.Status.BucketName = requested
+		Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+
+		_, err := reconcileBucketOnce(recon, "s3heal")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileBucketOnce(recon, "s3heal")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3heal"}, got)).To(Succeed())
+		Expect(got.Status.BucketName).To(Equal(realName))
+		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(buckets.Creates).To(Equal(0))
 	})
 
 	It("purges the bucket and Vault path on deletion", func() {

@@ -222,10 +222,11 @@ func (*CreateResponse_ServiceInfo) isCreateResponse_Result() {}
 
 func (*CreateResponse_S3Error) isCreateResponse_Result() {}
 
-// Credentials are read via CloudS3Service.findAll, so only id is modelled.
+// slug carries the server-assigned full bucket name (with prefix).
 type Service struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Slug          string                 `protobuf:"bytes,6,opt,name=slug,proto3" json:"slug,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -267,6 +268,13 @@ func (x *Service) GetId() string {
 	return ""
 }
 
+func (x *Service) GetSlug() string {
+	if x != nil {
+		return x.Slug
+	}
+	return ""
+}
+
 var File_cloud_proto protoreflect.FileDescriptor
 
 const file_cloud_proto_rawDesc = "" +
@@ -284,9 +292,10 @@ const file_cloud_proto_rawDesc = "" +
 	"\aservice\x18\x01 \x01(\v20.beget.internal.cloud.cloudManager.cloud.ServiceB\x02\x18\x01R\aservice\x12U\n" +
 	"\fservice_info\x18\x02 \x01(\v20.beget.internal.cloud.cloudManager.cloud.ServiceH\x00R\vserviceInfo\x12Q\n" +
 	"\bs3_error\x18\x03 \x01(\v24.beget.internal.cloud.cloudManager.s3.s3.CreateErrorH\x00R\as3ErrorB\b\n" +
-	"\x06result\"\x19\n" +
+	"\x06result\"-\n" +
 	"\aService\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id2\x8b\x01\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04slug\x18\x06 \x01(\tR\x04slug2\x8b\x01\n" +
 	"\fCloudService\x12{\n" +
 	"\x06create\x126.beget.internal.cloud.cloudManager.cloud.CreateRequest\x1a7.beget.internal.cloud.cloudManager.cloud.CreateResponse\"\x00BSZQgithub.com/PRO-Robotech/vault-operator/internal/cloudmanager/proto;cloudmanagerpbb\x06proto3"
 

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -73,8 +74,13 @@ type CreateInput struct {
 
 // BucketAPI is the subset of cloud-manager the bucket-operator depends on.
 type BucketAPI interface {
-	Create(ctx context.Context, in CreateInput) error
+	// Create returns the server-assigned bucket name (with prefix).
+	Create(ctx context.Context, in CreateInput) (string, error)
+	// FindByCustomerBucket matches by exact server name.
 	FindByCustomerBucket(ctx context.Context, custLogin, bucketName string) (*Bucket, error)
+	// FindByCustomerRequested matches by the requested name (server name with its
+	// prefix stripped), for adopt and self-heal.
+	FindByCustomerRequested(ctx context.Context, custLogin, requestedName string) (*Bucket, error)
 	Remove(ctx context.Context, bucketName string) error
 }
 
@@ -107,7 +113,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) Create(ctx context.Context, in CreateInput) error {
+func (c *Client) Create(ctx context.Context, in CreateInput) (string, error) {
 	resp, err := c.cloud.Create(ctx, &pb.CreateRequest{
 		CustomerIdentifier: in.CustomerLogin,
 		ConfigurationId:    in.ConfigurationID,
@@ -120,25 +126,18 @@ func (c *Client) Create(ctx context.Context, in CreateInput) error {
 		}},
 	})
 	if err != nil {
-		return fmt.Errorf("cloud-manager create: %w", err)
+		return "", fmt.Errorf("cloud-manager create: %w", err)
 	}
 	if s3err := resp.GetS3Error(); s3err != nil {
-		return mapCreateError(s3err)
+		return "", mapCreateError(s3err)
 	}
-	return nil
+	return resp.GetServiceInfo().GetSlug(), nil
 }
 
 func (c *Client) FindByCustomerBucket(ctx context.Context, custLogin, bucketName string) (*Bucket, error) {
-	resp, err := c.s3.FindAll(ctx, &pb.FindAllRequest{Scope: []*pb.FindAllRequest_SearchScope{
-		{Condition: &pb.FindAllRequest_SearchScope_ByCustomer{
-			ByCustomer: &pb.FindAllRequest_SearchScope_ByCustomerLogin{Login: []string{custLogin}},
-		}},
-		{Condition: &pb.FindAllRequest_SearchScope_ByBucket{
-			ByBucket: &pb.FindAllRequest_SearchScope_ByBucketName{Name: []string{bucketName}},
-		}},
-	}})
+	resp, err := c.findAllByCustomer(ctx, custLogin)
 	if err != nil {
-		return nil, fmt.Errorf("cloud-manager findAll: %w", err)
+		return nil, err
 	}
 	for _, b := range resp.GetBucket() {
 		if b.GetName() == bucketName {
@@ -146,6 +145,40 @@ func (c *Client) FindByCustomerBucket(ctx context.Context, custLogin, bucketName
 		}
 	}
 	return nil, ErrBucketNotFound
+}
+
+func (c *Client) FindByCustomerRequested(ctx context.Context, custLogin, requestedName string) (*Bucket, error) {
+	resp, err := c.findAllByCustomer(ctx, custLogin)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range resp.GetBucket() {
+		if stripBucketPrefix(b.GetName()) == requestedName {
+			return toDomain(b), nil
+		}
+	}
+	return nil, ErrBucketNotFound
+}
+
+func (c *Client) findAllByCustomer(ctx context.Context, custLogin string) (*pb.FindAllResponse, error) {
+	resp, err := c.s3.FindAll(ctx, &pb.FindAllRequest{Scope: []*pb.FindAllRequest_SearchScope{
+		{Condition: &pb.FindAllRequest_SearchScope_ByCustomer{
+			ByCustomer: &pb.FindAllRequest_SearchScope_ByCustomerLogin{Login: []string{custLogin}},
+		}},
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("cloud-manager findAll: %w", err)
+	}
+	return resp, nil
+}
+
+// stripBucketPrefix drops the server-added "<hex>-" prefix, yielding the
+// requested name (the prefix contains no '-').
+func stripBucketPrefix(name string) string {
+	if i := strings.IndexByte(name, '-'); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }
 
 func (c *Client) Remove(ctx context.Context, bucketName string) error {

@@ -172,18 +172,14 @@ func (r *S3BucketClaimReconciler) resolveAndLogin(ctx context.Context, claim *va
 	return vc, cfg, ctrl.Result{}, true
 }
 
-// ensureBucket creates the bucket unless status.bucketName is already set.
-// Adopt-on-conflict is resolved by the ownership check in fetchCreds.
+// ensureBucket creates the bucket unless status.bucketName is already set, and
+// records the server-assigned real name.
 func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
-	name := claim.Status.BucketName
-	if name == "" {
-		name = bucketBaseName(claim.Spec.CustomerLogin, claim.Spec.ClusterRef.Name)
-	}
-
 	if claim.Status.BucketName != "" {
 		return ctrl.Result{}, true
 	}
 
+	requestedName := bucketBaseName(claim.Spec.CustomerLogin, claim.Spec.ClusterRef.Name)
 	cfgID := claim.Spec.Bucket.ConfigurationID
 	if cfgID == "" {
 		cfgID = r.DefaultConfigurationID
@@ -193,9 +189,9 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 		managedBy = cloudmanager.ManagedBySystem
 	}
 
-	err := r.Buckets.Create(ctx, cloudmanager.CreateInput{
+	realName, err := r.Buckets.Create(ctx, cloudmanager.CreateInput{
 		CustomerLogin:   claim.Spec.CustomerLogin,
-		BucketName:      name,
+		BucketName:      requestedName,
 		ConfigurationID: cfgID,
 		Region:          claim.Spec.Region,
 		DisplayName:     fmt.Sprintf("k8s cluster %s backup", claim.Spec.ClusterRef.Name),
@@ -204,15 +200,43 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 	})
 	switch {
 	case err == nil:
-		claim.Status.BucketName = name
+		if realName == "" {
+			if b, lerr := r.Buckets.FindByCustomerRequested(ctx, claim.Spec.CustomerLogin, requestedName); lerr == nil {
+				realName = b.Name
+			}
+		}
+		if realName == "" {
+			claim.Status.Phase = vaultv1alpha1.PhasePending
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+				"Locating", "bucket created; resolving its name")
+			return ctrl.Result{RequeueAfter: bucketRequeueRace}, false
+		}
+		claim.Status.BucketName = realName
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionTrue, claim.Generation,
-			"Created", fmt.Sprintf("bucket %q create accepted", name))
+			"Created", fmt.Sprintf("bucket %q create accepted", realName))
 		return ctrl.Result{}, true
 
 	case errors.Is(err, cloudmanager.ErrBucketNameAlreadyExists):
-		claim.Status.BucketName = name
+		b, lerr := r.Buckets.FindByCustomerRequested(ctx, claim.Spec.CustomerLogin, requestedName)
+		if errors.Is(lerr, cloudmanager.ErrBucketNotFound) {
+			claim.Status.Phase = vaultv1alpha1.PhasePending
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+				"Locating", fmt.Sprintf("bucket %q exists; resolving its name", requestedName))
+			return ctrl.Result{RequeueAfter: bucketRequeueRace}, false
+		}
+		if lerr != nil {
+			claim.Status.Phase = vaultv1alpha1.PhasePending
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+				"FindFailed", lerr.Error())
+			return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
+		}
+		if b.CustLogin != "" && b.CustLogin != claim.Spec.CustomerLogin {
+			return r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ForeignBucket",
+				fmt.Sprintf("bucket %q owned by %q, expected %q", b.Name, b.CustLogin, claim.Spec.CustomerLogin)), false
+		}
+		claim.Status.BucketName = b.Name
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionTrue, claim.Generation,
-			"Exists", fmt.Sprintf("bucket %q already exists; verifying ownership", name))
+			"Exists", fmt.Sprintf("bucket %q already exists", b.Name))
 		return ctrl.Result{}, true
 
 	case errors.Is(err, cloudmanager.ErrConfigurationNotFound):
@@ -221,7 +245,7 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 
 	case errors.Is(err, cloudmanager.ErrInvalidBucketName):
 		return r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "InvalidBucketName",
-			fmt.Sprintf("bucket name %q rejected: %v", name, err)), false
+			fmt.Sprintf("bucket name %q rejected: %v", requestedName, err)), false
 
 	case errors.Is(err, cloudmanager.ErrBucketLimitReached):
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
@@ -239,14 +263,34 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 	}
 }
 
+// resolveBucket returns the bucket by its stored real name, falling back to a
+// requested-name lookup that repairs status.BucketName (self-heal).
+func (r *S3BucketClaimReconciler) resolveBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (*cloudmanager.Bucket, error) {
+	if name := claim.Status.BucketName; name != "" {
+		b, err := r.Buckets.FindByCustomerBucket(ctx, claim.Spec.CustomerLogin, name)
+		if err == nil {
+			return b, nil
+		}
+		if !errors.Is(err, cloudmanager.ErrBucketNotFound) {
+			return nil, err
+		}
+	}
+	requestedName := bucketBaseName(claim.Spec.CustomerLogin, claim.Spec.ClusterRef.Name)
+	b, err := r.Buckets.FindByCustomerRequested(ctx, claim.Spec.CustomerLogin, requestedName)
+	if err != nil {
+		return nil, err
+	}
+	claim.Status.BucketName = b.Name
+	return b, nil
+}
+
 // fetchCreds looks up the bucket and validates ownership and RUNNING state.
 func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (*cloudmanager.Bucket, ctrl.Result, bool) {
-	name := claim.Status.BucketName
-	bucket, err := r.Buckets.FindByCustomerBucket(ctx, claim.Spec.CustomerLogin, name)
+	bucket, err := r.resolveBucket(ctx, claim)
 	if errors.Is(err, cloudmanager.ErrBucketNotFound) {
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketRunning, metav1.ConditionFalse, claim.Generation,
-			"NotVisibleYet", fmt.Sprintf("bucket %q not yet returned by findAll", name))
+			"NotVisibleYet", fmt.Sprintf("bucket for %q not yet returned by findAll", claim.Spec.ClusterRef.Name))
 		return nil, ctrl.Result{RequeueAfter: bucketRequeueRace}, false
 	}
 	if err != nil {
@@ -258,7 +302,7 @@ func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1
 
 	if bucket.CustLogin != "" && bucket.CustLogin != claim.Spec.CustomerLogin {
 		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "ForeignBucket",
-			fmt.Sprintf("bucket %q owned by %q, expected %q", name, bucket.CustLogin, claim.Spec.CustomerLogin)), false
+			fmt.Sprintf("bucket %q owned by %q, expected %q", bucket.Name, bucket.CustLogin, claim.Spec.CustomerLogin)), false
 	}
 
 	claim.Status.BucketStatus = bucket.Status
@@ -272,12 +316,12 @@ func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1
 		return nil, ctrl.Result{RequeueAfter: bucketRequeueCreating}, false
 	default: // ERROR / REMOVING / REMOVED / STOPPED
 		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "BadStatus",
-			fmt.Sprintf("bucket %q in unexpected status %q", name, bucket.Status)), false
+			fmt.Sprintf("bucket %q in unexpected status %q", bucket.Name, bucket.Status)), false
 	}
 
 	if bucket.AccessKey == "" || bucket.SecretKey == "" {
 		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "NoKeys",
-			fmt.Sprintf("bucket %q RUNNING but credentials are empty", name)), false
+			fmt.Sprintf("bucket %q RUNNING but credentials are empty", bucket.Name)), false
 	}
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketRunning, metav1.ConditionTrue, claim.Generation,
 		"Running", "bucket is RUNNING with credentials")
@@ -355,22 +399,19 @@ func (r *S3BucketClaimReconciler) handleDeletion(ctx context.Context, claim *vau
 // purge removes the bucket and its Vault path, keeping the finalizer and
 // requeueing if either backend is unavailable.
 func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
-	name := claim.Status.BucketName
-	if name != "" {
-		bucket, err := r.Buckets.FindByCustomerBucket(ctx, claim.Spec.CustomerLogin, name)
-		switch {
-		case errors.Is(err, cloudmanager.ErrBucketNotFound):
-			// already gone
-		case err != nil:
-			r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("find bucket for purge: %v", err))
+	bucket, err := r.resolveBucket(ctx, claim)
+	switch {
+	case errors.Is(err, cloudmanager.ErrBucketNotFound):
+		// already gone
+	case err != nil:
+		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("find bucket for purge: %v", err))
+		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
+	case bucket.CustLogin != "" && bucket.CustLogin != claim.Spec.CustomerLogin:
+		r.event(claim, corev1.EventTypeWarning, "ForeignBucket", fmt.Sprintf("refusing to remove bucket %q owned by %q", bucket.Name, bucket.CustLogin))
+	default:
+		if err := r.Buckets.Remove(ctx, bucket.Name); err != nil {
+			r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("remove bucket: %v", err))
 			return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
-		case bucket.CustLogin != "" && bucket.CustLogin != claim.Spec.CustomerLogin:
-			r.event(claim, corev1.EventTypeWarning, "ForeignBucket", fmt.Sprintf("refusing to remove bucket %q owned by %q", name, bucket.CustLogin))
-		default:
-			if err := r.Buckets.Remove(ctx, name); err != nil {
-				r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("remove bucket: %v", err))
-				return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
-			}
 		}
 	}
 
