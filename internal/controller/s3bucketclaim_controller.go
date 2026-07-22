@@ -231,8 +231,9 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 			return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 		}
 		if b.CustLogin != "" && b.CustLogin != claim.Spec.CustomerLogin {
-			return r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ForeignBucket",
-				fmt.Sprintf("bucket %q owned by %q, expected %q", b.Name, b.CustLogin, claim.Spec.CustomerLogin)), false
+			r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ForeignBucket",
+				fmt.Sprintf("bucket %q owned by %q, expected %q", b.Name, b.CustLogin, claim.Spec.CustomerLogin))
+			return ctrl.Result{}, false
 		}
 		claim.Status.BucketName = b.Name
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionTrue, claim.Generation,
@@ -240,12 +241,14 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 		return ctrl.Result{}, true
 
 	case errors.Is(err, cloudmanager.ErrConfigurationNotFound):
-		return r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ConfigurationMissing",
-			fmt.Sprintf("s3 configuration %q not found (create it in cloud-manager)", cfgID)), false
+		r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ConfigurationMissing",
+			fmt.Sprintf("s3 configuration %q not found (create it in cloud-manager)", cfgID))
+		return ctrl.Result{}, false
 
 	case errors.Is(err, cloudmanager.ErrInvalidBucketName):
-		return r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "InvalidBucketName",
-			fmt.Sprintf("bucket name %q rejected: %v", requestedName, err)), false
+		r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "InvalidBucketName",
+			fmt.Sprintf("bucket name %q rejected: %v", requestedName, err))
+		return ctrl.Result{}, false
 
 	case errors.Is(err, cloudmanager.ErrBucketLimitReached):
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
@@ -301,8 +304,9 @@ func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1
 	}
 
 	if bucket.CustLogin != "" && bucket.CustLogin != claim.Spec.CustomerLogin {
-		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "ForeignBucket",
-			fmt.Sprintf("bucket %q owned by %q, expected %q", bucket.Name, bucket.CustLogin, claim.Spec.CustomerLogin)), false
+		r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "ForeignBucket",
+			fmt.Sprintf("bucket %q owned by %q, expected %q", bucket.Name, bucket.CustLogin, claim.Spec.CustomerLogin))
+		return nil, ctrl.Result{}, false
 	}
 
 	claim.Status.BucketStatus = bucket.Status
@@ -315,13 +319,15 @@ func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		return nil, ctrl.Result{RequeueAfter: bucketRequeueCreating}, false
 	default: // ERROR / REMOVING / REMOVED / STOPPED
-		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "BadStatus",
-			fmt.Sprintf("bucket %q in unexpected status %q", bucket.Name, bucket.Status)), false
+		r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "BadStatus",
+			fmt.Sprintf("bucket %q in unexpected status %q", bucket.Name, bucket.Status))
+		return nil, ctrl.Result{}, false
 	}
 
 	if bucket.AccessKey == "" || bucket.SecretKey == "" {
-		return nil, r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "NoKeys",
-			fmt.Sprintf("bucket %q RUNNING but credentials are empty", bucket.Name)), false
+		r.fail(claim, vaultv1alpha1.ConditionBucketRunning, "NoKeys",
+			fmt.Sprintf("bucket %q RUNNING but credentials are empty", bucket.Name))
+		return nil, ctrl.Result{}, false
 	}
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketRunning, metav1.ConditionTrue, claim.Generation,
 		"Running", "bucket is RUNNING with credentials")
@@ -452,12 +458,11 @@ func (r *S3BucketClaimReconciler) clientForDeletion(ctx context.Context, claim *
 }
 
 // fail marks the claim terminally failed and emits an event.
-func (r *S3BucketClaimReconciler) fail(claim *vaultv1alpha1.S3BucketClaim, condType, reason, msg string) ctrl.Result {
+func (r *S3BucketClaimReconciler) fail(claim *vaultv1alpha1.S3BucketClaim, condType, reason, msg string) {
 	claim.Status.Phase = vaultv1alpha1.PhaseFailed
 	setCondition(&claim.Status.Conditions, condType, metav1.ConditionFalse, claim.Generation, reason, msg)
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation, reason, msg)
 	r.event(claim, corev1.EventTypeWarning, reason, msg)
-	return ctrl.Result{}
 }
 
 func (r *S3BucketClaimReconciler) markReady(claim *vaultv1alpha1.S3BucketClaim) {

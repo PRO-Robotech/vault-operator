@@ -32,7 +32,7 @@ func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Res
 	})
 }
 
-func makeS3BucketClaim(ctx context.Context, name, configName, custLogin, deletionPolicy string) {
+func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) {
 	claim := &vaultv1alpha1.S3BucketClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: vaultv1alpha1.S3BucketClaimSpec{
@@ -42,7 +42,7 @@ func makeS3BucketClaim(ctx context.Context, name, configName, custLogin, deletio
 			Region:         "ru1",
 			Bucket:         vaultv1alpha1.S3BucketSpec{ManagedBy: cloudmanager.ManagedBySystem, ConfigurationID: "s3_v1"},
 			Vault:          vaultv1alpha1.S3VaultSpec{SecretsPrefix: "clusters/" + name, DestinationPath: defaultS3DestinationPath},
-			DeletionPolicy: deletionPolicy,
+			DeletionPolicy: vaultv1alpha1.DeletionPolicyPurge,
 		},
 	}
 	Expect(k8sClient.Create(ctx, claim)).To(Succeed())
@@ -72,7 +72,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("creates a bucket and writes credentials to Vault, reaching Ready", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-ready")
-		makeS3BucketClaim(ctx, "s3ready", "s3-cfg-ready", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3ready", "s3-cfg-ready", custName)
 
 		// First reconcile adds the finalizer (returns early on Update).
 		_, err := reconcileBucketOnce(recon, "s3ready")
@@ -103,7 +103,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("is idempotent: a second reconcile does not re-create or re-write", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-idem")
-		makeS3BucketClaim(ctx, "s3idem", "s3-cfg-idem", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3idem", "s3-cfg-idem", custName)
 
 		for i := 0; i < 3; i++ {
 			_, err := reconcileBucketOnce(recon, "s3idem")
@@ -118,7 +118,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) (string, error) {
 			return "", cloudmanager.ErrConfigurationNotFound
 		}
-		makeS3BucketClaim(ctx, "s3cnf", "s3-cfg-cnf", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3cnf", "s3-cfg-cnf", custName)
 
 		_, err := reconcileBucketOnce(recon, "s3cnf")
 		Expect(err).NotTo(HaveOccurred())
@@ -144,7 +144,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		buckets.CreateHook = func(context.Context, cloudmanager.CreateInput) (string, error) {
 			return "", cloudmanager.ErrBucketNameAlreadyExists
 		}
-		makeS3BucketClaim(ctx, "s3adopt", "s3-cfg-adopt", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3adopt", "s3-cfg-adopt", custName)
 
 		_, err := reconcileBucketOnce(recon, "s3adopt")
 		Expect(err).NotTo(HaveOccurred())
@@ -166,7 +166,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Name: realName, CustLogin: custName, Status: cloudmanager.StatusRunning,
 			AccessKey: "AK-x", SecretKey: "SK-x",
 		})
-		makeS3BucketClaim(ctx, "s3heal", "s3-cfg-heal", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3heal", "s3-cfg-heal", custName)
 
 		// Simulate the stuck state: status.BucketName holds the requested name.
 		got := &vaultv1alpha1.S3BucketClaim{}
@@ -187,7 +187,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("purges the bucket and Vault path on deletion", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-purge")
-		makeS3BucketClaim(ctx, "s3purge", "s3-cfg-purge", custName, vaultv1alpha1.DeletionPolicyPurge)
+		makeS3BucketClaim(ctx, "s3purge", "s3-cfg-purge", custName)
 
 		_, err := reconcileBucketOnce(recon, "s3purge")
 		Expect(err).NotTo(HaveOccurred())
