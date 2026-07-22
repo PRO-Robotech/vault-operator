@@ -221,6 +221,7 @@ kubectl rollout restart deploy/vault-operator-controller-manager -n vault-operat
 | `vault_api_responses_total{code="403"}` | `rate(...) > 0` 10m → admin-policy недостаточна |
 | `vault_client_token_renewal_total{result="login_failed"}` | `rate(...) > 0` 5m → оператор не может войти |
 | `vault_reviewer_jwt_renewal_total{result="failed"}` | `rate(...) > 0` 15m → consumer pods начнут получать 401 |
+| `vault_reviewer_jwt_expiry_seconds` | `< 7200` warn, `< 0` crit → reviewer JWT протух/протухает; per-claim, ставится каждый reconcile независимо от drift short-circuit |
 | `vaultclaim_drift_detected_total` | `rate(...) > 0` over 30m–1h → внешние мутации Vault |
 
 ---
@@ -237,7 +238,9 @@ kubectl rollout restart deploy/vault-operator-controller-manager -n vault-operat
 
 ### Pod'ы в infra-кластере получают 401 при login
 
-- `auth/{mount}/config.token_reviewer_jwt` устарел → проверьте `status.vault.tokenReviewerJWT.expiresAt`. Если в прошлом — ротация failed, смотрите `TokenReviewerJWTFresh` condition.
+- `auth/{mount}/config.token_reviewer_jwt` устарел → проверьте `status.vault.tokenReviewerJWT.expiresAt`. Если в прошлом:
+  - `TokenReviewerJWTFresh=False` → ротация упала, смотрите reason (`TokenRequestFailed`/`TargetClientError`);
+  - `TokenReviewerJWTFresh=True` при свежих `lastReconcileAt`/`lastDriftCheckAt` и `expiresAt` в прошлом → баг, при котором drift short-circuit пропускал ротацию (Step 4). Исправлено: short-circuit теперь гейтится по `ShouldRotateReviewerJWT`; кластер само-лечится на ближайшем reconcile. Ориентируйтесь на `vault_reviewer_jwt_expiry_seconds`, а не на condition.
 - Audience JWT'а pod'а не совпадает с тем, что ожидает Vault → проверьте, что pod использует дефолтный SA-token (без override `audience`).
 - SA pod'а не в `boundServiceAccounts` ни одной роли в этом auth-mount → добавьте role в VaultClaim.
 

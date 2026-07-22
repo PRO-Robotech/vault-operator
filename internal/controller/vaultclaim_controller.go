@@ -64,6 +64,7 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	claim := &vaultv1alpha1.VaultClaim{}
 	if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
 		if apierrors.IsNotFound(err) {
+			reviewerJWTExpirySeconds.DeleteLabelValues(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("get VaultClaim: %w", err)
@@ -95,6 +96,11 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
 	claim.Status.Vault.LastReconcileAt = ptrTime(r.now())
+
+	if jwt := claim.Status.Vault.TokenReviewerJWT; jwt != nil && jwt.ExpiresAt != nil {
+		reviewerJWTExpirySeconds.WithLabelValues(claim.Namespace, claim.Name).
+			Set(jwt.ExpiresAt.Sub(r.now()).Seconds())
+	}
 
 	if err := r.updateStatusIfChanged(ctx, claim, oldStatus); err != nil {
 		logger.V(1).Info("status update conflict (will retry)", "err", err.Error())
