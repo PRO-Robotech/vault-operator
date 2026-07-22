@@ -43,6 +43,14 @@ var reviewerJWTRenewalCounter = prometheus.NewCounterVec(
 	[]string{"result"},
 )
 
+var reviewerJWTExpirySeconds = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "vault_reviewer_jwt_expiry_seconds",
+		Help: "Seconds until the token-reviewer JWT expires (negative once expired), per VaultClaim.",
+	},
+	[]string{"namespace", "claim"},
+)
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter)
+	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter, reviewerJWTExpirySeconds)
 }

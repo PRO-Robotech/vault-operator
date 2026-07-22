@@ -810,6 +810,74 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.ListAuthMountsCalls).To(Equal(1))
 	})
 
+	It("Drift: no structural drift but reviewer JWT expired → falls through, Step 4 re-mints, Step 5 rewrites JWT", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		// First reconcile drives to Ready (ObservedGeneration set → specChanged=false next).
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+
+		// Prime Vault to report "no structural drift" — mount/policies/roles intact.
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+		fakeVC.ListPoliciesResp = nil
+		fakeVC.ListRolesResp = nil
+
+		// Force the reviewer JWT into the expired state prod clusters ended up in.
+		got := getClaim(name)
+		got.Status.Vault.TokenReviewerJWT = &vaultv1alpha1.TokenReviewerJWTStatus{
+			IssuedAt:  ptrTime(fixedNow.Add(-25 * time.Hour)),
+			ExpiresAt: ptrTime(fixedNow.Add(-time.Hour)),
+		}
+		Expect(k8sClient.Status().Update(context.Background(), got)).To(Succeed())
+
+		fakeVC.mu.Lock()
+		beforeWriteConfig := fakeVC.WriteConfigCalls
+		fakeVC.mu.Unlock()
+		kc := targetCS.Kubernetes.(*fake.Clientset)
+		actionsBefore := len(kc.Actions())
+
+		// Second reconcile: expired JWT must break the short-circuit → full pipeline.
+		res, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimDriftReady))
+
+		// Step 4 minted a new JWT (TokenRequest hit the target apiserver).
+		Expect(len(kc.Actions())).To(BeNumerically(">", actionsBefore), "Step 4 must re-mint the reviewer JWT")
+		// Step 5 writes the token only when Step 4 rotated → proves fall-through.
+		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWriteConfig+1), "Step 5 must rewrite token_reviewer_jwt")
+		Expect(fakeVC.WrittenAuthCfgs[len(fakeVC.WrittenAuthCfgs)-1].TokenReviewerJWT).To(Equal(issuedToken))
+
+		got = getClaim(name)
+		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		c := findCondition(got.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Reason).To(Equal("Rotated"))
+		Expect(got.Status.Vault.TokenReviewerJWT.ExpiresAt.Time).To(BeTemporally("==", fixedNow.Add(24*time.Hour)))
+		Expect(got.Status.Vault.TokenReviewerJWT.LastRotationAttempt.Time).To(BeTemporally("==", fixedNow))
+		Expect(got.Status.Vault.TokenReviewerJWT.LastRotated).NotTo(BeNil())
+	})
+
 	It("Drift: missing auth mount in Vault → falls through, Step 5 re-enables", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name

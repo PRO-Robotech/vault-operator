@@ -43,7 +43,7 @@ type IssuedJWT struct {
 // produces a JWT Vault stores happily
 // but the apiserver rejects with 401 during TokenReview → consumer pods
 // see "permission denied".
-func IssueReviewerJWT(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClaim) (*IssuedJWT, error) {
+func IssueReviewerJWT(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClaim, now time.Time) (*IssuedJWT, error) {
 	ref := claim.Spec.Auth.TokenReviewer.ServiceAccount
 	if ref.Namespace == "" || ref.Name == "" {
 		return nil, fmt.Errorf("tokenReviewer.serviceAccount is required")
@@ -76,11 +76,11 @@ func IssueReviewerJWT(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.V
 	if expiresAt.IsZero() {
 		// Older apiservers and fake clients without a reactor omit the
 		// timestamp — fall back to issuedAt + ttl.
-		expiresAt = time.Now().Add(ttl)
+		expiresAt = now.Add(ttl)
 	}
 	return &IssuedJWT{
 		Token:     resp.Status.Token,
-		IssuedAt:  time.Now(),
+		IssuedAt:  now,
 		ExpiresAt: expiresAt,
 	}, nil
 }
