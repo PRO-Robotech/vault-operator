@@ -54,7 +54,7 @@ func TestIssueReviewerJWT_HappyPath(t *testing.T) {
 	claim := newSampleClaim()
 	claim.Spec.Auth.TokenReviewer.TTL = metav1.Duration{Duration: 12 * time.Hour}
 
-	got, err := IssueReviewerJWT(context.Background(), cs, claim)
+	got, err := IssueReviewerJWT(context.Background(), cs, claim, time.Now())
 	if err != nil {
 		t.Fatalf("IssueReviewerJWT: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestIssueReviewerJWT_DefaultTTL(t *testing.T) {
 	claim := newSampleClaim()
 	// TTL left at zero value → expect 24h default.
 
-	if _, err := IssueReviewerJWT(context.Background(), cs, claim); err != nil {
+	if _, err := IssueReviewerJWT(context.Background(), cs, claim, time.Now()); err != nil {
 		t.Fatalf("issue: %v", err)
 	}
 	tr := kc.Actions()[0].(ktesting.CreateAction).GetObject().(*authenticationv1.TokenRequest)
@@ -110,7 +110,7 @@ func TestIssueReviewerJWT_PropagatesAPIError(t *testing.T) {
 	cs := &ClientSet{Kubernetes: kc}
 
 	claim := newSampleClaim()
-	_, err := IssueReviewerJWT(context.Background(), cs, claim)
+	_, err := IssueReviewerJWT(context.Background(), cs, claim, time.Now())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -124,7 +124,7 @@ func TestIssueReviewerJWT_ErrorsOnEmptyToken(t *testing.T) {
 	cs := &ClientSet{Kubernetes: kc}
 
 	claim := newSampleClaim()
-	_, err := IssueReviewerJWT(context.Background(), cs, claim)
+	_, err := IssueReviewerJWT(context.Background(), cs, claim, time.Now())
 	if err == nil {
 		t.Fatal("expected error for empty token")
 	}

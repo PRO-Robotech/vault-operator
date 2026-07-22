@@ -158,7 +158,7 @@ func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *
 		return Proceed, nil
 	}
 
-	issued, err := target.IssueReviewerJWT(ctx, state.Target, claim)
+	issued, err := target.IssueReviewerJWT(ctx, state.Target, claim, now)
 	if err != nil {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionFalse, claim.Generation,
 			"TokenRequestFailed", err.Error())
