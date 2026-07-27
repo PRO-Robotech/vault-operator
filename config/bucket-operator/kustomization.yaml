@@ -1,0 +1,11 @@
+namespace: bucket-operator-system
+namePrefix: bucket-operator-
+
+resources:
+- manager.yaml
+- rbac.yaml
+
+images:
+- name: controller
+  newName: controller
+  newTag: latest

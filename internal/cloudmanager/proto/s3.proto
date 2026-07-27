@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+// Minimal subset of the cloud-manager S3 contract. Field numbers, proto package
+// and RPC names must match the server wire format.
+package beget.internal.cloud.cloudManager.s3.s3;
+
+option go_package = "github.com/PRO-Robotech/vault-operator/internal/cloudmanager/proto;cloudmanagerpb";
+
+// Bucket creation lives in cloud.CloudService.create with s3_params.
+service CloudS3Service {
+  rpc findAll(FindAllRequest) returns (FindAllResponse) {}
+  rpc removeBucket(RemoveBucketRequest) returns (RemoveBucketResponse) {}
+}
+
+enum Status {
+  RUNNING = 0;
+  CREATING = 1;
+  REMOVING = 2;
+  REMOVED = 3;
+  ERROR = 4;
+  STOPPED = 5;
+}
+
+enum S3BucketManagedBy {
+  SYSTEM = 0;
+  CUSTOMER = 1;
+}
+
+message Bucket {
+  bool public = 1;
+  string name = 2;
+  string cust_login = 3;
+  string access_key = 4;
+  string secret_key = 5;
+  string fqdn = 6;
+  Status status = 7;
+  string cname = 11;
+  S3BucketManagedBy managed_by = 15;
+}
+
+message CreateParams {
+  bool public = 1;
+  string bucket_name = 2;
+  string fqdn = 3;
+  S3BucketManagedBy managed_by = 4;
+}
+
+message CreateError {
+  string message = 1;
+  Code code = 2;
+
+  enum Code {
+    CODE_RESERVED = 0;
+    INSUFFICIENT_FUNDS = 1;
+    CONFIGURATION_NOT_FOUND = 2;
+    INVALID_DISPLAY_NAME = 4;
+    BUCKET_NAME_ALREADY_EXISTS = 8;
+    INVALID_BUCKET_NAME = 9;
+    BUCKET_LIMIT_REACHED = 10;
+    INVALID_DESCRIPTION = 11;
+  }
+}
+
+message FindAllRequest {
+  repeated SearchScope scope = 1;
+
+  message SearchScope {
+    oneof condition {
+      ByCustomerLogin by_customer = 1;
+      ByBucketName by_bucket = 2;
+    }
+
+    message ByCustomerLogin {
+      repeated string login = 1;
+    }
+
+    message ByBucketName {
+      repeated string name = 1;
+    }
+  }
+}
+
+message FindAllResponse {
+  repeated Bucket bucket = 1;
+}
+
+message RemoveBucketRequest {
+  string bucket_name = 1;
+}
+
+message RemoveBucketResponse {
+  Error error = 1;
+
+  message Error {
+    string message = 2;
+  }
+}

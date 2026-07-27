@@ -29,17 +29,23 @@
 - **Нет drift** → claim сразу остаётся `Ready`, шаги 2-7 не выполняются (экономия Vault-запросов).
 - **Есть drift** → событие `DriftDetected`, метрика `vaultclaim_drift_detected_total{drift_type=mount|policy|role}` инкрементируется, дальше идёт полный pipeline и идемпотентные шаги выравнивают состояние.
 
-`status.vault.lastDriftCheckAt` обновляется в обоих случаях.
+`status.vault.lastDriftCheckAt` обновляется в обоих случаях (персистится не чаще heartbeat-интервала, см. ниже).
 
 ## RequeueAfter интервалы
 
 | Ситуация | RequeueAfter |
 |---|---|
 | Pipeline успешно завершён | 10 min (drift detection) |
-| Vault API ошибка / login fail | 30 sec |
+| Vault API ошибка / login fail | 30 sec × 2ⁿ, cap 10 min |
 | Ждём kubeconfig-секрет (есть watch, это fallback) | 5 min |
-| Прочие транзиентные ошибки | 1 min |
+| Прочие транзиентные ошибки | 1 min × 2ⁿ, cap 10 min |
 | Reverse pipeline застрял на Vault | 1 min |
+
+Повторные транзиентные фейлы **одного и того же шага** одного claim'а удваивают интервал до cap 10 min (in-memory; сбрасывается при успехе шага, смене падающего шага или рестарте оператора). Circuit-open Vault-клиента вместо этого выравнивается на следующий probe breaker'а.
+
+## Status heartbeat
+
+Timestamps `lastReconcileAt` / `lastDriftCheckAt` / `tokenReviewerJWT.lastRotationAttempt` сами по себе **не** считаются изменением статуса: они персистятся вместе с содержательными изменениями либо отдельным heartbeat-патчем не чаще раза в 10 минут. Иначе status-patch каждого reconcile порождал watch-событие → немедленный re-enqueue, превращая RequeueAfter в мёртвый код (k8s-625: ретраи к мёртвому кластеру ровно каждые ~40 s без затухания).
 
 ## Watches и event-driven продвижение
 

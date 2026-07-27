@@ -41,6 +41,8 @@ const KubeconfigKey = "value"
 const (
 	defaultTTL      = 5 * time.Minute
 	cleanupInterval = 1 * time.Minute
+
+	requestTimeout = 10 * time.Second
 )
 
 // ClientSet bundles the two kube clients used in a target cluster: a
@@ -116,6 +118,7 @@ func (cm *ClusterManager) Get(_ context.Context, secret *corev1.Secret) (*Client
 	if err != nil {
 		return nil, fmt.Errorf("parse kubeconfig from %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
+	restConfig.Timeout = requestTimeout
 
 	ctrlClient, err := client.New(restConfig, client.Options{Scheme: cm.scheme})
 	if err != nil {

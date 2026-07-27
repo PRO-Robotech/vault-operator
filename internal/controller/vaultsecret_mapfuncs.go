@@ -26,10 +26,14 @@ import (
 // to a reconciler configured for reconcilerOwner. A label-less config belongs to
 // vault-operator for backwards compatibility.
 func ownerMatches(label, reconcilerOwner string) bool {
-	if reconcilerOwner == vaultv1alpha1.OwnerVaultSecretOperator {
+	switch reconcilerOwner {
+	case vaultv1alpha1.OwnerVaultSecretOperator:
 		return label == vaultv1alpha1.OwnerVaultSecretOperator
+	case vaultv1alpha1.OwnerBucketOperator:
+		return label == vaultv1alpha1.OwnerBucketOperator
+	default:
+		return label == "" || label == vaultv1alpha1.OwnerVaultOperator
 	}
-	return label == "" || label == vaultv1alpha1.OwnerVaultOperator
 }
 
 // vaultConfigOwnerPredicate filters the VaultConfig watch at the cache layer to

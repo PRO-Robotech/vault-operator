@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -31,6 +32,7 @@ const (
 	RequeueClaimVaultError     = 30 * time.Second
 	RequeueClaimKubeconfigWait = 5 * time.Minute
 	RequeueClaimTransient      = 1 * time.Minute
+	RequeueClaimBackoffCap     = 10 * time.Minute
 )
 
 type StepResult int
@@ -62,6 +64,7 @@ type pipelineStep struct {
 func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vaultv1alpha1.VaultClaim) ctrl.Result {
 	logger := log.FromContext(ctx)
 	state := &pipelineState{}
+	key := client.ObjectKeyFromObject(claim)
 
 	// specChanged disables short-circuit: new policies/roles in spec would
 	// be missed by drift detection.
@@ -83,11 +86,12 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 	for i, s := range steps {
 		res, err := s.fn(ctx, claim, state)
 		if err != nil {
-			// Short-circuit: requeue at the next probe, not the fixed step interval.
-			requeue := s.waitInterval
+			var requeue time.Duration
 			var co *vault.CircuitOpenError
 			if errors.As(err, &co) {
 				requeue = requeueForCircuit(co.RetryAfter)
+			} else {
+				requeue = r.backoff.Next(key, s.name, s.waitInterval, RequeueClaimBackoffCap)
 			}
 			logger.Info("pipeline step failed (will retry)", "step", s.name, "error", err.Error(), "requeueAfter", requeue.String())
 			if r.Recorder != nil {
@@ -98,16 +102,19 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 		}
 		if res == Wait {
 			logger.V(1).Info("pipeline step waiting", "step", s.name)
+			r.backoff.Reset(key)
 			return ctrl.Result{RequeueAfter: s.waitInterval}
 		}
 
 		if i == 0 && wasReady && !specChanged && state.Vault != nil {
 			if early, res := r.driftCheckAndMaybeShortCircuit(ctx, claim, state); early {
+				r.backoff.Reset(key)
 				return res
 			}
 		}
 	}
 
+	r.backoff.Reset(key)
 	setReady(claim)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(claim, corev1.EventTypeNormal, "VaultClaimReady",

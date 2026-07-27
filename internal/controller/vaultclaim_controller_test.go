@@ -792,6 +792,9 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		fakeVC.ListPoliciesResp = nil // spec has no policies
 		fakeVC.ListRolesResp = nil    // spec has no roles
 
+		// Advance past the heartbeat interval so the drift timestamp persists.
+		fixedNow = fixedNow.Add(statusHeartbeatInterval)
+
 		// Second reconcile: drift hook should short-circuit.
 		res, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
@@ -1217,6 +1220,108 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		// Drift detector saw the extra role → fell through → Step 7 purged it.
 		Expect(fakeVC.DeletedRoles).To(ContainElement("rogue-role"))
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+	})
+
+	It("Heartbeat: no-change reconciles don't patch status; heartbeat flushes after the interval", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		// Drive to Ready, then prime "no drift" so later passes short-circuit.
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+
+		// Within the heartbeat interval: nothing material changed → no write,
+		// no ResourceVersion churn, no watch echo.
+		fixedNow = fixedNow.Add(time.Minute)
+		rvBefore := getClaim(name).ResourceVersion
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getClaim(name).ResourceVersion).To(Equal(rvBefore), "heartbeat-only diff must not patch status")
+
+		// Past the interval: a single heartbeat patch persists the timestamps.
+		fixedNow = fixedNow.Add(statusHeartbeatInterval)
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		got := getClaim(name)
+		Expect(got.ResourceVersion).NotTo(Equal(rvBefore))
+		Expect(got.Status.Vault.LastReconcileAt.Time).To(BeTemporally("==", fixedNow))
+	})
+
+	It("Backoff: repeated failures of one step grow the requeue exponentially, success resets", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		// Step 3 fails: target cluster unreachable (the k8s-625 scenario).
+		fakeTarget.Err = errors.New("dial tcp 89.0.0.1:6443: i/o timeout")
+
+		res, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimTransient))
+		rvAfterFirstFailure := getClaim(name).ResourceVersion
+
+		res, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(2 * RequeueClaimTransient))
+
+		res, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(4 * RequeueClaimTransient))
+
+		// Identical failures produce no status churn (no watch echo to defeat
+		// the growing RequeueAfter).
+		Expect(getClaim(name).ResourceVersion).To(Equal(rvAfterFirstFailure))
+
+		// Target recovers → pipeline completes → backoff record dropped.
+		fakeTarget.Err = nil
+		res, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimDriftReady))
+		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+
+		// A fresh failure starts over from the base interval.
+		fakeTarget.Err = errors.New("dial tcp 89.0.0.1:6443: i/o timeout")
+		res, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimTransient))
 	})
 })
 
