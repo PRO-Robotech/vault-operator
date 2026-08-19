@@ -44,5 +44,5 @@ func s3EndpointForRegion(region string) string {
 	if region == "" {
 		region = "ru1"
 	}
-	return fmt.Sprintf("https://s3.%s.storage.beget.cloud", region)
+	return fmt.Sprintf("s3.%s.storage.beget.cloud", region)
 }
