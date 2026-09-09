@@ -1,0 +1,49 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - vault.in-cloud.io
+  resources:
+  - vaultconfigs
+  - vaultsecretclaims
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vault.in-cloud.io
+  resources:
+  - vaultconfigs/finalizers
+  - vaultsecretclaims/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - vault.in-cloud.io
+  resources:
+  - vaultconfigs/status
+  - vaultsecretclaims/status
+  verbs:
+  - get
+  - patch
+  - update

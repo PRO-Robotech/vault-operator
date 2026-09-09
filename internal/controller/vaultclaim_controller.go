@@ -66,12 +66,7 @@ const defaultMaxConcurrentReconciles = 4
 // turning every RequeueAfter into dead code (k8s-625).
 const statusHeartbeatInterval = 10 * time.Minute
 
-// +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultclaims/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultclaims/finalizers,verbs=update
-// +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// RBAC markers: internal/rbac/vaultoperator.
 
 func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("vaultclaim", req.NamespacedName)

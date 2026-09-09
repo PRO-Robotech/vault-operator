@@ -29,6 +29,7 @@ type VaultClient interface {
 	SealStatus(ctx context.Context) (*vault.SealStatus, error)
 	Login(ctx context.Context) error
 	SharedMountExists(ctx context.Context, path string) (bool, error)
+	MountExists(ctx context.Context, path, typePrefix string) (bool, error)
 	Token() string
 	ClearToken()
 
@@ -41,10 +42,16 @@ type VaultClient interface {
 	PutPolicy(ctx context.Context, name, hcl string) error
 	DeletePolicy(ctx context.Context, name string) error
 	ListPolicies(ctx context.Context) ([]string, error)
+	ReadPolicy(ctx context.Context, name string) (string, error)
 
 	PutKubernetesRole(ctx context.Context, mount, name string, role vault.KubernetesRole) error
 	DeleteKubernetesRole(ctx context.Context, mount, name string) error
 	ListKubernetesRoles(ctx context.Context, mount string) ([]string, error)
+	ReadKubernetesRole(ctx context.Context, mount, name string) (*vault.KubernetesRole, error)
+
+	ReadTransitKey(ctx context.Context, mount, name string) (*vault.TransitKey, error)
+	CreateTransitKey(ctx context.Context, mount, name string, req vault.CreateTransitKeyRequest) error
+	UpdateTransitKeyConfig(ctx context.Context, mount, name string, cfg vault.TransitKeyConfig) error
 }
 
 var _ VaultClient = (*vault.Client)(nil)

@@ -74,3 +74,27 @@ func (c *Client) ListPolicies(ctx context.Context) ([]string, error) {
 	}
 	return raw.Data.Keys, nil
 }
+
+// ReadPolicy returns a policy's HCL body, for content drift.
+func (c *Client) ReadPolicy(ctx context.Context, name string) (string, error) {
+	n := strings.Trim(name, "/")
+	if n == "" {
+		return "", fmt.Errorf("policy name is empty")
+	}
+	resp, err := c.Do(ctx, &Request{
+		Method: http.MethodGet,
+		Path:   "sys/policies/acl/" + n,
+	})
+	if err != nil {
+		return "", err
+	}
+	var raw struct {
+		Data struct {
+			Policy string `json:"policy"`
+		} `json:"data"`
+	}
+	if err := resp.Decode(&raw); err != nil {
+		return "", fmt.Errorf("decode sys/policies/acl/%s: %w", n, err)
+	}
+	return raw.Data.Policy, nil
+}

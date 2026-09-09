@@ -97,7 +97,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		Expect(vaultData["bucketName"]).To(Equal(realName))
 		Expect(vaultData["accessKey"]).To(HavePrefix("AK-"))
 		Expect(vaultData["secretKey"]).To(HavePrefix("SK-"))
-		Expect(vaultData["endpoint"]).To(Equal("https://s3.ru1.storage.beget.cloud"))
+		Expect(vaultData["endpoint"]).To(Equal("s3.ru1.storage.beget.cloud"))
 		Expect(vaultData["s3ForcePathStyle"]).To(Equal("true"))
 	})
 
