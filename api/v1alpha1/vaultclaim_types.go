@@ -33,7 +33,10 @@ const (
 	ConditionPoliciesApplied       = "PoliciesApplied"
 	ConditionRolesApplied          = "RolesApplied"
 	ConditionTokenReviewerJWTFresh = "TokenReviewerJWTFresh"
+	ConditionTransitKeysReady      = "TransitKeysReady"
 )
+
+// DeletionPolicy values are shared with VaultSecretClaim. Neither ever deletes a Transit key.
 
 const VaultClaimFinalizer = "vault.in-cloud.io/finalizer"
 
@@ -148,6 +151,79 @@ type RoleSpec struct {
 
 	// +optional
 	TokenMaxTTL *metav1.Duration `json:"tokenMaxTTL,omitempty"`
+
+	// Audience is the `aud` claim Vault verifies in the login JWT. Without it the
+	// role accepts any token of the bound ServiceAccount.
+	// +optional
+	Audience string `json:"audience,omitempty"`
+
+	// TokenType is restricted to "service": batch tokens cannot be renewed and
+	// cannot carry an explicit max TTL.
+	// +kubebuilder:validation:Enum=service
+	// +optional
+	TokenType string `json:"tokenType,omitempty"`
+
+	// TokenNoDefaultPolicy drops Vault's built-in `default` policy. The referenced
+	// policies must then grant auth/token/lookup-self themselves.
+	// +optional
+	TokenNoDefaultPolicy bool `json:"tokenNoDefaultPolicy,omitempty"`
+
+	// TokenExplicitMaxTTL is a hard cap that renewal cannot extend past.
+	// +optional
+	TokenExplicitMaxTTL *metav1.Duration `json:"tokenExplicitMaxTTL,omitempty"`
+}
+
+// TransitKeySpec declares one encryption key. Hardening fields default to their
+// safe values. Type and Derived are fixed at creation; Exportable and
+// AllowPlaintextBackup can be turned on later but never off.
+type TransitKeySpec struct {
+	// Uniqueness scoped to {mountPath}/keys/.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// +kubebuilder:validation:Enum=aes256-gcm96;aes128-gcm96;chacha20-poly1305
+	// +kubebuilder:default=aes256-gcm96
+	// +optional
+	Type string `json:"type,omitempty"`
+
+	// Derived requires a context on every operation; envelope consumers supply none.
+	// +kubebuilder:default=false
+	// +optional
+	Derived bool `json:"derived,omitempty"`
+
+	// +kubebuilder:default=false
+	// +optional
+	Exportable bool `json:"exportable,omitempty"`
+
+	// +kubebuilder:default=false
+	// +optional
+	AllowPlaintextBackup bool `json:"allowPlaintextBackup,omitempty"`
+
+	// DeletionAllowed governs manual deletion in Vault; the operator never deletes keys.
+	// +kubebuilder:default=false
+	// +optional
+	DeletionAllowed bool `json:"deletionAllowed,omitempty"`
+
+	// AutoRotatePeriod of zero disables rotation. Rotating requires rewriting
+	// previously written data, so it is a procedure rather than a background job.
+	// +optional
+	AutoRotatePeriod *metav1.Duration `json:"autoRotatePeriod,omitempty"`
+}
+
+// TransitSpec describes the Transit keys this claim owns. The engine itself is
+// a platform-level object the operator verifies but never manages.
+type TransitSpec struct {
+	// MountPath of an existing Transit secrets engine.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:default=transit
+	// +optional
+	MountPath string `json:"mountPath,omitempty"`
+
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MinItems=1
+	// +optional
+	Keys []TransitKeySpec `json:"keys,omitempty"`
 }
 
 // PolicySpec defines an ACL policy written as HCL into Vault. Names should
@@ -169,6 +245,7 @@ type PolicySpec struct {
 // +kubebuilder:validation:XValidation:rule="self.secretsPrefix == oldSelf.secretsPrefix",message="spec.secretsPrefix is immutable"
 // +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="spec.clusterRef.name is immutable"
 // +kubebuilder:validation:XValidation:rule="self.auth.mountPath == oldSelf.auth.mountPath",message="spec.auth.mountPath is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.transit) || !has(oldSelf.transit) || self.transit.mountPath == oldSelf.transit.mountPath",message="spec.transit.mountPath is immutable"
 type VaultClaimSpec struct {
 	// VaultConfigRef is mutable — changing it migrates this claim to a
 	// different Vault.
@@ -195,6 +272,18 @@ type VaultClaimSpec struct {
 	// +listMapKey=name
 	// +optional
 	Policies []PolicySpec `json:"policies,omitempty"`
+
+	// Transit declares encryption keys owned by this claim; absent skips the step.
+	// +optional
+	Transit *TransitSpec `json:"transit,omitempty"`
+
+	// DeletionPolicy controls what deletion removes from Vault. Purge (default)
+	// also disables the auth mount; Retain leaves it for its other consumers.
+	// Transit keys are never deleted under either.
+	// +kubebuilder:validation:Enum=Retain;Purge
+	// +kubebuilder:default=Purge
+	// +optional
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 }
 
 // TokenReviewerJWTStatus tracks the reviewer JWT lifecycle.
@@ -208,6 +297,19 @@ type TokenReviewerJWTStatus struct {
 	// LastRotationAttempt records the last attempt, successful or not.
 	// +optional
 	LastRotationAttempt *metav1.Time `json:"lastRotationAttempt,omitempty"`
+}
+
+// TransitKeyStatus is the observed state of one Transit key, read back from Vault.
+type TransitKeyStatus struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// +optional
+	LatestVersion int `json:"latestVersion,omitempty"`
+
+	// CreatedByClaim distinguishes a key this operator created from an adopted one.
+	// +optional
+	CreatedByClaim bool `json:"createdByClaim,omitempty"`
 }
 
 // VaultStatusSummary is a compact view of the actual Vault state.
@@ -234,6 +336,13 @@ type VaultStatusSummary struct {
 
 	// +optional
 	TokenReviewerJWT *TokenReviewerJWTStatus `json:"tokenReviewerJWT,omitempty"`
+
+	// TransitKeys is the ledger of keys this claim observed or created. A recorded
+	// key that later disappears is reported, never recreated.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	TransitKeys []TransitKeyStatus `json:"transitKeys,omitempty"`
 
 	// +optional
 	LastReconcileAt *metav1.Time `json:"lastReconcileAt,omitempty"`

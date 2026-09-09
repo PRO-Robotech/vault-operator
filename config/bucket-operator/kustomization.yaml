@@ -3,6 +3,7 @@ namePrefix: bucket-operator-
 
 resources:
 - manager.yaml
+- role.yaml
 - rbac.yaml
 
 images:

@@ -12,6 +12,7 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -26,6 +27,11 @@ type KubernetesRole struct {
 	TokenPolicies                 []string `json:"token_policies"`
 	TokenTTLSeconds               int      `json:"token_ttl"`
 	TokenMaxTTLSeconds            int      `json:"token_max_ttl"`
+
+	Audience                string `json:"audience,omitempty"`
+	TokenType               string `json:"token_type,omitempty"`
+	TokenNoDefaultPolicy    bool   `json:"token_no_default_policy,omitempty"`
+	TokenExplicitMaxTTLSecs int    `json:"token_explicit_max_ttl,omitempty"`
 }
 
 func (c *Client) PutKubernetesRole(ctx context.Context, mount, name string, role KubernetesRole) error {
@@ -93,4 +99,57 @@ func (c *Client) ListKubernetesRoles(ctx context.Context, mount string) ([]strin
 		return nil, fmt.Errorf("decode auth/%s/role list: %w", m, err)
 	}
 	return raw.Data.Keys, nil
+}
+
+// ReadKubernetesRole returns a role's live parameters, for content drift.
+func (c *Client) ReadKubernetesRole(ctx context.Context, mount, name string) (*KubernetesRole, error) {
+	m := strings.Trim(mount, "/")
+	n := strings.Trim(name, "/")
+	if m == "" || n == "" {
+		return nil, fmt.Errorf("mount or role name is empty")
+	}
+	resp, err := c.Do(ctx, &Request{
+		Method: http.MethodGet,
+		Path:   "auth/" + m + "/role/" + n,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Data struct {
+			BoundServiceAccountNames      []string    `json:"bound_service_account_names"`
+			BoundServiceAccountNamespaces []string    `json:"bound_service_account_namespaces"`
+			TokenPolicies                 []string    `json:"token_policies"`
+			TokenTTL                      json.Number `json:"token_ttl"`
+			TokenMaxTTL                   json.Number `json:"token_max_ttl"`
+			TokenExplicitMaxTTL           json.Number `json:"token_explicit_max_ttl"`
+			Audience                      string      `json:"audience"`
+			TokenType                     string      `json:"token_type"`
+			TokenNoDefaultPolicy          bool        `json:"token_no_default_policy"`
+		} `json:"data"`
+	}
+	if err := resp.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode auth/%s/role/%s: %w", m, n, err)
+	}
+	asInt := func(v json.Number) int {
+		if v == "" {
+			return 0
+		}
+		i, convErr := v.Int64()
+		if convErr != nil {
+			return 0
+		}
+		return int(i)
+	}
+	return &KubernetesRole{
+		BoundServiceAccountNames:      raw.Data.BoundServiceAccountNames,
+		BoundServiceAccountNamespaces: raw.Data.BoundServiceAccountNamespaces,
+		TokenPolicies:                 raw.Data.TokenPolicies,
+		TokenTTLSeconds:               asInt(raw.Data.TokenTTL),
+		TokenMaxTTLSeconds:            asInt(raw.Data.TokenMaxTTL),
+		TokenExplicitMaxTTLSecs:       asInt(raw.Data.TokenExplicitMaxTTL),
+		Audience:                      raw.Data.Audience,
+		TokenType:                     raw.Data.TokenType,
+		TokenNoDefaultPolicy:          raw.Data.TokenNoDefaultPolicy,
+	}, nil
 }

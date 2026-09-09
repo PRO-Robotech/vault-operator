@@ -135,6 +135,16 @@ spec:
                 required:
                 - name
                 type: object
+              deletionPolicy:
+                default: Purge
+                description: |-
+                  DeletionPolicy controls what deletion removes from Vault. Purge (default)
+                  also disables the auth mount; Retain leaves it for its other consumers.
+                  Transit keys are never deleted under either.
+                enum:
+                - Retain
+                - Purge
+                type: string
               policies:
                 items:
                   description: |-
@@ -165,6 +175,11 @@ spec:
                     RoleSpec binds {SA, namespace} to a list of policies inside the
                     per-cluster auth mount.
                   properties:
+                    audience:
+                      description: |-
+                        Audience is the `aud` claim Vault verifies in the login JWT. Without it the
+                        role accepts any token of the bound ServiceAccount.
+                      type: string
                     boundServiceAccounts:
                       description: |-
                         BoundServiceAccounts identifies the single ServiceAccount allowed to log
@@ -202,9 +217,25 @@ spec:
                         type: string
                       minItems: 1
                       type: array
+                    tokenExplicitMaxTTL:
+                      description: TokenExplicitMaxTTL is a hard cap that renewal
+                        cannot extend past.
+                      type: string
                     tokenMaxTTL:
                       type: string
+                    tokenNoDefaultPolicy:
+                      description: |-
+                        TokenNoDefaultPolicy drops Vault's built-in `default` policy. The referenced
+                        policies must then grant auth/token/lookup-self themselves.
+                      type: boolean
                     tokenTTL:
+                      type: string
+                    tokenType:
+                      description: |-
+                        TokenType is restricted to "service": batch tokens cannot be renewed and
+                        cannot carry an explicit max TTL.
+                      enum:
+                      - service
                       type: string
                   required:
                   - boundServiceAccounts
@@ -221,6 +252,63 @@ spec:
                   policies. Convention: "clusters/{metadata.name}". Immutable.
                 minLength: 1
                 type: string
+              transit:
+                description: Transit declares encryption keys owned by this claim;
+                  absent skips the step.
+                properties:
+                  keys:
+                    items:
+                      description: |-
+                        TransitKeySpec declares one encryption key. Hardening fields default to their
+                        safe values. Type and Derived are fixed at creation; Exportable and
+                        AllowPlaintextBackup can be turned on later but never off.
+                      properties:
+                        allowPlaintextBackup:
+                          default: false
+                          type: boolean
+                        autoRotatePeriod:
+                          description: |-
+                            AutoRotatePeriod of zero disables rotation. Rotating requires rewriting
+                            previously written data, so it is a procedure rather than a background job.
+                          type: string
+                        deletionAllowed:
+                          default: false
+                          description: DeletionAllowed governs manual deletion in
+                            Vault; the operator never deletes keys.
+                          type: boolean
+                        derived:
+                          default: false
+                          description: Derived requires a context on every operation;
+                            envelope consumers supply none.
+                          type: boolean
+                        exportable:
+                          default: false
+                          type: boolean
+                        name:
+                          description: Uniqueness scoped to {mountPath}/keys/.
+                          minLength: 1
+                          type: string
+                        type:
+                          default: aes256-gcm96
+                          enum:
+                          - aes256-gcm96
+                          - aes128-gcm96
+                          - chacha20-poly1305
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  mountPath:
+                    default: transit
+                    description: MountPath of an existing Transit secrets engine.
+                    minLength: 1
+                    type: string
+                type: object
               vaultConfigRef:
                 description: |-
                   VaultConfigRef is mutable — changing it migrates this claim to a
@@ -245,6 +333,9 @@ spec:
               rule: self.clusterRef.name == oldSelf.clusterRef.name
             - message: spec.auth.mountPath is immutable
               rule: self.auth.mountPath == oldSelf.auth.mountPath
+            - message: spec.transit.mountPath is immutable
+              rule: '!has(self.transit) || !has(oldSelf.transit) || self.transit.mountPath
+                == oldSelf.transit.mountPath'
           status:
             description: VaultClaimStatus is the observed state of VaultClaim.
             properties:
@@ -368,6 +459,30 @@ spec:
                         format: date-time
                         type: string
                     type: object
+                  transitKeys:
+                    description: |-
+                      TransitKeys is the ledger of keys this claim observed or created. A recorded
+                      key that later disappears is reported, never recreated.
+                    items:
+                      description: TransitKeyStatus is the observed state of one Transit
+                        key, read back from Vault.
+                      properties:
+                        createdByClaim:
+                          description: CreatedByClaim distinguishes a key this operator
+                            created from an adopted one.
+                          type: boolean
+                        latestVersion:
+                          type: integer
+                        name:
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                 type: object
             type: object
         required:

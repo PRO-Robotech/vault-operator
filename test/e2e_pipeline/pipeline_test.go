@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -140,6 +141,11 @@ func TestPipelineE2E(t *testing.T) {
 		t.Fatalf("bootstrap vault: %v", err)
 	}
 
+	// Mounted by the harness: the operator policy has no sys/mounts write.
+	if err := EnableTransitMount(ctx, vaultSrv, "transit"); err != nil {
+		t.Fatalf("enable transit mount: %v", err)
+	}
+
 	// Build reconcilers using the real factory + real target.ClusterManager.
 	factory := &controller.DefaultVaultClientFactory{
 		JWTSource: vault.StaticJWTSource(operatorJWT),
@@ -219,6 +225,12 @@ func TestPipelineE2E(t *testing.T) {
 					TTL: metav1.Duration{Duration: 24 * time.Hour},
 				},
 			},
+			Transit: &vaultv1alpha1.TransitSpec{
+				MountPath: "transit",
+				Keys: []vaultv1alpha1.TransitKeySpec{
+					{Name: claimName + "-l2", Type: "aes256-gcm96"},
+				},
+			},
 			Policies: []vaultv1alpha1.PolicySpec{
 				{Name: claimName + "-vmauth-reader", Rules: `path "secret/data/clusters/` + claimName + `/monitoring/vmauth/*" { capabilities = ["read", "list"] }`},
 			},
@@ -268,6 +280,57 @@ func TestPipelineE2E(t *testing.T) {
 	if _, ok := mounts["kubernetes-"+claimName+"/"]; !ok {
 		t.Fatalf("expected auth mount kubernetes-%s/ in Vault, got %v", claimName, mounts)
 	}
+	// --- Transit ---
+	keyName := claimName + "-l2"
+	liveKey, err := directClient.ReadTransitKey(ctx, "transit", keyName)
+	if err != nil {
+		t.Fatalf("read transit key %q: %v", keyName, err)
+	}
+	if liveKey.Type != "aes256-gcm96" {
+		t.Errorf("transit key type = %q, want aes256-gcm96", liveKey.Type)
+	}
+	if liveKey.Exportable || liveKey.AllowPlaintextBackup || liveKey.DeletionAllowed || liveKey.Derived {
+		t.Errorf("transit key is not hardened: %+v", liveKey)
+	}
+	// The 1.20.x docs omit latest_version from the sample response; assert it live.
+	if liveKey.LatestVersion != 1 {
+		t.Errorf("transit key latest_version = %d, want 1", liveKey.LatestVersion)
+	}
+
+	rawKey, err := ReadTransitKeyRaw(ctx, vaultSrv, "transit", keyName)
+	if err != nil {
+		t.Fatalf("raw read transit key: %v", err)
+	}
+	if rawKey["deletion_allowed"] != false {
+		t.Errorf("raw deletion_allowed = %v, want false", rawKey["deletion_allowed"])
+	}
+
+	readyClaim := &vaultv1alpha1.VaultClaim{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, readyClaim); err != nil {
+		t.Fatalf("get claim: %v", err)
+	}
+	if !isConditionTrue(readyClaim.Status.Conditions, "TransitKeysReady") {
+		t.Errorf("TransitKeysReady is not True: %+v", readyClaim.Status.Conditions)
+	}
+	if len(readyClaim.Status.Vault.TransitKeys) != 1 {
+		t.Fatalf("status ledger = %+v, want one key", readyClaim.Status.Vault.TransitKeys)
+	}
+	ledger := readyClaim.Status.Vault.TransitKeys[0]
+	if ledger.Name != keyName || ledger.LatestVersion != 1 || !ledger.CreatedByClaim {
+		t.Errorf("ledger entry = %+v, want name=%s version=1 createdByClaim=true", ledger, keyName)
+	}
+
+	// The policy is the boundary, not the absence of a method.
+	if _, err := directClient.Do(ctx, &vault.Request{
+		Method: http.MethodPost,
+		Path:   "transit/encrypt/" + keyName,
+		Body:   map[string]string{"plaintext": "dGVzdA=="},
+	}); err == nil {
+		t.Error("operator token could encrypt; its policy must exclude the data plane")
+	} else if !vault.IsForbidden(err) {
+		t.Errorf("encrypt rejected with %v, want 403", err)
+	}
+
 	roles, err := directClient.ListKubernetesRoles(ctx, "kubernetes-"+claimName)
 	if err != nil {
 		t.Fatalf("list roles: %v", err)

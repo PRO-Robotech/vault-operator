@@ -97,7 +97,7 @@ status:
   phase: Ready                       # Pending | Provisioning | Ready | Failed | Deleting
   bucketName: k8s-dlputi1u-ec8a00
   bucketStatus: RUNNING              # зеркало s3.Status (CREATING/RUNNING/ERROR/...)
-  endpoint: k8s-dlputi1u-ec8a00.s3.beget.cloud   # из Bucket.Fqdn
+  endpoint: s3.ru1.storage.beget.cloud   # s3EndpointForRegion(spec.region), без схемы
   keysWrittenHash: "9f2c…"           # hash(accessKey+secretKey+bucketName+endpoint) — детект ротации/дрифта
   observedGeneration: 2
   conditions:
@@ -138,12 +138,12 @@ status:
 accessKey:       AKIA...
 secretKey:       ...
 bucketName:      k8s-dlputi1u-ec8a00        # = Bucket.name
-endpoint:        https://s3.ru1.storage.beget.cloud   # per-region ceph S3, path-style
+endpoint:        s3.ru1.storage.beget.cloud   # per-region ceph S3, path-style; схему дописывает чарт-потребитель
 region:          ru1
 s3ForcePathStyle: "true"                    # ceph требует path-style, не virtual-host
 ```
 
-> **Endpoint — фиксированный per-region ceph-хост** (`s3.<region>.storage.beget.cloud`), а не домен бакета: в референсе `Repository::getS3URL()` захардкожен `https://s3.ru1.storage.beget.cloud`, регион кластера у cloud-manager для s3 пока тоже фиксирован `ru1` (TODO на их стороне — см. §10 П3). `Bucket.Fqdn`/`Cname` (домен самого бакета) для backup-потребителя не нужны — они для публичного доступа.
+> **Endpoint — фиксированный per-region ceph-хост** (`s3.<region>.storage.beget.cloud`), а не домен бакета: в PHP-референсе `Repository::getS3URL()` захардкожен `https://s3.ru1.storage.beget.cloud` — это его собственный литерал, к формату нашего ключа отношения не имеющий, регион кластера у cloud-manager для s3 пока тоже фиксирован `ru1` (TODO на их стороне — см. §10 П3). `Bucket.Fqdn`/`Cname` (домен самого бакета) для backup-потребителя не нужны — они для публичного доступа.
 
 Запись — read-modify-write merge (переиспользовать `internal/vault/kv.go`): соседние ключи листа не клобберятся; запись только при `hash(входа) != status.keysWrittenHash` — не жечь KV-версии.
 

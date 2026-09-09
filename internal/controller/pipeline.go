@@ -79,6 +79,7 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 		{name: "EnsureTargetSA", fn: r.stepEnsureTargetSA, waitInterval: RequeueClaimTransient},
 		{name: "IssueReviewerJWT", fn: r.stepIssueReviewerJWT, waitInterval: RequeueClaimTransient},
 		{name: "EnableAuthMount", fn: r.stepEnableAuthMount, waitInterval: RequeueClaimVaultError},
+		{name: "EnsureTransitKeys", fn: r.stepEnsureTransitKeys, waitInterval: RequeueClaimVaultError},
 		{name: "ApplyPolicies", fn: r.stepApplyPolicies, waitInterval: RequeueClaimTransient},
 		{name: "ApplyRoles", fn: r.stepApplyRoles, waitInterval: RequeueClaimTransient},
 	}
