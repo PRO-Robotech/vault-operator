@@ -1,5 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+IMG_VAULTSECRET ?= vault-secret-operator:latest
+IMG_BUCKET ?= bucket-operator:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -43,7 +45,13 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	"$(CONTROLLER_GEN)" crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role paths="./internal/rbac/vaultoperator/..." output:rbac:artifacts:config=config/rbac
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role paths="./internal/rbac/vaultsecret/..." output:rbac:artifacts:config=config/secret-manager
+	"$(CONTROLLER_GEN)" rbac:roleName=manager-role paths="./internal/rbac/bucket/..." output:rbac:artifacts:config=config/bucket-operator
+	@for f in config/rbac/role.yaml config/secret-manager/role.yaml config/bucket-operator/role.yaml; do \
+		grep -q apiGroups "$$f" 2>/dev/null || { echo "manifests: $$f is missing or has no rules — did a marker package under internal/rbac lose its markers?"; exit 1; }; \
+	done
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -118,6 +126,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 build: manifests generate fmt vet ## Build manager binaries.
 	go build -o bin/manager cmd/main.go
 	go build -o bin/vault-secret-manager cmd/vaultsecret/main.go
+	go build -o bin/bucket-operator cmd/bucket/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -129,6 +138,14 @@ run: manifests generate fmt vet ## Run a controller from your host.
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
+
+.PHONY: docker-build-vaultsecret
+docker-build-vaultsecret: ## Build docker image with the vault-secret-manager.
+	$(CONTAINER_TOOL) build -f Dockerfile.vaultsecret -t ${IMG_VAULTSECRET} .
+
+.PHONY: docker-build-bucket
+docker-build-bucket: ## Build docker image with the bucket-operator.
+	$(CONTAINER_TOOL) build -f Dockerfile.bucket -t ${IMG_BUCKET} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

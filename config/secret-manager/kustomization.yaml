@@ -3,6 +3,7 @@ namePrefix: vault-secret-operator-
 
 resources:
 - manager.yaml
+- role.yaml
 - rbac.yaml
 
 images:

@@ -33,6 +33,12 @@ const (
 // without losing cardinality control.
 const PathOther = "other"
 
+// Transit path buckets.
+const (
+	PathTransitKey       = "transit_key"
+	PathTransitKeyConfig = "transit_key_config"
+)
+
 var APIResponsesTotal = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "vault_api_responses_total",
@@ -79,6 +85,14 @@ func normalizePath(p string) string {
 		return normalizeSysPath(parts)
 	case "auth":
 		return normalizeAuthPath(parts)
+	}
+
+	// The mount path is configurable, so match {mount}/keys/{name}[/config] by shape.
+	if len(parts) >= 3 && parts[1] == "keys" {
+		if len(parts) >= 4 && parts[3] == "config" {
+			return PathTransitKeyConfig
+		}
+		return PathTransitKey
 	}
 	return PathOther
 }

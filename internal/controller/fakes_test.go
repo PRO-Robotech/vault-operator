@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -62,6 +63,26 @@ type fakeVaultClient struct {
 	ListRolesErr  error
 	WrittenRoles  map[string]vault.KubernetesRole
 	DeletedRoles  []string
+
+	// Transit. TransitKeys is keyed "mount/name" and doubles as the engine's
+	// contents: absent means the read returns NotFound.
+	MountExistsResp       map[string]bool
+	MountExistsErr        error
+	MountExistsArgs       []string
+	TransitKeys           map[string]*vault.TransitKey
+	ReadTransitKeyErr     error
+	CreateTransitKeyErr   error
+	UpdateTransitCfgErr   error
+	CreatedTransitKeys    map[string]vault.CreateTransitKeyRequest
+	UpdatedTransitCfgs    map[string]vault.TransitKeyConfig
+	ReadPolicyErr         error
+	ReadRoleErr           error
+	ReadPolicyCalls       int
+	ReadRoleCalls         int
+	MountExistsCalls      int
+	ReadTransitKeyCalls   int
+	CreateTransitKeyCalls int
+	UpdateTransitCfgCalls int
 
 	SealCalls           int
 	LoginCalls          int
@@ -242,6 +263,119 @@ func (f *fakeVaultClient) ListKubernetesRoles(_ context.Context, _ string) ([]st
 		return nil, f.ListRolesErr
 	}
 	return f.ListRolesResp, nil
+}
+
+func (f *fakeVaultClient) ReadPolicy(_ context.Context, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadPolicyCalls++
+	if f.ReadPolicyErr != nil {
+		return "", f.ReadPolicyErr
+	}
+	if hcl, ok := f.WrittenPolicies[name]; ok {
+		return hcl, nil
+	}
+	return "", &vault.APIError{Method: http.MethodGet, Path: "sys/policies/acl/" + name, StatusCode: http.StatusNotFound}
+}
+
+func (f *fakeVaultClient) ReadKubernetesRole(_ context.Context, _, name string) (*vault.KubernetesRole, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadRoleCalls++
+	if f.ReadRoleErr != nil {
+		return nil, f.ReadRoleErr
+	}
+	if role, ok := f.WrittenRoles[name]; ok {
+		clone := role
+		return &clone, nil
+	}
+	return nil, &vault.APIError{Method: http.MethodGet, Path: "role/" + name, StatusCode: http.StatusNotFound}
+}
+
+func (f *fakeVaultClient) MountExists(_ context.Context, path, typePrefix string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.MountExistsCalls++
+	f.MountExistsArgs = append(f.MountExistsArgs, path+":"+typePrefix)
+	if f.MountExistsErr != nil {
+		return false, f.MountExistsErr
+	}
+	if resp, ok := f.MountExistsResp[path]; ok {
+		return resp, nil
+	}
+	// Default to "kv mounts exist, everything else does not" so tests that
+	// predate Transit keep their old SharedMountExists behaviour.
+	if typePrefix == "kv" {
+		return f.SharedMountResp, nil
+	}
+	return false, nil
+}
+
+// TransitKeys is the fake's stand-in for the engine: present names decode as
+// live keys, absent ones produce the NotFound the real client returns.
+func (f *fakeVaultClient) ReadTransitKey(_ context.Context, mount, name string) (*vault.TransitKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadTransitKeyCalls++
+	if f.ReadTransitKeyErr != nil {
+		return nil, f.ReadTransitKeyErr
+	}
+	key, ok := f.TransitKeys[mount+"/"+name]
+	if !ok {
+		return nil, &vault.APIError{
+			Method:     http.MethodGet,
+			Path:       mount + "/keys/" + name,
+			StatusCode: http.StatusNotFound,
+		}
+	}
+	clone := *key
+	return &clone, nil
+}
+
+func (f *fakeVaultClient) CreateTransitKey(_ context.Context, mount, name string, req vault.CreateTransitKeyRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.CreateTransitKeyCalls++
+	if f.CreateTransitKeyErr != nil {
+		return f.CreateTransitKeyErr
+	}
+	if f.TransitKeys == nil {
+		f.TransitKeys = map[string]*vault.TransitKey{}
+	}
+	if f.CreatedTransitKeys == nil {
+		f.CreatedTransitKeys = map[string]vault.CreateTransitKeyRequest{}
+	}
+	f.CreatedTransitKeys[mount+"/"+name] = req
+	f.TransitKeys[mount+"/"+name] = &vault.TransitKey{
+		Name:                 name,
+		Type:                 req.Type,
+		Derived:              req.Derived,
+		Exportable:           req.Exportable,
+		AllowPlaintextBackup: req.AllowPlaintextBackup,
+		AutoRotatePeriod:     req.AutoRotatePeriodSecs,
+		LatestVersion:        1,
+	}
+	return nil
+}
+
+func (f *fakeVaultClient) UpdateTransitKeyConfig(_ context.Context, mount, name string, cfg vault.TransitKeyConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.UpdateTransitCfgCalls++
+	if f.UpdateTransitCfgErr != nil {
+		return f.UpdateTransitCfgErr
+	}
+	if f.UpdatedTransitCfgs == nil {
+		f.UpdatedTransitCfgs = map[string]vault.TransitKeyConfig{}
+	}
+	f.UpdatedTransitCfgs[mount+"/"+name] = cfg
+	if key, ok := f.TransitKeys[mount+"/"+name]; ok {
+		key.DeletionAllowed = cfg.DeletionAllowed
+		key.Exportable = cfg.Exportable
+		key.AllowPlaintextBackup = cfg.AllowPlaintextBackup
+		key.AutoRotatePeriod = cfg.AutoRotatePeriodSecs
+	}
+	return nil
 }
 
 // fakeVaultFactory always returns the same fakeVaultClient.

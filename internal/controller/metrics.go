@@ -16,9 +16,12 @@ import (
 )
 
 const (
-	DriftTypeMount  = "mount"
-	DriftTypePolicy = "policy"
-	DriftTypeRole   = "role"
+	DriftTypeMount      = "mount"
+	DriftTypePolicy     = "policy"
+	DriftTypeRole       = "role"
+	DriftTypeTransitKey = "transit_key"
+	DriftTypeRoleBody   = "role_body"
+	DriftTypePolicyBody = "policy_body"
 )
 
 var driftDetectedCounter = prometheus.NewCounterVec(

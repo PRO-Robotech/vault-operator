@@ -188,6 +188,12 @@ func (r *VaultClaimReconciler) stepApplyRoles(ctx context.Context, claim *vaultv
 		if role.TokenMaxTTL != nil {
 			body.TokenMaxTTLSeconds = int(role.TokenMaxTTL.Seconds())
 		}
+		body.Audience = role.Audience
+		body.TokenType = role.TokenType
+		body.TokenNoDefaultPolicy = role.TokenNoDefaultPolicy
+		if role.TokenExplicitMaxTTL != nil {
+			body.TokenExplicitMaxTTLSecs = int(role.TokenExplicitMaxTTL.Seconds())
+		}
 		if err := state.Vault.PutKubernetesRole(ctx, mount, role.Name, body); err != nil {
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionRolesApplied, metav1.ConditionFalse, claim.Generation,
 				"PutRoleFailed", fmt.Sprintf("role %q: %v", role.Name, err))

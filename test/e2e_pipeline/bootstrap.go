@@ -92,6 +92,45 @@ func BootstrapVaultDev(ctx context.Context, srv *VaultDevServer, cfg BootstrapCo
 	return nil
 }
 
+// EnableTransitMount mounts the engine as the platform would; the operator cannot.
+func EnableTransitMount(ctx context.Context, srv *VaultDevServer, mountPath string) error {
+	err := vaultPost(ctx, srv, "/v1/sys/mounts/"+mountPath, map[string]string{
+		"type":        "transit",
+		"description": "vault-operator e2e transit engine",
+	})
+	if err != nil && !isAlreadyExists(err) {
+		return fmt.Errorf("enable transit at %q: %w", mountPath, err)
+	}
+	return nil
+}
+
+// ReadTransitKeyRaw reads a key as dev root, bypassing the client under test.
+func ReadTransitKeyRaw(
+	ctx context.Context, srv *VaultDevServer, mountPath, name string,
+) (map[string]interface{}, error) {
+	body, err := vaultGet(ctx, srv, "/v1/"+mountPath+"/keys/"+name)
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode transit key %q: %w", name, err)
+	}
+	return raw.Data, nil
+}
+
+// DeleteTransitKeyRaw removes a key out-of-band; deletion must be allowed first.
+func DeleteTransitKeyRaw(ctx context.Context, srv *VaultDevServer, mountPath, name string) error {
+	if err := vaultPost(ctx, srv, "/v1/"+mountPath+"/keys/"+name+"/config", map[string]interface{}{
+		"deletion_allowed": true,
+	}); err != nil {
+		return fmt.Errorf("allow deletion of %q: %w", name, err)
+	}
+	return vaultRequest(ctx, srv, http.MethodDelete, "/v1/"+mountPath+"/keys/"+name, nil)
+}
+
 // EnsureKVMount checks the shared `secret/` KV-v2 mount exists; vault dev
 // already enables it by default. Provided here for clarity and as a fail-fast
 // in case the dev banner ever drops it.
@@ -143,6 +182,10 @@ path "sys/policies/acl/*"       { capabilities = ["create", "read", "update", "d
 path "sys/policies/acl"         { capabilities = ["list"] }
 path "auth/token/renew-self"    { capabilities = ["update"] }
 path "auth/token/lookup-self"   { capabilities = ["read"] }
+
+# Transit: keys only. No encrypt/decrypt, rotate, export or delete.
+path "transit/keys/+"           { capabilities = ["create", "read", "update"] }
+path "transit/keys/+/config"    { capabilities = ["update"] }
 `
 
 // vaultPost issues an authenticated POST as the dev root.

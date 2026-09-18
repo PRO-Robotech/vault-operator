@@ -10,7 +10,10 @@ You may obtain a copy of the License at
 
 package controller
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBucketBaseName(t *testing.T) {
 	cases := []struct {
@@ -38,11 +41,17 @@ func TestBucketBaseNameLength(t *testing.T) {
 	}
 }
 
+// The value is a bare host: the etcd-backup-snapshot chart renders it into
+// both `endpoint: "https://{{ ... }}"` and a CiliumNetworkPolicy toFQDNs
+// matchName, and a scheme would break the second silently.
 func TestS3EndpointForRegion(t *testing.T) {
-	if got := s3EndpointForRegion(""); got != "https://s3.ru1.storage.beget.cloud" {
+	if got := s3EndpointForRegion(""); got != "s3.ru1.storage.beget.cloud" {
 		t.Errorf("empty region: got %q", got)
 	}
-	if got := s3EndpointForRegion("ru2"); got != "https://s3.ru2.storage.beget.cloud" {
+	if got := s3EndpointForRegion("ru2"); got != "s3.ru2.storage.beget.cloud" {
 		t.Errorf("ru2: got %q", got)
+	}
+	if strings.Contains(s3EndpointForRegion("ru1"), "://") {
+		t.Error("endpoint must carry no scheme")
 	}
 }

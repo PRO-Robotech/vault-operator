@@ -130,7 +130,14 @@ func (c *Client) GetAuthMountAccessor(ctx context.Context, mount string) (string
 	return info.Accessor, nil
 }
 
+// SharedMountExists reports whether path is a mounted KV engine.
 func (c *Client) SharedMountExists(ctx context.Context, path string) (bool, error) {
+	return c.MountExists(ctx, path, "kv")
+}
+
+// MountExists reports whether path is a mounted engine whose type starts with
+// typePrefix. A wrong-typed mount reports false, like an absent one.
+func (c *Client) MountExists(ctx context.Context, path, typePrefix string) (bool, error) {
 	resp, err := c.Do(ctx, &Request{
 		Method: http.MethodGet,
 		Path:   "sys/mounts",
@@ -160,5 +167,5 @@ func (c *Client) SharedMountExists(ctx context.Context, path string) (bool, erro
 			return false, nil
 		}
 	}
-	return strings.HasPrefix(info.Type, "kv"), nil
+	return strings.HasPrefix(info.Type, typePrefix), nil
 }

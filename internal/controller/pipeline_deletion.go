@@ -107,6 +107,13 @@ func (r *VaultClaimReconciler) deleteVaultObjects(ctx context.Context, claim *va
 			return fmt.Errorf("delete policy %q: %w", name, err)
 		}
 	}
+	// Transit keys are never deleted, under any policy.
+	if claim.Spec.DeletionPolicy == vaultv1alpha1.DeletionPolicyRetain {
+		return nil
+	}
+	if !claim.Spec.Auth.AutoCreate {
+		return nil
+	}
 	if err := vc.DisableAuthMethod(ctx, mount); err != nil {
 		return fmt.Errorf("disable auth method %q: %w", mount, err)
 	}
