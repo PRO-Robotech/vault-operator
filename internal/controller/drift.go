@@ -30,12 +30,14 @@ type DriftReport struct {
 	KeyVersionMoved []string
 	ChangedRoles    []string
 	ChangedPolicies []string
+	// ReviewerJWTUnset: auth/{mount}/config has no token_reviewer_jwt.
+	ReviewerJWTUnset bool
 }
 
 func (d DriftReport) Found() bool {
 	return d.MountMissing || len(d.MissingPolicies) > 0 || len(d.MissingRoles) > 0 || len(d.ExtraRoles) > 0 ||
 		d.TransitMissing || len(d.MissingKeys) > 0 || len(d.KeyVersionMoved) > 0 ||
-		len(d.ChangedRoles) > 0 || len(d.ChangedPolicies) > 0
+		len(d.ChangedRoles) > 0 || len(d.ChangedPolicies) > 0 || d.ReviewerJWTUnset
 }
 
 func (d DriftReport) Summary() string {
@@ -54,6 +56,9 @@ func (d DriftReport) Summary() string {
 	}
 	if n := len(d.ExtraRoles); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d extra roles", n))
+	}
+	if d.ReviewerJWTUnset {
+		parts = append(parts, "token_reviewer_jwt not set")
 	}
 	if d.TransitMissing {
 		parts = append(parts, "transit mount missing")
@@ -90,6 +95,16 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 	if _, ok := mounts[key]; !ok {
 		report.MountMissing = true
 		driftDetectedCounter.WithLabelValues(DriftTypeMount).Inc()
+	} else {
+		// Running clients only renew, so a wiped reviewer shows up on the next login.
+		cfg, err := vc.ReadKubernetesAuthConfig(ctx, mount)
+		if err != nil {
+			return report, fmt.Errorf("read auth config: %w", err)
+		}
+		if !cfg.TokenReviewerJWTSet {
+			report.ReviewerJWTUnset = true
+			driftDetectedCounter.WithLabelValues(DriftTypeAuthConfig).Inc()
+		}
 	}
 
 	// Only check policies we own — user-managed policies are not our drift.

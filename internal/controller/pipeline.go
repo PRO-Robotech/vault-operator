@@ -144,7 +144,7 @@ func (r *VaultClaimReconciler) driftCheckAndMaybeShortCircuit(ctx context.Contex
 		}
 		return false, ctrl.Result{}
 	}
-	// detectDrift ignores JWT expiry — gate here or Step 4 never rotates.
+	// detectDrift ignores JWT expiry — gate here or the JWT never rotates on schedule.
 	if target.ShouldRotateReviewerJWT(claim.Status.Vault.TokenReviewerJWT, r.now()) {
 		logger.Info("reviewer JWT past rotation threshold, falling through to full pipeline")
 		return false, ctrl.Result{}

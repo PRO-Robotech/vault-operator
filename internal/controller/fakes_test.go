@@ -47,6 +47,10 @@ type fakeVaultClient struct {
 	DisabledAuthPaths  []string
 	ListAuthMountsResp map[string]vault.AuthMountInfo
 	ListAuthMountsErr  error
+	// AuthConfigs: auth/{mount}/config per mount. A write replaces it, like Vault.
+	AuthConfigs       map[string]vault.KubernetesAuthConfig
+	ReadAuthConfigErr error
+	ReadAuthCfgCalls  int
 
 	// Step 6 — policies.
 	PutPolicyErr     error
@@ -166,7 +170,7 @@ func (f *fakeVaultClient) DisableAuthMethod(_ context.Context, path string) erro
 	return nil
 }
 
-func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, _ string, cfg vault.KubernetesAuthConfig) error {
+func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, mount string, cfg vault.KubernetesAuthConfig) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.WriteConfigCalls++
@@ -174,7 +178,28 @@ func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, _ string,
 		return f.WriteConfigErr
 	}
 	f.WrittenAuthCfgs = append(f.WrittenAuthCfgs, cfg)
+	if f.AuthConfigs == nil {
+		f.AuthConfigs = map[string]vault.KubernetesAuthConfig{}
+	}
+	f.AuthConfigs[mount] = cfg
 	return nil
+}
+
+func (f *fakeVaultClient) ReadKubernetesAuthConfig(_ context.Context, mount string) (*vault.KubernetesAuthState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadAuthCfgCalls++
+	if f.ReadAuthConfigErr != nil {
+		return nil, f.ReadAuthConfigErr
+	}
+	cfg, ok := f.AuthConfigs[mount]
+	if !ok {
+		return &vault.KubernetesAuthState{}, nil
+	}
+	return &vault.KubernetesAuthState{
+		KubernetesHost:      cfg.KubernetesHost,
+		TokenReviewerJWTSet: cfg.TokenReviewerJWT != "",
+	}, nil
 }
 
 func (f *fakeVaultClient) GetAuthMountAccessor(_ context.Context, _ string) (string, error) {

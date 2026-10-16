@@ -9,7 +9,7 @@
 | 1 | **ResolveConfigAndLogin** | Получает VaultConfig из spec, проверяет что он `Reachable=True` и `SharedMountFound=True`, логинится в Vault | VaultConfig не найден → `ConfigResolved=False`; sealed/network → `VaultReachable=False` |
 | 2 | **WaitKubeconfig** | Достаёт Secret `{clusterRef.kubeconfigSecret}` из namespace claim'а | Secret отсутствует → `KubeconfigAvailable=False`, ждём watch-события |
 | 3 | **EnsureTargetSA** | Через kubeconfig применяет (SSA) Namespace + SA `vault-token-reviewer` + ClusterRoleBinding `system:auth-delegator` в infra-кластере. Только когда `tokenReviewer.serviceAccount.autoCreate: true` | apiserver недоступен → транзиент, retry |
-| 4 | **IssueReviewerJWT** | Вызывает TokenRequest API: новый JWT для reviewer SA. Только если предыдущий ближе чем 30% TTL к expiry | TokenRequest 4xx/5xx → транзиент |
+| 4 | **IssueReviewerJWT** | Вызывает TokenRequest API: новый JWT для reviewer SA — на **каждом** полном проходе, потому что Step 5 перезаписывает `auth/{mount}/config` целиком (запись без `token_reviewer_jwt` стирает рецензента). В `status` JWT записывается только при плановой ротации (остаток < 30% TTL): иначе повтор упавшего claim'а патчил бы статус и обходил backoff | TokenRequest 4xx/5xx → транзиент |
 | 5 | **EnableAuthMount** | `POST sys/auth/{mount}` (на 400 «уже существует» — продолжаем). Затем `POST auth/{mount}/config` с `kubernetes_host`, `kubernetes_ca_cert`, `token_reviewer_jwt`, `issuer` (или `disable_iss_validation=true`) | Vault 5xx → `AuthMountReady=False`, retry |
 | 6 | **ApplyPolicies** | Для каждой `spec.policies[]` — `PUT sys/policies/acl/{name}`. Если в HCL встречается `{{ .AuthMountAccessor }}`, accessor лениво забирается из `GET sys/auth` | Невалидный HCL → 400 `PutPolicyFailed`, retry |
 | 7 | **ApplyRoles** | Для каждой `spec.roles[]` — `POST auth/{mount}/role/{name}`. После — `LIST auth/{mount}/role` и удаление имён, которых нет в `spec.roles[]` (soft-purge) | Vault 5xx → `RolesApplied=False`, retry |
@@ -25,9 +25,10 @@
 | `ListAuthMounts` | Auth-mount `{spec.auth.mountPath}/` отсутствует |
 | `ListPolicies` | Любое имя из `spec.policies[].name` отсутствует |
 | `ListKubernetesRoles` | Любая роль из spec отсутствует или есть лишняя в Vault |
+| `ReadKubernetesAuthConfig` | В `auth/{mount}/config` нет рецензента: `token_reviewer_jwt_set=false` |
 
 - **Нет drift** → claim сразу остаётся `Ready`, шаги 2-7 не выполняются (экономия Vault-запросов).
-- **Есть drift** → событие `DriftDetected`, метрика `vaultclaim_drift_detected_total{drift_type=mount|policy|role}` инкрементируется, дальше идёт полный pipeline и идемпотентные шаги выравнивают состояние.
+- **Есть drift** → событие `DriftDetected`, метрика `vaultclaim_drift_detected_total{drift_type}` инкрементируется, дальше идёт полный pipeline и идемпотентные шаги выравнивают состояние.
 
 `status.vault.lastDriftCheckAt` обновляется в обоих случаях (персистится не чаще heartbeat-интервала, см. ниже).
 

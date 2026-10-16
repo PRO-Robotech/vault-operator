@@ -43,7 +43,7 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 
 | Метрика | Описание | Labels |
 |---|---|---|
-| `vaultclaim_drift_detected_total` | Drift events per category | `drift_type` ∈ {`mount`, `policy`, `role`} |
+| `vaultclaim_drift_detected_total` | Drift events per category | `drift_type` ∈ {`mount`, `policy`, `role`, `transit_key`, `role_body`, `policy_body`, `auth_config`} |
 | `vault_reviewer_jwt_renewal_total` | Reviewer JWT lifecycle | `result` ∈ {`rotated`, `skipped`, `failed`} |
 | `vault_api_responses_total` | HTTP-ответы Vault | `verb`, `path`, `code` |
 | `vault_api_calls_total` | Вызовы оператора в Vault | `verb`, `path`, `result` |
