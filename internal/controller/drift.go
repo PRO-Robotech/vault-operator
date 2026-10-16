@@ -30,7 +30,7 @@ type DriftReport struct {
 	KeyVersionMoved []string
 	ChangedRoles    []string
 	ChangedPolicies []string
-	// ReviewerJWTUnset — в auth/<точка>/config нет рецензента (K8S-1329).
+	// ReviewerJWTUnset: auth/{mount}/config has no token_reviewer_jwt.
 	ReviewerJWTUnset bool
 }
 
@@ -96,9 +96,9 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		report.MountMissing = true
 		driftDetectedCounter.WithLabelValues(DriftTypeMount).Inc()
 	} else {
-		// Стёртый рецензент снаружи не виден: живые клиенты только продлевают токены,
-		// а отказ получает следующий новый вход. Без этой сверки стёртое жило бы до
-		// ротации по сроку (K8S-1329).
+		// A wiped reviewer is invisible to running clients (they only renew);
+		// the next fresh login fails. Without this check it lasts until the
+		// next scheduled rotation.
 		cfg, err := vc.ReadKubernetesAuthConfig(ctx, mount)
 		if err != nil {
 			return report, fmt.Errorf("read auth config: %w", err)

@@ -82,15 +82,15 @@ func (c *Client) WriteKubernetesAuthConfig(ctx context.Context, mount string, cf
 	return err
 }
 
-// KubernetesAuthState — то, что хранилище отдаёт чтением auth/{mount}/config.
-// Значение рецензента оно не возвращает никогда, только признак его наличия.
+// KubernetesAuthState is the readable subset of auth/{mount}/config. Vault
+// never returns the reviewer JWT itself, only whether one is set.
 type KubernetesAuthState struct {
 	KubernetesHost      string `json:"kubernetes_host"`
 	TokenReviewerJWTSet bool   `json:"token_reviewer_jwt_set"`
 }
 
-// ReadKubernetesAuthConfig читает auth/{mount}/config. У ненастроенной точки тело
-// ответа пустое — это признак «рецензента нет», а не ошибка.
+// ReadKubernetesAuthConfig reads auth/{mount}/config. An unconfigured mount
+// returns an empty body, which reads as "no reviewer", not as an error.
 func (c *Client) ReadKubernetesAuthConfig(ctx context.Context, mount string) (*KubernetesAuthState, error) {
 	m := strings.Trim(mount, "/")
 	if m == "" {

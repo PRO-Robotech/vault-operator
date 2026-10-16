@@ -52,9 +52,9 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 		}
 	}
 
-	// Хранилище заменяет конфигурацию целиком: запись без token_reviewer_jwt стёрла бы
-	// рецензента (K8S-1329). Шаг 4 выпускает его на каждом полном проходе; нет JWT —
-	// инвариант нарушен, и лучше не писать вовсе, чем стереть.
+	// Vault replaces the whole config: a write without token_reviewer_jwt would
+	// wipe the reviewer. Step 4 mints one on every full pass, so a missing JWT is
+	// a broken invariant — fail instead of wiping.
 	if state.ReviewerJWT == nil || state.ReviewerJWT.Token == "" {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady, metav1.ConditionFalse, claim.Generation,
 			"ReviewerJWTMissing", "no reviewer JWT issued in this pass; auth config not written")

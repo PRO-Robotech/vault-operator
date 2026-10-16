@@ -138,13 +138,13 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 	return Proceed, nil
 }
 
-// stepIssueReviewerJWT (Step 4): выпускает рецензента на КАЖДОМ полном проходе.
-// Шаг 5 пишет auth/<точка>/config, а хранилище запись конфигурации не сливает с
-// прежней, а заменяет целиком: без поля token_reviewer_jwt рецензент стирается, и
-// следующий вход в точку (новый под плагина KMS) получает 403 (K8S-1329). Сохранить
-// прежний JWT нельзя — хранилище его не отдаёт, только token_reviewer_jwt_set.
-// Ротацию по сроку решает короткое замыкание в executePipeline: свежий рецензент
-// без дрейфа до этого шага не доходит. Байты JWT в статус не пишутся — только время.
+// stepIssueReviewerJWT (Step 4): mints the reviewer JWT on EVERY full pass.
+// Step 5 writes auth/{mount}/config, and Vault replaces the config rather than
+// merging it: a write without token_reviewer_jwt wipes the reviewer and the next
+// fresh login gets 403. The previous JWT cannot be carried over — Vault only
+// reports token_reviewer_jwt_set. Scheduled rotation is decided by the drift
+// short-circuit in executePipeline. JWT bytes are never persisted to status —
+// only timestamps.
 func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}

@@ -121,10 +121,10 @@ func TestClient_ReadKubernetesAuthConfig(t *testing.T) {
 		body    string
 		wantSet bool
 	}{
-		// Хранилище отдаёт признак рецензента, а не его значение.
+		// Vault reports whether a reviewer is set, never its value.
 		{"reviewer set", http.StatusOK, `{"data":{"kubernetes_host":"https://infra:6443","token_reviewer_jwt_set":true}}`, true},
 		{"reviewer wiped", http.StatusOK, `{"data":{"kubernetes_host":"https://infra:6443","token_reviewer_jwt_set":false}}`, false},
-		// Ненастроенная точка отвечает пустым телом: рецензента нет, ошибки нет.
+		// An unconfigured mount answers with an empty body: no reviewer, no error.
 		{"not configured", http.StatusNoContent, "", false},
 	}
 	for _, tc := range cases {

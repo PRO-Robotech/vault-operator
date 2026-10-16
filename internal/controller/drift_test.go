@@ -64,8 +64,7 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 	}
 }
 
-// reviewerSet — конфигурация точки фикстуры с рецензентом: законный близнец
-// для сверки рецензента.
+// reviewerSet returns the fixture mount's auth config with a reviewer set.
 func reviewerSet() map[string]vault.KubernetesAuthConfig {
 	return map[string]vault.KubernetesAuthConfig{
 		"kubernetes-ec8a00": {KubernetesHost: "https://infra:6443", TokenReviewerJWT: "jwt"},
@@ -73,8 +72,8 @@ func reviewerSet() map[string]vault.KubernetesAuthConfig {
 }
 
 func TestDetectDrift_ReviewerJWTUnset(t *testing.T) {
-	// Конфигурация есть, а рецензента в ней нет — так её оставляла запись без поля
-	// token_reviewer_jwt (K8S-1329). Вход нового клиента в такую точку отвергается.
+	// Config present but reviewer empty — what a write without
+	// token_reviewer_jwt leaves behind. New logins to such a mount are denied.
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
 		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},

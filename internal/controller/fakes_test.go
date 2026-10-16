@@ -47,9 +47,8 @@ type fakeVaultClient struct {
 	DisabledAuthPaths  []string
 	ListAuthMountsResp map[string]vault.AuthMountInfo
 	ListAuthMountsErr  error
-	// AuthConfigs — auth/<точка>/config по точке. Запись ЗАМЕНЯЕТ конфигурацию
-	// целиком, как настоящее хранилище: фейк со слиянием полей и пропустил
-	// стирание рецензента (K8S-1329).
+	// AuthConfigs holds auth/{mount}/config per mount. A write REPLACES the
+	// whole config, as real Vault does — a merging fake hid the wiped reviewer.
 	AuthConfigs       map[string]vault.KubernetesAuthConfig
 	ReadAuthConfigErr error
 	ReadAuthCfgCalls  int
