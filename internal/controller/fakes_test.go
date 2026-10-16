@@ -47,8 +47,7 @@ type fakeVaultClient struct {
 	DisabledAuthPaths  []string
 	ListAuthMountsResp map[string]vault.AuthMountInfo
 	ListAuthMountsErr  error
-	// AuthConfigs holds auth/{mount}/config per mount. A write REPLACES the
-	// whole config, as real Vault does — a merging fake hid the wiped reviewer.
+	// AuthConfigs: auth/{mount}/config per mount. A write replaces it, like Vault.
 	AuthConfigs       map[string]vault.KubernetesAuthConfig
 	ReadAuthConfigErr error
 	ReadAuthCfgCalls  int

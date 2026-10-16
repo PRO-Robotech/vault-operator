@@ -82,15 +82,15 @@ func (c *Client) WriteKubernetesAuthConfig(ctx context.Context, mount string, cf
 	return err
 }
 
-// KubernetesAuthState is the readable subset of auth/{mount}/config. Vault
-// never returns the reviewer JWT itself, only whether one is set.
+// KubernetesAuthState is the readable part of auth/{mount}/config; Vault
+// reports only whether the reviewer JWT is set.
 type KubernetesAuthState struct {
 	KubernetesHost      string `json:"kubernetes_host"`
 	TokenReviewerJWTSet bool   `json:"token_reviewer_jwt_set"`
 }
 
-// ReadKubernetesAuthConfig reads auth/{mount}/config. An unconfigured mount
-// returns an empty body, which reads as "no reviewer", not as an error.
+// ReadKubernetesAuthConfig reads auth/{mount}/config. An empty body (mount not
+// configured) yields a zero state, not an error.
 func (c *Client) ReadKubernetesAuthConfig(ctx context.Context, mount string) (*KubernetesAuthState, error) {
 	m := strings.Trim(mount, "/")
 	if m == "" {

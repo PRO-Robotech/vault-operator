@@ -72,8 +72,7 @@ func reviewerSet() map[string]vault.KubernetesAuthConfig {
 }
 
 func TestDetectDrift_ReviewerJWTUnset(t *testing.T) {
-	// Config present but reviewer empty — what a write without
-	// token_reviewer_jwt leaves behind. New logins to such a mount are denied.
+	// Left behind by a config write without token_reviewer_jwt.
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
 		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},

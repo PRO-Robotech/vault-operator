@@ -138,13 +138,10 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 	return Proceed, nil
 }
 
-// stepIssueReviewerJWT (Step 4): mints the reviewer JWT on EVERY full pass.
-// Step 5 writes auth/{mount}/config, and Vault replaces the config rather than
-// merging it: a write without token_reviewer_jwt wipes the reviewer and the next
-// fresh login gets 403. The previous JWT cannot be carried over — Vault only
-// reports token_reviewer_jwt_set. Scheduled rotation is decided by the drift
-// short-circuit in executePipeline. JWT bytes are never persisted to status —
-// only timestamps.
+// stepIssueReviewerJWT (Step 4): mints the reviewer JWT on every full pass —
+// Step 5 replaces auth/{mount}/config, and a write without the JWT wipes it.
+// Scheduled rotation is gated by the drift short-circuit. JWT bytes are never
+// persisted to status — only timestamps.
 func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}

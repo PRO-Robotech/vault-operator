@@ -96,9 +96,7 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		report.MountMissing = true
 		driftDetectedCounter.WithLabelValues(DriftTypeMount).Inc()
 	} else {
-		// A wiped reviewer is invisible to running clients (they only renew);
-		// the next fresh login fails. Without this check it lasts until the
-		// next scheduled rotation.
+		// Running clients only renew, so a wiped reviewer shows up on the next login.
 		cfg, err := vc.ReadKubernetesAuthConfig(ctx, mount)
 		if err != nil {
 			return report, fmt.Errorf("read auth config: %w", err)

@@ -344,8 +344,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 			}
 		})
 
-		// Fresh JWT in status: previously Step 4 skipped and Step 5 wrote the
-		// config without the field, which wipes the reviewer in Vault.
+		// Fresh JWT in status — the case that used to write the config without it.
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{
 			TokenReviewerJWT: &vaultv1alpha1.TokenReviewerJWTStatus{
 				IssuedAt:  ptrTime(fixedNow.Add(-time.Hour)),
@@ -357,7 +356,6 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		_, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
 
-		// One write, carrying the JWT minted in this pass.
 		Expect(fakeVC.WriteConfigCalls).To(Equal(1))
 		Expect(fakeVC.WrittenAuthCfgs[0].TokenReviewerJWT).To(Equal(issuedToken))
 		Expect(fakeVC.AuthConfigs["kubernetes-"+name].TokenReviewerJWT).To(Equal(issuedToken),
@@ -709,8 +707,6 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(c).NotTo(BeNil())
 		Expect(c.Reason).To(Equal("Rotated"))
 
-		// A full pass writes the config, so it always mints; scheduled rotation
-		// is decided by the short-circuit, not by this step.
 		kc := targetCS.Kubernetes.(*fake.Clientset)
 		Expect(kc.Actions()).NotTo(BeEmpty(), "TokenRequest must happen on every full pass")
 
@@ -922,8 +918,6 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 	})
 
-	// Ready claim, fresh reviewer, spec changes: this pass used to write the
-	// config without the reviewer, wiping it in Vault.
 	It("Spec change on a Ready claim with a fresh reviewer: config rewritten WITH the reviewer", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name
@@ -957,7 +951,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		fakeVC.ListPoliciesResp = nil
 		fakeVC.ListRolesResp = nil
 
-		// Make the second mint distinguishable to prove the write carries the new JWT.
+		// Distinct second token proves the write carries the new JWT.
 		const secondToken = "second-reviewer-jwt"
 		targetCS.Kubernetes.(*fake.Clientset).PrependReactor("create", "serviceaccounts/token",
 			func(action ktesting.Action) (bool, runtime.Object, error) {
@@ -1014,7 +1008,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		fakeVC.ListPoliciesResp = nil
 		fakeVC.ListRolesResp = nil
 
-		// Config without the reviewer — what older operator versions left behind.
+		// Reviewer wiped, as older operator versions left it.
 		wiped := fakeVC.AuthConfigs[mount]
 		wiped.TokenReviewerJWT = ""
 		fakeVC.AuthConfigs[mount] = wiped

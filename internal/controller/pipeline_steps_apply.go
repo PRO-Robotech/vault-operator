@@ -52,9 +52,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 		}
 	}
 
-	// Vault replaces the whole config: a write without token_reviewer_jwt would
-	// wipe the reviewer. Step 4 mints one on every full pass, so a missing JWT is
-	// a broken invariant — fail instead of wiping.
+	// Vault replaces the config: writing without the JWT would wipe the reviewer.
 	if state.ReviewerJWT == nil || state.ReviewerJWT.Token == "" {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady, metav1.ConditionFalse, claim.Generation,
 			"ReviewerJWTMissing", "no reviewer JWT issued in this pass; auth config not written")
