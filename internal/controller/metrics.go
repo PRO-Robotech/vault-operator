@@ -22,6 +22,7 @@ const (
 	DriftTypeTransitKey = "transit_key"
 	DriftTypeRoleBody   = "role_body"
 	DriftTypePolicyBody = "policy_body"
+	DriftTypeAuthConfig = "auth_config"
 )
 
 var driftDetectedCounter = prometheus.NewCounterVec(

@@ -36,6 +36,7 @@ type VaultClient interface {
 	EnableAuthMethod(ctx context.Context, path string, req vault.EnableAuthRequest) error
 	DisableAuthMethod(ctx context.Context, path string) error
 	WriteKubernetesAuthConfig(ctx context.Context, mount string, cfg vault.KubernetesAuthConfig) error
+	ReadKubernetesAuthConfig(ctx context.Context, mount string) (*vault.KubernetesAuthState, error)
 	GetAuthMountAccessor(ctx context.Context, mount string) (string, error)
 	ListAuthMounts(ctx context.Context) (map[string]vault.AuthMountInfo, error)
 

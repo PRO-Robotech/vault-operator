@@ -82,6 +82,36 @@ func (c *Client) WriteKubernetesAuthConfig(ctx context.Context, mount string, cf
 	return err
 }
 
+// KubernetesAuthState — то, что хранилище отдаёт чтением auth/{mount}/config.
+// Значение рецензента оно не возвращает никогда, только признак его наличия.
+type KubernetesAuthState struct {
+	KubernetesHost      string `json:"kubernetes_host"`
+	TokenReviewerJWTSet bool   `json:"token_reviewer_jwt_set"`
+}
+
+// ReadKubernetesAuthConfig читает auth/{mount}/config. У ненастроенной точки тело
+// ответа пустое — это признак «рецензента нет», а не ошибка.
+func (c *Client) ReadKubernetesAuthConfig(ctx context.Context, mount string) (*KubernetesAuthState, error) {
+	m := strings.Trim(mount, "/")
+	if m == "" {
+		return nil, fmt.Errorf("mount path is empty")
+	}
+	resp, err := c.Do(ctx, &Request{
+		Method: http.MethodGet,
+		Path:   "auth/" + m + "/config",
+	})
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Data KubernetesAuthState `json:"data"`
+	}
+	if err := resp.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode auth/%s/config: %w", m, err)
+	}
+	return &raw.Data, nil
+}
+
 type AuthMountInfo struct {
 	Type     string `json:"type"`
 	Accessor string `json:"accessor"`

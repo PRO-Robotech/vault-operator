@@ -114,6 +114,47 @@ func TestClient_WriteKubernetesAuthConfig(t *testing.T) {
 	}
 }
 
+func TestClient_ReadKubernetesAuthConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		wantSet bool
+	}{
+		// Хранилище отдаёт признак рецензента, а не его значение.
+		{"reviewer set", http.StatusOK, `{"data":{"kubernetes_host":"https://infra:6443","token_reviewer_jwt_set":true}}`, true},
+		{"reviewer wiped", http.StatusOK, `{"data":{"kubernetes_host":"https://infra:6443","token_reviewer_jwt_set":false}}`, false},
+		// Ненастроенная точка отвечает пустым телом: рецензента нет, ошибки нет.
+		{"not configured", http.StatusNoContent, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fv := newFakeVault(t)
+			var seenPath string
+			fv.override = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/auth/") {
+					seenPath = r.URL.Path
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, tc.body)
+					return true
+				}
+				return false
+			}
+			c := newTestClient(t, fv)
+			got, err := c.ReadKubernetesAuthConfig(context.Background(), "/kubernetes-ec8a00/")
+			if err != nil {
+				t.Fatalf("ReadKubernetesAuthConfig: %v", err)
+			}
+			if seenPath != "/v1/auth/kubernetes-ec8a00/config" {
+				t.Fatalf("unexpected path %q", seenPath)
+			}
+			if got.TokenReviewerJWTSet != tc.wantSet {
+				t.Fatalf("TokenReviewerJWTSet = %t, want %t", got.TokenReviewerJWTSet, tc.wantSet)
+			}
+		})
+	}
+}
+
 func TestClient_ListAuthMounts_DataKey(t *testing.T) {
 	fv := newFakeVault(t)
 	fv.override = func(w http.ResponseWriter, r *http.Request) bool {

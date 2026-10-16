@@ -807,6 +807,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWriteConfig), "Step 5 must be skipped on no-drift")
 		Expect(fakeVC.PutRoleCalls).To(Equal(beforePutRole), "Step 7 must be skipped on no-drift")
 		Expect(fakeVC.ListAuthMountsCalls).To(Equal(1))
+		Expect(fakeVC.ReadAuthCfgCalls).To(Equal(1), "drift check must read auth config")
 	})
 
 	It("Drift: no structural drift but reviewer JWT expired → falls through, Step 4 re-mints, Step 5 rewrites JWT", func() {
@@ -978,6 +979,55 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.WrittenAuthCfgs[len(fakeVC.WrittenAuthCfgs)-1].TokenReviewerJWT).To(Equal(secondToken))
 		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(secondToken),
 			"a spec-change pass must not wipe the reviewer")
+	})
+
+	It("Drift: reviewer wiped in Vault → falls through, config rewritten with a fresh reviewer", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+		mount := "kubernetes-" + name
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(issuedToken))
+
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": {Type: "kubernetes"}}
+		fakeVC.ListPoliciesResp = nil
+		fakeVC.ListRolesResp = nil
+
+		// Конфигурация записана без рецензента — то, что оставлял прежний оператор.
+		wiped := fakeVC.AuthConfigs[mount]
+		wiped.TokenReviewerJWT = ""
+		fakeVC.AuthConfigs[mount] = wiped
+
+		fixedNow = fixedNow.Add(statusHeartbeatInterval)
+		beforeWrite := fakeVC.WriteConfigCalls
+		res, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimDriftReady))
+
+		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWrite+1), "wiped reviewer must break the short-circuit")
+		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(issuedToken))
+		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 	})
 
 	It("Deletion: full reverse pipeline — roles, policies, auth method, target SA", func() {

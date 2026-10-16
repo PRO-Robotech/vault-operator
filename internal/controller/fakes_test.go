@@ -50,7 +50,9 @@ type fakeVaultClient struct {
 	// AuthConfigs — auth/<точка>/config по точке. Запись ЗАМЕНЯЕТ конфигурацию
 	// целиком, как настоящее хранилище: фейк со слиянием полей и пропустил
 	// стирание рецензента (K8S-1329).
-	AuthConfigs map[string]vault.KubernetesAuthConfig
+	AuthConfigs       map[string]vault.KubernetesAuthConfig
+	ReadAuthConfigErr error
+	ReadAuthCfgCalls  int
 
 	// Step 6 — policies.
 	PutPolicyErr     error
@@ -183,6 +185,23 @@ func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, mount str
 	}
 	f.AuthConfigs[mount] = cfg
 	return nil
+}
+
+func (f *fakeVaultClient) ReadKubernetesAuthConfig(_ context.Context, mount string) (*vault.KubernetesAuthState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadAuthCfgCalls++
+	if f.ReadAuthConfigErr != nil {
+		return nil, f.ReadAuthConfigErr
+	}
+	cfg, ok := f.AuthConfigs[mount]
+	if !ok {
+		return &vault.KubernetesAuthState{}, nil
+	}
+	return &vault.KubernetesAuthState{
+		KubernetesHost:      cfg.KubernetesHost,
+		TokenReviewerJWTSet: cfg.TokenReviewerJWT != "",
+	}, nil
 }
 
 func (f *fakeVaultClient) GetAuthMountAccessor(_ context.Context, _ string) (string, error) {

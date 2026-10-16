@@ -52,6 +52,7 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 			"unrelated-policy", // a user-managed policy we don't own
 		},
 		ListRolesResp: []string{"vmauth-reader", "argocd-reader"},
+		AuthConfigs:   reviewerSet(),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -60,6 +61,68 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 	}
 	if report.Found() {
 		t.Errorf("expected no drift, got %+v", report)
+	}
+}
+
+// reviewerSet — конфигурация точки фикстуры с рецензентом: законный близнец
+// для сверки рецензента.
+func reviewerSet() map[string]vault.KubernetesAuthConfig {
+	return map[string]vault.KubernetesAuthConfig{
+		"kubernetes-ec8a00": {KubernetesHost: "https://infra:6443", TokenReviewerJWT: "jwt"},
+	}
+}
+
+func TestDetectDrift_ReviewerJWTUnset(t *testing.T) {
+	// Конфигурация есть, а рецензента в ней нет — так её оставляла запись без поля
+	// token_reviewer_jwt (K8S-1329). Вход нового клиента в такую точку отвергается.
+	fake := &fakeVaultClient{
+		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
+		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
+		ListRolesResp:      []string{"vmauth-reader", "argocd-reader"},
+		AuthConfigs: map[string]vault.KubernetesAuthConfig{
+			"kubernetes-ec8a00": {KubernetesHost: "https://infra:6443"},
+		},
+	}
+	r := &VaultClaimReconciler{}
+	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
+	if err != nil {
+		t.Fatalf("detectDrift: %v", err)
+	}
+	if !report.Found() || !report.ReviewerJWTUnset {
+		t.Errorf("expected ReviewerJWTUnset drift, got %+v", report)
+	}
+	if got := report.Summary(); got != "token_reviewer_jwt not set" {
+		t.Errorf("summary = %q", got)
+	}
+}
+
+func TestDetectDrift_MountMissingSkipsAuthConfigRead(t *testing.T) {
+	fake := &fakeVaultClient{
+		ListAuthMountsResp: map[string]vault.AuthMountInfo{},
+		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
+		ListRolesResp:      []string{"vmauth-reader", "argocd-reader"},
+	}
+	r := &VaultClaimReconciler{}
+	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
+	if err != nil {
+		t.Fatalf("detectDrift: %v", err)
+	}
+	if !report.MountMissing || report.ReviewerJWTUnset {
+		t.Errorf("expected MountMissing only, got %+v", report)
+	}
+	if fake.ReadAuthCfgCalls != 0 {
+		t.Errorf("auth config of a missing mount must not be read, got %d reads", fake.ReadAuthCfgCalls)
+	}
+}
+
+func TestDetectDrift_PropagatesAuthConfigReadError(t *testing.T) {
+	fake := &fakeVaultClient{
+		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
+		ReadAuthConfigErr:  &vault.APIError{Method: http.MethodGet, Path: "/v1/auth/kubernetes-ec8a00/config", StatusCode: http.StatusForbidden},
+	}
+	r := &VaultClaimReconciler{}
+	if _, err := r.detectDrift(context.Background(), fake, driftFixtureClaim()); err == nil {
+		t.Fatal("expected propagated auth config read error")
 	}
 }
 
