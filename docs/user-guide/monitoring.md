@@ -32,7 +32,7 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 | `DriftDetected` | Warning | Кто-то менял Vault снаружи; оператор сам выровняет. Если повторяется — найдите источник. |
 | `DeletionStuck` | Warning | Reverse pipeline не может удалить из Vault — проверьте доступность Vault и права оператора. |
 | `TargetCleanupBestEffort` | Warning | Infra-кластер недоступен при удалении claim'а; SA останется висеть. Не критично, но стоит почистить. |
-| `ReviewerJWTRotated` | Normal | Норма раз в ~16 часов (при TTL 24h и threshold 30%). |
+| `ReviewerJWTRotated` | Normal | Норма раз в ~16 часов (при TTL 24h и threshold 30%) и на каждом полном проходе pipeline: изменение `spec`, найденный drift, повтор незавершённого claim'а. |
 | `RolesPurged` | Normal | Soft-purge удалил роли — норма после изменения `spec.roles[]`. |
 
 ## Метрики
@@ -43,8 +43,8 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 
 | Метрика | Описание | Labels |
 |---|---|---|
-| `vaultclaim_drift_detected_total` | Drift events per category | `drift_type` ∈ {`mount`, `policy`, `role`} |
-| `vault_reviewer_jwt_renewal_total` | Reviewer JWT lifecycle | `result` ∈ {`rotated`, `skipped`, `failed`} |
+| `vaultclaim_drift_detected_total` | Drift events per category | `drift_type` ∈ {`mount`, `policy`, `role`, `transit_key`, `role_body`, `policy_body`} |
+| `vault_reviewer_jwt_renewal_total` | Reviewer JWT lifecycle | `result` ∈ {`rotated`, `failed`} |
 | `vault_api_responses_total` | HTTP-ответы Vault | `verb`, `path`, `code` |
 | `vault_api_calls_total` | Вызовы оператора в Vault | `verb`, `path`, `result` |
 | `vault_client_token_renewal_total` | Лайфцикл client_token оператора | `result` |

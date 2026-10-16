@@ -252,8 +252,8 @@ CEL: `type=generate` требует `generate` и запрещает `source` (�
 
 | Метрика | Labels | Что считает |
 |---|---|---|
-| `vaultclaim_drift_detected_total` | `drift_type=mount\|policy\|role` | Категории найденного drift, инкрементируется один раз на категорию на цикл |
-| `vault_reviewer_jwt_renewal_total` | `result=rotated\|skipped\|failed` | Лайфцикл reviewer JWT |
+| `vaultclaim_drift_detected_total` | `drift_type=mount\|policy\|role\|transit_key\|role_body\|policy_body` | Категории найденного drift, инкрементируется один раз на категорию на цикл |
+| `vault_reviewer_jwt_renewal_total` | `result=rotated\|failed` | Лайфцикл reviewer JWT |
 | `vault_api_responses_total` | `verb`, `path`, `code` | HTTP-ответы Vault (path bucketed: `auth_login`, `auth_role`, `sys_mounts`, ...) |
 | `vault_api_calls_total` | `verb`, `path`, `result=success\|client_error\|server_error\|transport_error` | Каждый вызов оператора в Vault |
 | `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed` | Лайфцикл собственного `client_token` оператора |

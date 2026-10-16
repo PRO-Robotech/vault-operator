@@ -321,7 +321,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.WriteConfigCalls).To(Equal(1), "config write must still happen after 'already exists'")
 	})
 
-	It("Step 5: skips token_reviewer_jwt write when Step 4 didn't rotate", func() {
+	It("Step 5: every auth config write carries the reviewer JWT, even when the recorded one is fresh", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name
 		secretName := name + "-kc"
@@ -344,7 +344,8 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 			}
 		})
 
-		// Pre-populate status so Step 4 short-circuits (JWT is fresh).
+		// Рецензент в статусе свежий: прежде шаг 4 его не выпускал, и шаг 5 писал
+		// конфигурацию без поля — хранилище при этом стирало рецензента (K8S-1329).
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{
 			TokenReviewerJWT: &vaultv1alpha1.TokenReviewerJWTStatus{
 				IssuedAt:  ptrTime(fixedNow.Add(-time.Hour)),
@@ -356,12 +357,13 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		_, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Auth config still written but without JWT (existing one in Vault is fine).
+		// Запись одна, и она несёт рецензента, выпущенного в этом же проходе.
 		Expect(fakeVC.WriteConfigCalls).To(Equal(1))
-		Expect(fakeVC.WrittenAuthCfgs[0].TokenReviewerJWT).To(BeEmpty())
-		// And TokenRequest API was NOT called (kc actions empty).
+		Expect(fakeVC.WrittenAuthCfgs[0].TokenReviewerJWT).To(Equal(issuedToken))
+		Expect(fakeVC.AuthConfigs["kubernetes-"+name].TokenReviewerJWT).To(Equal(issuedToken),
+			"the reviewer must survive the config replacement")
 		kc := targetCS.Kubernetes.(*fake.Clientset)
-		Expect(kc.Actions()).To(BeEmpty())
+		Expect(kc.Actions()).NotTo(BeEmpty(), "TokenRequest must happen before the write")
 	})
 
 	It("Step 6: lazy accessor fetch when policy uses {{ .AuthMountAccessor }}", func() {
@@ -666,7 +668,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(c.Reason).To(Equal("InvalidSecret"))
 	})
 
-	It("Step 4 skips re-issue when reviewer JWT is still fresh", func() {
+	It("Step 4 re-issues on every full pass, even when the recorded JWT is fresh", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name
 		secretName := name + "-kc"
@@ -705,18 +707,15 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		got := getClaim(name)
 		c := findCondition(got.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh)
 		Expect(c).NotTo(BeNil())
-		Expect(c.Reason).To(Equal("NoRotationNeeded"))
+		Expect(c.Reason).To(Equal("Rotated"))
 
-		// No new token issued — kc.Actions empty for token creation.
+		// Полный проход пишет конфигурацию, значит выпускает рецензента всегда;
+		// ротацию по сроку решает короткое замыкание, а не этот шаг.
 		kc := targetCS.Kubernetes.(*fake.Clientset)
-		Expect(kc.Actions()).To(BeEmpty(), "TokenRequest must be skipped when JWT is fresh")
+		Expect(kc.Actions()).NotTo(BeEmpty(), "TokenRequest must happen on every full pass")
 
-		// IssuedAt unchanged, ExpiresAt unchanged. Use BeTemporally because
-		// metav1.Time round-trips through local zone (DeepEqual mismatches).
-		Expect(got.Status.Vault.TokenReviewerJWT.IssuedAt.Time).To(BeTemporally("==", fixedNow.Add(-time.Hour)))
-		Expect(got.Status.Vault.TokenReviewerJWT.ExpiresAt.Time).To(BeTemporally("==", fixedNow.Add(23*time.Hour)))
-		// LastRotationAttempt updated (we always touch it).
-		Expect(got.Status.Vault.TokenReviewerJWT.LastRotationAttempt).NotTo(BeNil())
+		Expect(got.Status.Vault.TokenReviewerJWT.IssuedAt.Time).To(BeTemporally("==", fixedNow))
+		Expect(got.Status.Vault.TokenReviewerJWT.ExpiresAt.Time).To(BeTemporally("==", fixedNow.Add(24*time.Hour)))
 		Expect(got.Status.Vault.TokenReviewerJWT.LastRotationAttempt.Time).To(BeTemporally("==", fixedNow))
 	})
 
@@ -920,6 +919,65 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.EnableAuthCalls).To(Equal(beforeEnable + 1))
 		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWriteConfig + 1))
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+	})
+
+	// Кейс K8S-1329: заявка Ready, рецензент свежий, меняется spec. Прежде этот
+	// проход писал конфигурацию без рецензента, и хранилище его стирало.
+	It("Spec change on a Ready claim with a fresh reviewer: config rewritten WITH the reviewer", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+		mount := "kubernetes-" + name
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(issuedToken))
+
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": {Type: "kubernetes"}}
+		fakeVC.ListPoliciesResp = nil
+		fakeVC.ListRolesResp = nil
+
+		// Следующий выпуск отличим от первого: так видно, что запись несёт новый JWT.
+		const secondToken = "second-reviewer-jwt"
+		targetCS.Kubernetes.(*fake.Clientset).PrependReactor("create", "serviceaccounts/token",
+			func(action ktesting.Action) (bool, runtime.Object, error) {
+				return true, &authenticationv1.TokenRequest{Status: authenticationv1.TokenRequestStatus{
+					Token: secondToken, ExpirationTimestamp: metav1.NewTime(fixedNow.Add(24 * time.Hour)),
+				}}, nil
+			})
+
+		fixedNow = fixedNow.Add(time.Hour)
+		got := getClaim(name)
+		got.Spec.Auth.TokenReviewer.TTL = metav1.Duration{Duration: 25 * time.Hour}
+		Expect(k8sClient.Update(context.Background(), got)).To(Succeed())
+
+		beforeWrite := fakeVC.WriteConfigCalls
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWrite + 1))
+		Expect(fakeVC.WrittenAuthCfgs[len(fakeVC.WrittenAuthCfgs)-1].TokenReviewerJWT).To(Equal(secondToken))
+		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(secondToken),
+			"a spec-change pass must not wipe the reviewer")
 	})
 
 	It("Deletion: full reverse pipeline — roles, policies, auth method, target SA", func() {

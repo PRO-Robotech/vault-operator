@@ -52,19 +52,24 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 		}
 	}
 
+	// Хранилище заменяет конфигурацию целиком: запись без token_reviewer_jwt стёрла бы
+	// рецензента (K8S-1329). Шаг 4 выпускает его на каждом полном проходе; нет JWT —
+	// инвариант нарушен, и лучше не писать вовсе, чем стереть.
+	if state.ReviewerJWT == nil || state.ReviewerJWT.Token == "" {
+		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady, metav1.ConditionFalse, claim.Generation,
+			"ReviewerJWTMissing", "no reviewer JWT issued in this pass; auth config not written")
+		return Proceed, fmt.Errorf("write auth config for %q: no reviewer JWT issued in this pass", mount)
+	}
+
 	issuer, disableISS := r.resolveIssuer(ctx, claim, state)
 
 	cfg := vault.KubernetesAuthConfig{
 		KubernetesHost:       state.Target.Host,
 		KubernetesCACert:     string(state.Target.CABundle),
+		TokenReviewerJWT:     state.ReviewerJWT.Token,
 		Issuer:               issuer,
 		DisableISSValidation: disableISS,
 		DisableLocalCAJWT:    true,
-	}
-	// Only overwrite token_reviewer_jwt when a fresh one was minted this
-	// cycle — otherwise the previous JWT (still within TTL) is preserved.
-	if state.ReviewerJWT != nil {
-		cfg.TokenReviewerJWT = state.ReviewerJWT.Token
 	}
 
 	if err := state.Vault.WriteKubernetesAuthConfig(ctx, mount, cfg); err != nil {
@@ -77,7 +82,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 		"Configured", fmt.Sprintf("auth method %q enabled and configured", mount))
 	if r.Recorder != nil {
 		r.Recorder.Eventf(claim, corev1.EventTypeNormal, "AuthMountReady",
-			"auth/%s configured (token_reviewer_jwt rotated=%t)", mount, state.ReviewerJWT != nil)
+			"auth/%s configured (token_reviewer_jwt rotated=true)", mount)
 	}
 	return Proceed, nil
 }

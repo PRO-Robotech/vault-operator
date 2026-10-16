@@ -47,6 +47,10 @@ type fakeVaultClient struct {
 	DisabledAuthPaths  []string
 	ListAuthMountsResp map[string]vault.AuthMountInfo
 	ListAuthMountsErr  error
+	// AuthConfigs — auth/<точка>/config по точке. Запись ЗАМЕНЯЕТ конфигурацию
+	// целиком, как настоящее хранилище: фейк со слиянием полей и пропустил
+	// стирание рецензента (K8S-1329).
+	AuthConfigs map[string]vault.KubernetesAuthConfig
 
 	// Step 6 — policies.
 	PutPolicyErr     error
@@ -166,7 +170,7 @@ func (f *fakeVaultClient) DisableAuthMethod(_ context.Context, path string) erro
 	return nil
 }
 
-func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, _ string, cfg vault.KubernetesAuthConfig) error {
+func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, mount string, cfg vault.KubernetesAuthConfig) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.WriteConfigCalls++
@@ -174,6 +178,10 @@ func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, _ string,
 		return f.WriteConfigErr
 	}
 	f.WrittenAuthCfgs = append(f.WrittenAuthCfgs, cfg)
+	if f.AuthConfigs == nil {
+		f.AuthConfigs = map[string]vault.KubernetesAuthConfig{}
+	}
+	f.AuthConfigs[mount] = cfg
 	return nil
 }
 

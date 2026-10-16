@@ -138,9 +138,13 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 	return Proceed, nil
 }
 
-// stepIssueReviewerJWT (Step 4): rotates the reviewer JWT only when past the
-// 30%-of-TTL threshold. JWT bytes are never persisted to status — only
-// timestamps.
+// stepIssueReviewerJWT (Step 4): выпускает рецензента на КАЖДОМ полном проходе.
+// Шаг 5 пишет auth/<точка>/config, а хранилище запись конфигурации не сливает с
+// прежней, а заменяет целиком: без поля token_reviewer_jwt рецензент стирается, и
+// следующий вход в точку (новый под плагина KMS) получает 403 (K8S-1329). Сохранить
+// прежний JWT нельзя — хранилище его не отдаёт, только token_reviewer_jwt_set.
+// Ротацию по сроку решает короткое замыкание в executePipeline: свежий рецензент
+// без дрейфа до этого шага не доходит. Байты JWT в статус не пишутся — только время.
 func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
@@ -149,14 +153,6 @@ func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *
 
 	claim.Status.Vault.TokenReviewerJWT = ensureJWTStatus(claim.Status.Vault.TokenReviewerJWT)
 	claim.Status.Vault.TokenReviewerJWT.LastRotationAttempt = ptrTime(now)
-
-	if !target.ShouldRotateReviewerJWT(claim.Status.Vault.TokenReviewerJWT, now) {
-		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionTrue, claim.Generation,
-			"NoRotationNeeded",
-			fmt.Sprintf("Reviewer JWT expires at %s (> 30%% TTL remaining)", claim.Status.Vault.TokenReviewerJWT.ExpiresAt.Format(time.RFC3339)))
-		reviewerJWTRenewalCounter.WithLabelValues(ReviewerJWTResultSkipped).Inc()
-		return Proceed, nil
-	}
 
 	issued, err := target.IssueReviewerJWT(ctx, state.Target, claim, now)
 	if err != nil {
