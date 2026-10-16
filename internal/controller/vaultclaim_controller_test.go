@@ -666,7 +666,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(c.Reason).To(Equal("InvalidSecret"))
 	})
 
-	It("Step 4 re-issues on every full pass, even when the recorded JWT is fresh", func() {
+	It("Step 4 mints a JWT for the write but keeps a fresh one in status", func() {
 		name := nextClaimName()
 		configName := "cfg-" + name
 		secretName := name + "-kc"
@@ -705,13 +705,14 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		got := getClaim(name)
 		c := findCondition(got.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh)
 		Expect(c).NotTo(BeNil())
-		Expect(c.Reason).To(Equal("Rotated"))
+		Expect(c.Reason).To(Equal("NoRotationNeeded"))
 
 		kc := targetCS.Kubernetes.(*fake.Clientset)
-		Expect(kc.Actions()).NotTo(BeEmpty(), "TokenRequest must happen on every full pass")
+		Expect(kc.Actions()).NotTo(BeEmpty(), "Step 5 needs a freshly minted JWT")
 
-		Expect(got.Status.Vault.TokenReviewerJWT.IssuedAt.Time).To(BeTemporally("==", fixedNow))
-		Expect(got.Status.Vault.TokenReviewerJWT.ExpiresAt.Time).To(BeTemporally("==", fixedNow.Add(24*time.Hour)))
+		// Status is not rewritten: scheduled rotation still follows the recorded JWT.
+		Expect(got.Status.Vault.TokenReviewerJWT.IssuedAt.Time).To(BeTemporally("==", fixedNow.Add(-time.Hour)))
+		Expect(got.Status.Vault.TokenReviewerJWT.ExpiresAt.Time).To(BeTemporally("==", fixedNow.Add(23*time.Hour)))
 		Expect(got.Status.Vault.TokenReviewerJWT.LastRotationAttempt.Time).To(BeTemporally("==", fixedNow))
 	})
 
@@ -973,6 +974,59 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(fakeVC.WrittenAuthCfgs[len(fakeVC.WrittenAuthCfgs)-1].TokenReviewerJWT).To(Equal(secondToken))
 		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(secondToken),
 			"a spec-change pass must not wipe the reviewer")
+	})
+
+	It("Retrying a failing claim mints a JWT for the write but leaves status unchanged", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		// A later step keeps failing, so every retry is a full pass.
+		fakeVC.ListRolesErr = errors.New("vault flaking")
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		first := getClaim(name)
+		Expect(first.Status.Phase).NotTo(Equal(vaultv1alpha1.PhaseReady))
+
+		// First retry flips the condition Rotated -> NoRotationNeeded once.
+		fixedNow = fixedNow.Add(time.Minute)
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		second := getClaim(name)
+
+		fixedNow = fixedNow.Add(time.Minute)
+		kc := targetCS.Kubernetes.(*fake.Clientset)
+		actionsBefore := len(kc.Actions())
+		writesBefore := fakeVC.WriteConfigCalls
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(len(kc.Actions())).To(BeNumerically(">", actionsBefore), "the write still needs a JWT")
+		Expect(fakeVC.WriteConfigCalls).To(Equal(writesBefore + 1))
+		Expect(fakeVC.WrittenAuthCfgs[len(fakeVC.WrittenAuthCfgs)-1].TokenReviewerJWT).To(Equal(issuedToken))
+
+		// A status change would re-trigger the watch and bypass the backoff.
+		third := getClaim(name)
+		Expect(third.ResourceVersion).To(Equal(second.ResourceVersion), "retry must not patch status")
+		Expect(third.Status.Vault.TokenReviewerJWT.IssuedAt.Time).To(BeTemporally("==", first.Status.Vault.TokenReviewerJWT.IssuedAt.Time))
 	})
 
 	It("Drift: reviewer wiped in Vault → falls through, config rewritten with a fresh reviewer", func() {

@@ -412,7 +412,7 @@ path "auth/token/lookup-self"         { capabilities = ["read"] }
 | Step | Операция | Идемпотентность |
 |------|----------|-----------------|
 | 3 | Create SA / CRB через SSA с fieldOwner `vault-operator` | Native idempotent (server-side apply) |
-| 4 | TokenRequest — выпускает новый JWT на каждом полном проходе: Step 5 заменяет `auth/{mount}/config` целиком. Когда проходить полностью, решает short-circuit (drift либо остаток < 30% TTL) | Conditional |
+| 4 | TokenRequest — выпускает новый JWT на каждом полном проходе: Step 5 заменяет `auth/{mount}/config` целиком. В `status` записывается только плановая ротация (остаток < 30% TTL) | Conditional |
 | 5 | `POST sys/auth/{path}` — если 400 (already exists), переходим к `POST auth/{path}/config` | Vault возвращает 204 на повторное config |
 | 6 | (опц.) `GET sys/auth/{mountPath}/tune` — только если хоть одна `spec.policies[].rules` содержит `{{ .AuthMountAccessor }}`. Затем `PUT sys/policies/acl/{name}` — overwrites. | Native idempotent; accessor-fetch lazy |
 | 7 | `POST auth/{path}/role/{role}` — overwrites; удаляем roles, которых нет в spec (soft-purge через enumeration `LIST auth/{path}/role`) | Soft-purge старых |

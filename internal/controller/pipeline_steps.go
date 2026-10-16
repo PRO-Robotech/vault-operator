@@ -138,10 +138,11 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 	return Proceed, nil
 }
 
-// stepIssueReviewerJWT (Step 4): mints the reviewer JWT on every full pass —
+// stepIssueReviewerJWT (Step 4): mints a reviewer JWT on every full pass —
 // Step 5 replaces auth/{mount}/config, and a write without the JWT wipes it.
-// Scheduled rotation is gated by the drift short-circuit. JWT bytes are never
-// persisted to status — only timestamps.
+// Status records the JWT only on scheduled rotation (< 30% TTL left): recording
+// every mint would patch status on each retry and re-trigger the watch. JWT
+// bytes are never persisted to status — only timestamps.
 func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
@@ -150,6 +151,7 @@ func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *
 
 	claim.Status.Vault.TokenReviewerJWT = ensureJWTStatus(claim.Status.Vault.TokenReviewerJWT)
 	claim.Status.Vault.TokenReviewerJWT.LastRotationAttempt = ptrTime(now)
+	rotate := target.ShouldRotateReviewerJWT(claim.Status.Vault.TokenReviewerJWT, now)
 
 	issued, err := target.IssueReviewerJWT(ctx, state.Target, claim, now)
 	if err != nil {
@@ -159,6 +161,17 @@ func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *
 		return Proceed, fmt.Errorf("issue reviewer JWT: %w", err)
 	}
 	state.ReviewerJWT = issued
+
+	if !rotate {
+		// The recorded expiry stays earlier than the real one, so scheduled
+		// rotation can only come sooner.
+		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionTrue, claim.Generation,
+			"NoRotationNeeded",
+			fmt.Sprintf("Reviewer JWT expires at %s (> 30%% TTL remaining)", claim.Status.Vault.TokenReviewerJWT.ExpiresAt.Format(time.RFC3339)))
+		reviewerJWTRenewalCounter.WithLabelValues(ReviewerJWTResultSkipped).Inc()
+		return Proceed, nil
+	}
+
 	claim.Status.Vault.TokenReviewerJWT.IssuedAt = ptrTime(issued.IssuedAt)
 	claim.Status.Vault.TokenReviewerJWT.ExpiresAt = ptrTime(issued.ExpiresAt)
 	claim.Status.Vault.TokenReviewerJWT.LastRotated = ptrTime(issued.IssuedAt)

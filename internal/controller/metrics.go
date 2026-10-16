@@ -35,13 +35,14 @@ var driftDetectedCounter = prometheus.NewCounterVec(
 
 const (
 	ReviewerJWTResultRotated = "rotated"
+	ReviewerJWTResultSkipped = "skipped"
 	ReviewerJWTResultFailed  = "failed"
 )
 
 var reviewerJWTRenewalCounter = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "vault_reviewer_jwt_renewal_total",
-		Help: "Token-reviewer JWT lifecycle events at Step 4 of the VaultClaim pipeline (rotated/failed).",
+		Help: "Token-reviewer JWT lifecycle events at Step 4 of the VaultClaim pipeline (rotated/skipped/failed).",
 	},
 	[]string{"result"},
 )
