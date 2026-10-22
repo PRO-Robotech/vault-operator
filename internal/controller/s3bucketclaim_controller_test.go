@@ -86,6 +86,16 @@ func condReason(conds []metav1.Condition, condType string) string {
 	return ""
 }
 
+type createResponseBuckets struct {
+	cloudmanager.BucketAPI
+	response string
+}
+
+func (b createResponseBuckets) Create(ctx context.Context, in cloudmanager.CreateInput) (string, error) {
+	_, err := b.BucketAPI.Create(ctx, in)
+	return b.response, err
+}
+
 var _ = Describe("S3BucketClaim Controller", func() {
 	const cust = s3Cust
 	var (
@@ -400,8 +410,8 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 		It("rejects a create response that changed the numeric cluster suffix", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-number")
-			// cloud-manager increments an existing numeric tail instead of
-			// appending a new suffix: s3number-11 becomes s3number-12.
+			// cloud-manager увеличивает существующий числовой хвост:
+			// вместо нового суффикса s3number-11 становится s3number-12.
 			srv.Seed(&pb.Bucket{Name: serverName("s3number-11"), CustLogin: cust, Status: pb.Status_REMOVED})
 			makeS3BucketClaim(ctx, "s3number-11", "s3-cfg-number")
 			reconcileN("s3number-11", 2)
@@ -412,13 +422,36 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(got.Status.BucketName).To(BeEmpty())
 			Expect(got.Status.PendingCreate).NotTo(BeNil())
 			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
-			// A deterministic name mismatch must not make another orphan
-			// when the in-flight deadline has long expired.
+			// Детерминированное несовпадение имени не создаёт новую сироту,
+			// даже когда срок незавершённого создания давно истёк.
 			recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
 			reconcileN("s3number-11", 3)
 			Expect(srv.Creates).To(Equal(1))
 			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))
 		})
+
+		DescribeTable("rejects a create response outside the persisted name baseline",
+			func(name string, baseTaken bool) {
+				makeHealthyVaultConfig(ctx, "s3-cfg-"+name)
+				response := serverName(name) + "-1"
+				if baseTaken {
+					response = serverName(name)
+					srv.Seed(&pb.Bucket{Name: response, CustLogin: cust, Status: pb.Status_REMOVED})
+				}
+				recon.Buckets = createResponseBuckets{BucketAPI: recon.Buckets, response: response}
+				makeS3BucketClaim(ctx, name, "s3-cfg-"+name)
+				reconcileN(name, 2)
+
+				Expect(srv.Creates).To(Equal(1))
+				Expect(getS3(name).Status.BucketName).To(BeEmpty())
+				Expect(s3Leaf(fakeSV, name, s3TestDest)).To(BeNil())
+				recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+				reconcileN(name, 3)
+				Expect(srv.Creates).To(Equal(1))
+			},
+			Entry("suffix without a taken base", "s3unexpected", false),
+			Entry("name already present before create", "s3existing", true),
+		)
 
 		It("accepts a create response with an appended suffix when the base was taken", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-appended")
