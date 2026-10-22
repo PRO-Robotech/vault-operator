@@ -75,20 +75,42 @@ var _ = Describe("VaultClaim controller watches", func() {
 		c.Labels = map[string]string{selectorKey: "yes"}
 		createClaim(c)
 
-		Eventually(func() int {
+		logins := func() int {
 			fakeVC.mu.Lock()
 			defer fakeVC.mu.Unlock()
 			return fakeVC.LoginCalls
-		}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1))
-		// The pass added the finalizer and patched status; neither may start
-		// another pass before the one-minute backoff.
-		Consistently(func() int {
-			fakeVC.mu.Lock()
-			defer fakeVC.mu.Unlock()
-			return fakeVC.LoginCalls
-		}, 3*time.Second, 100*time.Millisecond).Should(Equal(1))
+		}
+		Eventually(logins, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1))
+		// Startup events of other watched objects may add a pass; wait until the
+		// count holds over two polls before taking the baseline.
+		last := -1
+		Eventually(func() bool {
+			cur := logins()
+			settled := cur == last
+			last = cur
+			return settled
+		}, 10*time.Second, 500*time.Millisecond).Should(BeTrue())
+		baseline := logins()
 
+		// A status write and a metadata write that changes no generation, label
+		// or annotation must not start a pass: the backoff paces a failing claim.
 		fresh := &vaultv1alpha1.VaultClaim{}
+		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), fresh)).To(Succeed())
+		base := fresh.DeepCopy()
+		fresh.Status.Phase = vaultv1alpha1.PhasePending
+		Expect(k8sClient.Status().Patch(context.Background(), fresh, client.MergeFrom(base))).To(Succeed())
+		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), fresh)).To(Succeed())
+		fresh.Finalizers = append(fresh.Finalizers, "vault-operator-test/hold")
+		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		Consistently(logins, 3*time.Second, 100*time.Millisecond).Should(Equal(baseline))
+
+		// Twin: a label change is a change the claim acts on.
+		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), fresh)).To(Succeed())
+		fresh.Labels["vault-operator-test/poke"] = "1"
+		fresh.Finalizers = []string{vaultv1alpha1.VaultClaimFinalizer}
+		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		Eventually(logins, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">", baseline))
+
 		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), fresh)).To(Succeed())
 		Expect(k8sClient.Delete(context.Background(), fresh)).To(Succeed())
 		Eventually(func() bool {
