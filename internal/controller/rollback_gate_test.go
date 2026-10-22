@@ -106,8 +106,9 @@ func rollbackDocSet(t *testing.T) []string {
 	if len(lists) != 1 {
 		t.Fatalf("premise: %s holds %d arrays of reason names, want 1", rel, len(lists))
 	}
-	var out []string
-	for _, m := range quotedName.FindAllStringSubmatch(lists[0], -1) {
+	matches := quotedName.FindAllStringSubmatch(lists[0], -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
 		out = append(out, m[1])
 	}
 	return out
@@ -142,8 +143,9 @@ func ownershipDocSet(t *testing.T) []string {
 	if end < 0 {
 		t.Fatalf("premise: the sentence after %q in %s has no end", anchor, rel)
 	}
-	var out []string
-	for _, m := range backtickedName.FindAllStringSubmatch(rest[:end], -1) {
+	matches := backtickedName.FindAllStringSubmatch(rest[:end], -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
 		out = append(out, m[1])
 	}
 	return out
