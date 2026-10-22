@@ -42,6 +42,13 @@ type tokenVault struct {
 	lease     int
 	// hold, when set, keeps every login waiting until it is closed.
 	hold chan struct{}
+	// holdFirst, when set, keeps only the first login waiting until it is
+	// closed.
+	holdFirst chan struct{}
+	// loginStatus, when set, is the status every login answers with.
+	loginStatus int
+	// denyLookupSelf: the policy of a live token does not allow lookup-self.
+	denyLookupSelf bool
 
 	mu      sync.Mutex
 	dead    map[string]bool
@@ -66,9 +73,16 @@ func newTokenVault(t *testing.T, configure func(tv *tokenVault)) *tokenVault {
 func (tv *tokenVault) serve(w http.ResponseWriter, r *http.Request) {
 	tok := r.Header.Get("X-Vault-Token")
 	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/login") {
-		tv.arrived.Add(1)
+		first := tv.arrived.Add(1) == 1
 		if tv.hold != nil {
 			<-tv.hold
+		}
+		if first && tv.holdFirst != nil {
+			<-tv.holdFirst
+		}
+		if tv.loginStatus != 0 {
+			http.Error(w, `{"errors":["internal error"]}`, tv.loginStatus)
+			return
 		}
 		n := tv.logins.Add(1)
 		writeAuth(w, fmt.Sprintf("tok-%d", n), tv.lease, tv.renewable)
@@ -83,6 +97,10 @@ func (tv *tokenVault) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case pathLookupSelf:
+		if tv.denyLookupSelf {
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+			return
+		}
 		_, _ = w.Write([]byte(`{"data":{"ttl":3600}}`))
 	case pathRevokeSelf:
 		tv.mu.Lock()
@@ -197,6 +215,128 @@ func TestClient_DenialOfALiveTokenKeepsTheToken(t *testing.T) {
 	}
 	if got := c.Token(); got != firstToken {
 		t.Fatalf("token = %q, want tok-1", got)
+	}
+}
+
+// A live token whose policy does not allow lookup-self looks dead after any
+// 403. The client drops it, and a dropped token Vault still holds must be
+// revoked, or every such 403 leaves one more token behind until its TTL ends.
+func TestClient_ATokenDroppedAfterA403IsRevoked(t *testing.T) {
+	tv := newTokenVault(t, func(tv *tokenVault) { tv.denied, tv.denyLookupSelf = pathPolicyP, true })
+	c := tokenClient(t, tv.URL)
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	err := c.PutPolicy(context.Background(), "p", `path "secret/data/x" { capabilities = ["read"] }`)
+	if !IsForbidden(err) {
+		t.Fatalf("PutPolicy = %v, want 403", err)
+	}
+	if got := tv.revokedTokens(); len(got) != 1 || got[0] != firstToken {
+		t.Fatalf("revoked = %v, want [tok-1]: the dropped token stays in Vault", got)
+	}
+}
+
+// heldLogin starts a refresh whose login Vault holds and returns once the
+// login has reached Vault.
+func heldLogin(t *testing.T, tv *tokenVault, call func()) {
+	t.Helper()
+	go call()
+	deadline := time.Now().Add(5 * time.Second)
+	for tv.arrived.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if tv.arrived.Load() == 0 {
+		t.Fatal("the first login never reached Vault")
+	}
+}
+
+// waiters starts n callers that need a token while the first refresh is held
+// and returns their results once the refresh is released by release.
+func waiters(c *Client, n int, release func()) []error {
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = c.EnsureLoggedIn(context.Background())
+		}()
+	}
+	// Every waiter has had the time to queue behind the held refresh.
+	time.Sleep(200 * time.Millisecond)
+	release()
+	wg.Wait()
+	return errs
+}
+
+// The caller that refreshes may be cancelled (its reconcile timed out, the
+// process stops). Its cancellation says nothing about Vault: the callers that
+// waited for it refresh with their own context, and the breaker counts
+// nothing. Four waiters and the cancelled caller are the breaker's threshold.
+func TestClient_ACancelledRefreshIsNotPassedToItsWaiters(t *testing.T) {
+	hold := make(chan struct{})
+	tv := newTokenVault(t, func(tv *tokenVault) { tv.holdFirst = hold })
+	t.Cleanup(func() { close(hold) })
+	c := tokenClient(t, tv.URL)
+
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	heldLogin(t, tv, func() { leaderErr <- c.EnsureLoggedIn(leaderCtx) })
+	errs := waiters(c, DefaultBreakerFailureThreshold-1, cancel)
+
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled caller: %v, want context.Canceled", err)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("waiter %d: %v, want a token: the cancellation of another caller was passed on", i, err)
+		}
+	}
+	if st := c.Breaker().State(); st != StateClosed {
+		t.Fatalf("breaker = %s, want closed: a cancellation was counted as a Vault failure", st)
+	}
+}
+
+// One refresh is one outcome: a login Vault fails while others wait for it is
+// one failure for the breaker, however many callers it answers.
+func TestClient_ASharedRefreshFailureCountsOnce(t *testing.T) {
+	hold := make(chan struct{})
+	tv := newTokenVault(t, func(tv *tokenVault) { tv.holdFirst, tv.loginStatus = hold, http.StatusInternalServerError })
+	c := tokenClient(t, tv.URL)
+
+	leaderErr := make(chan error, 1)
+	heldLogin(t, tv, func() { leaderErr <- c.EnsureLoggedIn(context.Background()) })
+	errs := waiters(c, DefaultBreakerFailureThreshold-1, func() { close(hold) })
+
+	if err := <-leaderErr; err == nil {
+		t.Fatal("the refreshing caller got no error from a failed login")
+	}
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("waiter %d: nil, want the outcome of the refresh it waited for", i)
+		}
+	}
+	if n := tv.arrived.Load(); n != 1 {
+		t.Fatalf("logins sent = %d, want 1: waiters repeated a failed refresh", n)
+	}
+	if st := c.Breaker().State(); st != StateClosed {
+		t.Fatalf("breaker = %s, want closed: one failed login was counted %d times", st, DefaultBreakerFailureThreshold)
+	}
+}
+
+// Twin: failures of separate refreshes still count one each and open the
+// breaker at its threshold.
+func TestClient_SeparateRefreshFailuresOpenTheBreaker(t *testing.T) {
+	tv := newTokenVault(t, func(tv *tokenVault) { tv.loginStatus = http.StatusInternalServerError })
+	c := tokenClient(t, tv.URL)
+	for range DefaultBreakerFailureThreshold {
+		if err := c.EnsureLoggedIn(context.Background()); err == nil {
+			t.Fatal("EnsureLoggedIn: nil, want the login failure")
+		}
+	}
+	if st := c.Breaker().State(); st != StateOpen {
+		t.Fatalf("breaker = %s, want open after %d failed logins", st, DefaultBreakerFailureThreshold)
 	}
 }
 

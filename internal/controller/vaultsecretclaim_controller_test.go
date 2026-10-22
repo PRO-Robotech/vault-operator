@@ -42,6 +42,8 @@ type fakeSecretVaultClient struct {
 	// beforeCASWrite runs before a WriteKVCAS is checked: a test injects a
 	// concurrent writer here.
 	beforeCASWrite func(mount, path string)
+	// readErr fails reads of "mount|path" with the given error.
+	readErr map[string]error
 }
 
 func newFakeSecretVault() *fakeSecretVaultClient {
@@ -61,6 +63,9 @@ func (f *fakeSecretVaultClient) Token() string { return "tok" }
 func (f *fakeSecretVaultClient) ClearToken()   {}
 
 func (f *fakeSecretVaultClient) ReadKV(_ context.Context, mount, path string) (map[string]any, bool, error) {
+	if err := f.readErr[mount+"|"+path]; err != nil {
+		return nil, false, err
+	}
 	d, ok := f.store[mount+"|"+path]
 	if !ok {
 		return nil, false, nil
@@ -72,6 +77,9 @@ func (f *fakeSecretVaultClient) ReadKV(_ context.Context, mount, path string) (m
 // current version (0 only once the metadata is gone).
 func (f *fakeSecretVaultClient) ReadKVVersioned(_ context.Context, mount, path string) (map[string]any, int, bool, error) {
 	k := mount + "|" + path
+	if err := f.readErr[k]; err != nil {
+		return nil, 0, false, err
+	}
 	d, ok := f.store[k]
 	if !ok {
 		return nil, f.versions[k], false, nil

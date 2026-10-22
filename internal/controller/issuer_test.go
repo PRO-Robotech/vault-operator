@@ -14,13 +14,13 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 )
 
@@ -61,21 +61,69 @@ var _ = Describe("Target cluster issuer", func() {
 		Expect(fakeVC.WrittenAuthCfgs[0].DisableISSValidation).To(BeFalse())
 	})
 
-	It("keeps validating the issuer it recorded when discovery fails", func() {
+	// discoveryServer answers OIDC discovery with discovered while ok is true
+	// and fails it otherwise.
+	discoveryServer := func(ok *atomic.Bool) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !ok.Load() {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			writeJSON(w, map[string]string{"issuer": discovered})
+		}))
+		DeferCleanup(srv.Close)
+		return srv
+	}
+	// fullPassAgain makes the next pass a full one: a pass whose generation is
+	// not observed does not take the drift shortcut.
+	fullPassAgain := func(name string) {
+		c := claimNamed(name)
+		base := c.DeepCopy()
+		c.Status.ObservedGeneration = 0
+		Expect(k8sClient.Status().Patch(context.Background(), c, client.MergeFrom(base))).To(Succeed())
+	}
+
+	It("keeps validating the issuer it recorded when discovery fails on the same cluster", func() {
+		var ok atomic.Bool
+		ok.Store(true)
+		targetCS.Host = discoveryServer(&ok).URL
 		name := nextClaimName()
 		cfgName, secretName := fixture(name)
 		createClaim(newClaim(name, cfgName, secretName))
-		c := claimNamed(name)
-		base := c.DeepCopy()
-		c.Status.Vault = &vaultv1alpha1.VaultStatusSummary{Issuer: discovered}
-		Expect(k8sClient.Status().Patch(context.Background(), c, client.MergeFrom(base))).To(Succeed())
-
-		// The target set has no host: discovery fails this pass.
 		_, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(fakeVC.WrittenAuthCfgs).To(HaveLen(1))
-		Expect(fakeVC.WrittenAuthCfgs[0].Issuer).To(Equal(discovered))
-		Expect(fakeVC.WrittenAuthCfgs[0].DisableISSValidation).To(BeFalse(), "a failed discovery turned ISS validation off")
 		Expect(claimNamed(name).Status.Vault.Issuer).To(Equal(discovered))
+
+		ok.Store(false)
+		fullPassAgain(name)
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeVC.WrittenAuthCfgs).To(HaveLen(2))
+		Expect(fakeVC.WrittenAuthCfgs[1].Issuer).To(Equal(discovered))
+		Expect(fakeVC.WrittenAuthCfgs[1].DisableISSValidation).To(BeFalse(), "a failed discovery turned ISS validation off")
+		Expect(claimNamed(name).Status.Vault.Issuer).To(Equal(discovered))
+	})
+
+	It("does not carry an issuer over to another cluster behind the same kubeconfig", func() {
+		var okA, okB atomic.Bool
+		okA.Store(true)
+		targetCS.Host = discoveryServer(&okA).URL
+		name := nextClaimName()
+		cfgName, secretName := fixture(name)
+		createClaim(newClaim(name, cfgName, secretName))
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(claimNamed(name).Status.Vault.Issuer).To(Equal(discovered))
+
+		// The kubeconfig now points at a recreated cluster whose discovery fails.
+		targetCS.Host = discoveryServer(&okB).URL
+		fullPassAgain(name)
+		_, err = reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeVC.WrittenAuthCfgs).To(HaveLen(2))
+		Expect(fakeVC.WrittenAuthCfgs[1].KubernetesHost).To(Equal(targetCS.Host))
+		Expect(fakeVC.WrittenAuthCfgs[1].Issuer).To(BeEmpty(), "the previous cluster's issuer was applied to the new one")
+		Expect(fakeVC.WrittenAuthCfgs[1].DisableISSValidation).To(BeTrue())
+		Expect(claimNamed(name).Status.Vault.Issuer).To(BeEmpty())
 	})
 })
