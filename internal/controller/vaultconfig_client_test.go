@@ -94,7 +94,7 @@ var _ = Describe("VaultConfig probe through the real client", func() {
 		name := "ca-" + nextClaimName()
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: vcNS},
-			Data:       map[string][]byte{"ca.crt": ca1.pem},
+			Data:       map[string][]byte{"ca.crt": ca1.caPEM},
 		}
 		Expect(k8sClient.Create(context.Background(), secret)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), secret) })
@@ -114,7 +114,7 @@ var _ = Describe("VaultConfig probe through the real client", func() {
 		// The bundle is rotated: the next probe trusts the new CA.
 		fresh := &corev1.Secret{}
 		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(secret), fresh)).To(Succeed())
-		fresh.Data["ca.crt"] = ca2.pem
+		fresh.Data["ca.crt"] = ca2.caPEM
 		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
 		Expect(isConditionTrue(probe(r, name).Status.Conditions, vaultv1alpha1.ConditionReachable)).
 			To(BeTrue(), "the cached client still trusts only the old CA")

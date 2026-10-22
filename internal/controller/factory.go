@@ -73,10 +73,11 @@ type VaultClientFactory interface {
 }
 
 // caRevalidator is implemented by factories that cache a client per CA
-// bundle: the VaultConfig probe asks it to re-read the bundle, so a rotated
-// CA reaches the cached client within one probe interval.
+// bundle: the VaultConfig probe has it re-read the bundle, so a rotated CA
+// reaches the cached client within one probe interval. An error is the
+// probe's to report; the claims keep the client they have.
 type caRevalidator interface {
-	Revalidate(name string)
+	Revalidate(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig) error
 }
 
 // VaultClientOptions are applied to every client a factory builds. Zero
@@ -114,8 +115,11 @@ func (f *DefaultVaultClientFactory) client(ctx context.Context, cli client.Clien
 // Invalidate drops the client of a deleted VaultConfig and revokes its token.
 func (f *DefaultVaultClientFactory) Invalidate(name string) { f.cache.invalidate(name) }
 
-// Revalidate makes the next For re-read the CA bundle of name.
-func (f *DefaultVaultClientFactory) Revalidate(name string) { f.cache.revalidate(name) }
+// Revalidate re-reads the CA bundle of cfg and, when it changed, rebuilds the
+// cached client with the token kept.
+func (f *DefaultVaultClientFactory) Revalidate(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig) error {
+	return f.cache.revalidate(ctx, cli, cfg, f.JWTSource, f.Options)
+}
 
 // RevokeAll revokes every cached token. Run once the controllers have stopped.
 func (f *DefaultVaultClientFactory) RevokeAll(ctx context.Context) { f.cache.revokeAll(ctx) }
@@ -129,9 +133,7 @@ type clientCache struct {
 type cacheEntry struct {
 	generation int64
 	caHash     [sha256.Size]byte
-	// recheck: the CA bundle is re-read on the next get.
-	recheck bool
-	client  *vault.Client
+	client     *vault.Client
 }
 
 func (c *clientCache) get(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig,
@@ -142,46 +144,69 @@ func (c *clientCache) get(ctx context.Context, cli client.Client, cfg *vaultv1al
 		c.entries = make(map[string]*cacheEntry)
 	}
 	entry, ok := c.entries[cfg.Name]
-	sameGeneration := ok && entry.generation == cfg.Generation
-	if sameGeneration && !entry.recheck {
+	if ok && entry.generation == cfg.Generation {
 		return entry.client, nil
 	}
 
-	var caBundle []byte
-	if cfg.Spec.TLS != nil {
-		bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("load CA bundle: %w", err)
-		}
-		caBundle = bundle
+	caBundle, err := caBundleOf(ctx, cli, cfg)
+	if err != nil {
+		return nil, err
 	}
-	hash := sha256.Sum256(caBundle)
-	if sameGeneration && entry.caHash == hash {
-		entry.recheck = false
-		return entry.client, nil
-	}
-
 	vc, err := buildVaultClient(cfg, caBundle, jwtSrc, opts)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case sameGeneration:
-		// Same Vault, same role, new CA bundle: the token is still good.
-		vc.AdoptToken(entry.client)
-	case ok:
+	if ok {
 		retire(entry.client)
 	}
-	c.entries[cfg.Name] = &cacheEntry{generation: cfg.Generation, caHash: hash, client: vc}
+	c.entries[cfg.Name] = &cacheEntry{generation: cfg.Generation, caHash: sha256.Sum256(caBundle), client: vc}
 	return vc, nil
 }
 
-func (c *clientCache) revalidate(name string) {
+// revalidate re-reads the CA bundle of a cached client of the same
+// generation. The read runs without the cache lock: claims keep getting the
+// client meanwhile.
+func (c *clientCache) revalidate(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig,
+	jwtSrc vault.JWTSource, opts VaultClientOptions) error {
+	c.mu.Lock()
+	entry, ok := c.entries[cfg.Name]
+	c.mu.Unlock()
+	if !ok || entry.generation != cfg.Generation {
+		// The next get builds the client from the bundle as it is now.
+		return nil
+	}
+	caBundle, err := caBundleOf(ctx, cli, cfg)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(caBundle)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if entry, ok := c.entries[name]; ok {
-		entry.recheck = true
+	entry, ok = c.entries[cfg.Name]
+	if !ok || entry.generation != cfg.Generation || entry.caHash == hash {
+		return nil
 	}
+	vc, err := buildVaultClient(cfg, caBundle, jwtSrc, opts)
+	if err != nil {
+		return err
+	}
+	// Same Vault, same role, new CA bundle: the token is still good.
+	vc.AdoptToken(entry.client)
+	c.entries[cfg.Name] = &cacheEntry{generation: cfg.Generation, caHash: hash, client: vc}
+	return nil
+}
+
+// caBundleOf loads the CA bundle cfg names; nil means the system pool.
+func caBundleOf(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig) ([]byte, error) {
+	if cfg.Spec.TLS == nil {
+		return nil, nil
+	}
+	bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS)
+	if err != nil {
+		return nil, fmt.Errorf("load CA bundle: %w", err)
+	}
+	return bundle, nil
 }
 
 func (c *clientCache) invalidate(name string) {

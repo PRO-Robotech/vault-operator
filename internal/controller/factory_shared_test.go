@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/vault"
@@ -123,5 +125,60 @@ func TestFactoryNewGenerationRevokesTheOldToken(t *testing.T) {
 			t.Fatalf("calls %v: the replaced token was not revoked", v.calls())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A bundle that cannot be re-read leaves the working client in place; a
+// changed one replaces it and keeps the token.
+func TestFactoryRevalidateRebuildsOnlyOnAChangedBundle(t *testing.T) {
+	ca1, err := newTestCA("ca-1")
+	if err != nil {
+		t.Fatalf("CA: %v", err)
+	}
+	ca2, err := newTestCA("ca-2")
+	if err != nil {
+		t.Fatalf("CA: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "vault-ca", Namespace: "ns"},
+		Data:       map[string][]byte{"ca.crt": ca1.caPEM},
+	}
+	cli := fakeclient.NewClientBuilder().WithScheme(newCATestScheme(t)).WithObjects(secret).Build()
+	cfg := factoryConfig("https://127.0.0.1:1", 1)
+	cfg.Spec.TLS = &vaultv1alpha1.TLSSpec{CABundleSecretRef: &vaultv1alpha1.SecretKeySelector{Name: "vault-ca", Namespace: "ns", Key: "ca.crt"}}
+	f := &DefaultVaultClientFactory{JWTSource: vault.StaticJWTSource("jwt")}
+	ctx := context.Background()
+
+	first, err := f.For(ctx, cli, cfg)
+	if err != nil {
+		t.Fatalf("For: %v", err)
+	}
+	if err := f.Revalidate(ctx, cli, cfg); err != nil {
+		t.Fatalf("Revalidate of an unchanged bundle: %v", err)
+	}
+	if again, _ := f.For(ctx, cli, cfg); again.(*vault.Client) != first.(*vault.Client) {
+		t.Fatal("an unchanged bundle rebuilt the client")
+	}
+
+	if err := cli.Delete(ctx, secret); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := f.Revalidate(ctx, cli, cfg); err == nil {
+		t.Fatal("an unreadable bundle was not reported")
+	}
+	if again, _ := f.For(ctx, cli, cfg); again.(*vault.Client) != first.(*vault.Client) {
+		t.Fatal("an unreadable bundle dropped the working client")
+	}
+
+	secret.ResourceVersion = ""
+	secret.Data["ca.crt"] = ca2.caPEM
+	if err := cli.Create(ctx, secret); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := f.Revalidate(ctx, cli, cfg); err != nil {
+		t.Fatalf("Revalidate of a rotated bundle: %v", err)
+	}
+	if again, _ := f.For(ctx, cli, cfg); again.(*vault.Client) == first.(*vault.Client) {
+		t.Fatal("a rotated bundle kept the old client")
 	}
 }

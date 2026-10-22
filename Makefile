@@ -111,6 +111,12 @@ test-e2e-pipeline: manifests generate fmt vet envtest vault ## Run pipeline e2e 
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1 -timeout 15m
 
+.PHONY: test-load
+test-load: manifests generate fmt vet envtest vault ## Measure 1000 guest claims under a manager (envtest + `vault server -dev` $(VAULT_VERSION)); LOAD_WINDOW sets the steady window (default 10m).
+	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		go test -tags=e2e,load ./test/e2e_pipeline/... -run TestLoadThousandClaimsE2E -v -count=1 -timeout 30m
+
 .PHONY: test-e2e-secret-pipeline
 test-e2e-secret-pipeline: manifests generate fmt vet envtest vault ## Run VaultSecretClaim e2e only (envtest k8s + `vault server -dev` $(VAULT_VERSION)).
 	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \

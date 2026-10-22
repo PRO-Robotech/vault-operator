@@ -173,7 +173,8 @@ func main() {
 		setupLog.Error(err, "unable to set up probes")
 		os.Exit(1)
 	}
-	if err := controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindVaultSecretClaim); err != nil {
+	err = controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindVaultSecretClaim)
+	if err != nil {
 		setupLog.Error(err, "unable to register the claim inventory metrics")
 		os.Exit(1)
 	}

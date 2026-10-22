@@ -66,8 +66,14 @@ type harness struct {
 // (the tree's own when empty). Everything is torn down by t.Cleanup.
 func newHarness(t *testing.T, crdDir string) *harness {
 	t.Helper()
+	return newHarnessWithin(t, crdDir, 8*time.Minute)
+}
+
+// newHarnessWithin is newHarness whose context lasts timeout.
+func newHarnessWithin(t *testing.T, crdDir string, timeout time.Duration) *harness {
+	t.Helper()
 	logf.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(os.Stderr)))
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	t.Cleanup(cancel)
 
 	srv := StartVaultDev(ctx, t)

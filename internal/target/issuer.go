@@ -46,26 +46,23 @@ func DiscoverIssuer(ctx context.Context, cs *ClientSet) (string, error) {
 		return "", fmt.Errorf("target ClientSet has no Host configured")
 	}
 
-	// The target client's own transport, when there is one: its pool and
-	// its TLS settings come from the kubeconfig.
-	httpClient := cs.HTTPClient
-	if httpClient == nil {
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		if len(cs.CABundle) > 0 {
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(cs.CABundle) {
-				return "", fmt.Errorf("CABundle is not valid PEM")
-			}
-			tlsCfg.RootCAs = pool
-		} else {
-			tlsCfg.InsecureSkipVerify = true //nolint:gosec // matches kubeconfig intent
+	// Anonymous on purpose, not the target client's transport: with the
+	// kubeconfig credentials discovery succeeds where it used to fail, and
+	// every existing mount would be rewritten with issuer validation on —
+	// which refuses legacy Secret-based tokens (iss kubernetes/serviceaccount).
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if len(cs.CABundle) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(cs.CABundle) {
+			return "", fmt.Errorf("CABundle is not valid PEM")
 		}
-		httpClient = &http.Client{
-			Transport: &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment},
-		}
+		tlsCfg.RootCAs = pool
+	} else {
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // matches kubeconfig intent
 	}
-	ctx, cancel := context.WithTimeout(ctx, oidcDiscoveryHTTPTimeout)
-	defer cancel()
+	transport := &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment}
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{Timeout: oidcDiscoveryHTTPTimeout, Transport: transport}
 
 	url := strings.TrimRight(cs.Host, "/") + OIDCDiscoveryPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -177,8 +177,8 @@ func sortedKeys[V any](m map[string]V) []string {
 
 // testCA is a self-signed CA that signs a leaf for 127.0.0.1.
 type testCA struct {
-	pem  []byte
-	leaf *tls.Certificate
+	caPEM []byte
+	leaf  *tls.Certificate
 }
 
 func newTestCA(cn string) (*testCA, error) {
@@ -215,7 +215,7 @@ func newTestCA(cn string) (*testCA, error) {
 		return nil, err
 	}
 	return &testCA{
-		pem:  pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
-		leaf: &tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey},
+		caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		leaf:  &tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey},
 	}, nil
 }

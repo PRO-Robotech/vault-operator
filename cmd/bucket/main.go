@@ -207,7 +207,8 @@ func main() {
 		setupLog.Error(err, "unable to set up probes")
 		os.Exit(1)
 	}
-	if err := controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindS3BucketClaim); err != nil {
+	err = controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindS3BucketClaim)
+	if err != nil {
 		setupLog.Error(err, "unable to register the claim inventory metrics")
 		os.Exit(1)
 	}

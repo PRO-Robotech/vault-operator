@@ -181,9 +181,16 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 	}
 
 	// Every probe re-reads the CA bundle: a rotated CA reaches the cached
-	// client without a restart.
+	// client without a restart. A bundle that cannot be read now leaves the
+	// working client in place; the probe below shows whether it still works.
 	if rv, ok := r.VaultFactory.(caRevalidator); ok {
-		rv.Revalidate(cfg.Name)
+		if err := rv.Revalidate(ctx, r.Client, cfg); err != nil {
+			logger.Error(err, "re-read the CA bundle; the cached client is kept")
+			if r.Recorder != nil {
+				r.Recorder.Event(cfg, corev1.EventTypeWarning, "CABundleUnreadable",
+					"the CA bundle could not be re-read; the client built from the previous one is kept")
+			}
+		}
 	}
 	vc, err := r.VaultFactory.For(ctx, r.Client, cfg)
 	if err != nil {

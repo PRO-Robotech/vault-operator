@@ -25,6 +25,7 @@ import (
 )
 
 const (
+	firstToken     = "tok-1"
 	pathLookupSelf = "/v1/auth/token/lookup-self"
 	pathRevokeSelf = "/v1/auth/token/revoke-self"
 	pathPolicyP    = "/v1/sys/policies/acl/p"
@@ -165,7 +166,7 @@ func TestClient_RejectedTokenIsReplacedAndTheCallRetriedOnce(t *testing.T) {
 	if err := c.Login(context.Background()); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	tv.kill("tok-1")
+	tv.kill(firstToken)
 
 	if err := c.PutPolicy(context.Background(), "p", `path "secret/data/x" { capabilities = ["read"] }`); err != nil {
 		t.Fatalf("PutPolicy with a revoked token: %v", err)
@@ -194,7 +195,7 @@ func TestClient_DenialOfALiveTokenKeepsTheToken(t *testing.T) {
 	if n := tv.logins.Load(); n != 1 {
 		t.Fatalf("logins = %d, want 1: a capability denial is not a dead token", n)
 	}
-	if got := c.Token(); got != "tok-1" {
+	if got := c.Token(); got != firstToken {
 		t.Fatalf("token = %q, want tok-1", got)
 	}
 }
@@ -217,7 +218,7 @@ func TestClient_ReloginRevokesTheTokenItReplaces(t *testing.T) {
 	if n := tv.logins.Load(); n != 2 {
 		t.Fatalf("logins = %d, want 2", n)
 	}
-	if got := tv.revokedTokens(); len(got) != 1 || got[0] != "tok-1" {
+	if got := tv.revokedTokens(); len(got) != 1 || got[0] != firstToken {
 		t.Fatalf("revoked = %v, want [tok-1]", got)
 	}
 }
@@ -323,7 +324,7 @@ func TestClient_RevokeGivesTheTokenBack(t *testing.T) {
 		t.Fatalf("EnsureLoggedIn: %v", err)
 	}
 	c.Revoke(context.Background())
-	if got := tv.revokedTokens(); len(got) != 1 || got[0] != "tok-1" {
+	if got := tv.revokedTokens(); len(got) != 1 || got[0] != firstToken {
 		t.Fatalf("revoked = %v, want [tok-1]", got)
 	}
 	if c.Token() != "" {
