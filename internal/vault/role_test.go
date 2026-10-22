@@ -135,3 +135,47 @@ func TestClient_ListKubernetesRoles_EmptyIs404(t *testing.T) {
 		t.Fatalf("expected empty list, got %v", got)
 	}
 }
+
+// alias_name_source is read back for drift and sent only when set, so a role
+// without it is written as before.
+func TestClient_KubernetesRoleAliasNameSource(t *testing.T) {
+	fv := newFakeVault(t)
+	var bodies []string
+	fv.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/v1/auth/kubernetes-ec8a00/role/") {
+			return false
+		}
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"bound_service_account_names":      []string{"zot-1"},
+				"bound_service_account_namespaces": []string{"registry"},
+				"token_policies":                   []string{"p"},
+				"alias_name_source":                "serviceaccount_name",
+			}})
+			return true
+		}
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	c := newTestClient(t, fv)
+	live, err := c.ReadKubernetesRole(context.Background(), "kubernetes-ec8a00", "zot")
+	if err != nil {
+		t.Fatalf("ReadKubernetesRole: %v", err)
+	}
+	if live.AliasNameSource != "serviceaccount_name" {
+		t.Fatalf("alias_name_source read as %q", live.AliasNameSource)
+	}
+	role := KubernetesRole{BoundServiceAccountNames: []string{"zot-1"}, BoundServiceAccountNamespaces: []string{"registry"}, TokenPolicies: []string{"p"}}
+	if err := c.PutKubernetesRole(context.Background(), "kubernetes-ec8a00", "zot", role); err != nil {
+		t.Fatal(err)
+	}
+	role.AliasNameSource = "serviceaccount_name"
+	if err := c.PutKubernetesRole(context.Background(), "kubernetes-ec8a00", "zot", role); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 || strings.Contains(bodies[0], "alias_name_source") || !strings.Contains(bodies[1], `"alias_name_source":"serviceaccount_name"`) {
+		t.Fatalf("bodies sent: %v", bodies)
+	}
+}

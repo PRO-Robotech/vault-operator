@@ -1,98 +1,92 @@
 # Identity Templating
 
-Vault ACL-policies могут содержать ссылки на **identity** — атрибуты залогиненного entity (псевдо-пользователя). Самый частый сценарий в vault-operator — ограничить доступ namespace'ом pod'а через `{{ identity.entity.aliases.{accessor}.metadata.service_account_namespace }}`.
+Vault ACL-политика может ссылаться на атрибуты сущности, которая вошла в Vault. Kubernetes auth method на каждом входе пишет в метаданные alias имя и namespace ServiceAccount. Политика с путём по ним даёт каждому SA свой путь — одна политика вместо политики на каждую пару `(SA, namespace)`.
 
-## Когда это нужно
+Vault подставляет атрибут по шаблону `{{identity.entity.aliases.<accessor>.metadata.<ключ>}}`, где `<accessor>` — accessor auth-mount, через который был вход. Accessor знает только Vault, поэтому его подставляет оператор.
 
-Без identity templating — для каждой пары `(SA, namespace) → policy` приходится писать **отдельную политику** с явным namespace в path:
+## Три формы записи
 
-```hcl
-# 100 namespace'ов = 100 политик
-path "secret/data/clusters/ec8a00/monitoring/vmauth/*" { ... }
-path "secret/data/clusters/ec8a00/billing/svc/*" { ... }
-path "secret/data/clusters/ec8a00/observability/loki/*" { ... }
-...
+### 1. `identityPaths` — основная
+
+```yaml
+policies:
+  - name: ec8a00-apps
+    identityPaths:
+      - path: secret/data/clusters/ec8a00/{serviceAccountNamespace}/{serviceAccountName}
+        capabilities: [read]
 ```
 
-С identity templating — **одна политика на N namespace'ов**:
+Плейсхолдеры в одинарных фигурных скобках: `{serviceAccountName}`, `{serviceAccountNamespace}`. Их не трогают ни Go-шаблон оператора, ни шаблоны, которыми рендерят заявки. Оператор дописывает к `rules` (если они есть) по строфе на каждый путь:
 
 ```hcl
-path "secret/data/clusters/ec8a00/{{ identity.entity.aliases.{{ .AuthMountAccessor }}.metadata.service_account_namespace }}/*" {
-  capabilities = ["read", "list"]
+path "secret/data/clusters/ec8a00/{{identity.entity.aliases.auth_kubernetes_1a2b3c4d.metadata.service_account_namespace}}/{{identity.entity.aliases.auth_kubernetes_1a2b3c4d.metadata.service_account_name}}" {
+  capabilities = ["read"]
 }
 ```
 
-Vault на login'е автоматически проставляет `metadata.service_account_namespace`; ACL подставляет его в path.
+Что принимает схема:
+- путь — сегменты из `[a-z0-9._-]` и плейсхолдеров, хотя бы один плейсхолдер;
+- нет ведущего `/`, нет `*` и `+`, нет сегментов из одних точек (`.`, `..`);
+- `{meta.<ключ>}` зарезервирован и сейчас отвергается;
+- `capabilities` — `create`, `read`, `update`, `patch`, `delete`, `list`; `sudo` и `deny` недоступны.
+
+Оператор при рендере проверяет путь тем же выражением, что и схема (`IdentityPathPattern`).
+
+### 2. Функции шаблона в `rules`
+
+```yaml
+rules: |
+  path "secret/data/clusters/ec8a00/shared/{{ vaultSANamespace }}" {
+    capabilities = ["read"]
+  }
+```
+
+`{{ vaultSAName }}` и `{{ vaultSANamespace }}` выводят тот же шаблон Vault, что и плейсхолдеры.
+
+### 3. Экранированный шаблон Vault (прежняя форма)
+
+```yaml
+rules: |
+  path "secret/data/clusters/ec8a00/{{`{{`}}identity.entity.aliases.{{ .AuthMountAccessor }}.metadata.service_account_namespace{{`}}`}}/*" {
+    capabilities = ["read", "list"]
+  }
+```
+
+`rules` проходят через Go `text/template` оператора: `{{ .AuthMountAccessor }}` — accessor, а `{{`{{`}}` и `{{`}}`}}` выводят фигурные скобки Vault. Заявки в этой форме рендерятся байт в байт как раньше.
+
+Шаблон Vault без экранирования (`{{identity...}}` прямо в `rules`) отвергается: `PoliciesApplied=False reason=RenderFailed`, в сообщении названы формы, которыми его заменить.
+
+Набор форм в `rules` закрыт: текст и действие с одним операндом — `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` или строковая константа (`{{`{{`}}`). Циклы, ветвления, переменные, конвейеры, встроенные функции и вложенные шаблоны отвергаются той же причиной `RenderFailed` с позицией конструкции. `rules` длиннее 16384 байт не принимает схема, а отрендеренное тело политики ограничено 256 КиБ.
 
 ## Как это работает в операторе
 
-1. Оператор замечает в `spec.policies[].rules` подстроку `.AuthMountAccessor`.
-2. Лениво (один раз за reconcile) вызывает `GET sys/auth`, достаёт accessor для `spec.auth.mountPath`.
-3. Прогоняет HCL через `text/template` с `data = { AuthMountAccessor: "auth_kubernetes_a1b2c3" }`.
-4. Записывает отрендеренный HCL через `PUT sys/policies/acl/{name}`.
+1. Accessor нужен, если у политики есть `identityPaths` или если дерево разбора `rules` ссылается на данные шаблона (`.AuthMountAccessor`) либо на функции `vaultSA*`. Решение принимается по дереву разбора, а не по поиску подстроки: слово в комментарии HCL accessor не требует.
+2. Accessor читается из `GET sys/auth` один раз за полный проход и записывается в `status.vault.authMountAccessor`.
+3. Accessor в `sys/auth`, отличный от записанного, означает, что mount пересоздан: тела в Vault ссылаются на старый accessor и ничего не дают. Проверка дрейфа сообщает `auth mount accessor changed`, полный проход перерендеривает политики и пишет событие `AuthMountAccessorChanged`. Пустой `status.vault.authMountAccessor` сменой не считается — его заполнит следующий полный проход.
+4. Дрейф шаблонной политики сравнивает тело в Vault с телом, отрендеренным с записанным accessor. Ручная правка такой политики видна так же, как правка обычной.
+5. Конфиг auth-mount оператор пишет с `use_annotations_as_alias_metadata=false`: метаданные alias, которые читают шаблоны, нельзя дописать аннотацией ServiceAccount.
 
-Accessor кэшируется в `status.vault.authMountAccessor` для отладки (`kubectl describe`).
+## Роль на несколько SA
 
-## Пример
+Шаблонной политике нужна роль, через которую входят все SA, — `boundServiceAccounts.names[]`:
 
 ```yaml
-apiVersion: vault.in-cloud.io/v1alpha1
-kind: VaultClaim
-metadata:
-  name: ec8a00
-  namespace: dlputi1u
-spec:
-  vaultConfigRef: { name: default }
-  clusterRef:     { name: ec8a00 }
-  secretsPrefix: clusters/ec8a00
-  auth:
-    mountPath: kubernetes-ec8a00
-    tokenReviewer:
-      serviceAccount:
-        namespace: beget-vault-system
-        name: vault-token-reviewer
-
-  policies:
-    - name: ec8a00-namespace-scoped
-      rules: |
-        # Любой pod из любого namespace в этом кластере читает секреты
-        # только из своего namespace.
-        path "secret/data/clusters/ec8a00/{{`{{`}} identity.entity.aliases.{{ .AuthMountAccessor }}.metadata.service_account_namespace {{`}}`}}/*" {
-          capabilities = ["read", "list"]
-        }
-
-  roles:
-    - name: namespace-reader-monitoring
-      boundServiceAccounts: { name: vmauth, namespace: monitoring }
-      policies: [ec8a00-namespace-scoped]
-    - name: namespace-reader-billing
-      boundServiceAccounts: { name: svc, namespace: billing }
-      policies: [ec8a00-namespace-scoped]
+roles:
+  - name: apps
+    boundServiceAccounts:
+      names: [loki, vmauth]
+      namespace: monitoring
+    aliasNameSource: serviceaccount_name
+    policies: [ec8a00-apps]
 ```
 
-Pod `monitoring/vmauth` залогинится в роль `namespace-reader-monitoring`, получит client_token с политикой `ec8a00-namespace-scoped`, и сможет прочитать только `secret/data/clusters/ec8a00/monitoring/*`. Pod `billing/svc` — только `secret/data/clusters/ec8a00/billing/*`. Политика одна.
+- `names` и `name` взаимоисключающие. До 32 имён, DNS-1123, без глобов. Порядок не важен: оператор пишет имена отсортированными, а дрейф сравнивает множества.
+- Namespace у роли один. Несколько namespace — несколько ролей.
+- Кто именно вошёл, видно в метаданных токена (`service_account_name`, `service_account_namespace`) и в audit log.
+- `aliasNameSource: serviceaccount_name` называет alias `<namespace>/<name>`. SA, пересозданный с тем же именем в том же namespace, получает ту же сущность Vault: принципал тот же. Пусто — поле в Vault не отправляется.
+- `*`, `?`, `[` в `name` и `namespace` новой заявки отвергаются схемой. Сохранённое значение не перепроверяется, пока его не меняют (CRD validation ratcheting): старые заявки с `*` обновляются по другим полям.
 
-## Двойное экранирование
-
-Внутри YAML-строки `rules` имеется два уровня шаблонизации:
-
-1. **Внешний** — Go `text/template` оператора подставляет `.AuthMountAccessor`.
-2. **Внутренний** — Vault на login'е подставляет identity-атрибуты.
-
-Чтобы Vault'овские `{{ ... }}` дошли до Vault как есть и не были съедены первым уровнем, экранируйте их `{{`{{`}} ... {{`}}`}}`:
-
-```hcl
-# Что пишем в spec.policies[].rules
-path "secret/data/{{`{{`}} identity.entity.aliases.{{ .AuthMountAccessor }}.metadata.service_account_namespace {{`}}`}}/*" {
-```
-
-После рендера оператором уходит в Vault:
-
-```hcl
-path "secret/data/{{ identity.entity.aliases.auth_kubernetes_a1b2c3.metadata.service_account_namespace }}/*" {
-```
-
-## Доступные identity-атрибуты
+## Доступные атрибуты alias
 
 | Атрибут | Описание |
 |---|---|
@@ -101,16 +95,13 @@ path "secret/data/{{ identity.entity.aliases.auth_kubernetes_a1b2c3.metadata.ser
 | `service_account_uid` | UID SA |
 | `service_account_secret_name` | Имя legacy SA-секрета (если есть) |
 
-Полный список — [Vault docs: Kubernetes Auth Method](https://developer.hashicorp.com/vault/docs/auth/kubernetes#metadata).
-
 ## Когда НЕ использовать
 
-- **Маленькое число пар (SA, namespace)** — проще одну явную политику на пару, чем шаблон.
-- **Разные capabilities по namespace** — templating даёт один path-шаблон с одинаковыми `capabilities`. Если monitoring читает, а billing пишет, разделяйте.
-- **Если шаблонизация раздражает** — Vault считает identity templating «advanced»; явные политики проще читать в audit log'е.
+- Разные capabilities для разных SA: шаблон даёт всем одни и те же capabilities.
+- Доступ к путям другого SA или namespace: шаблон привязывает путь к тому, кто вошёл.
 
 ## Связанные документы
 
-- [Auth & Policies](auth-and-policies.md) — общий стек
-- [Пример](../examples/identity-templating/README.md) — рабочий YAML
+- [Auth & Policies](auth-and-policies.md)
+- [Пример](../examples/identity-templating/README.md)
 - [Vault docs: Templated Policies](https://developer.hashicorp.com/vault/docs/concepts/policies#templated-policies)

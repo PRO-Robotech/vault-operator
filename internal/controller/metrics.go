@@ -23,6 +23,7 @@ const (
 	DriftTypeRoleBody   = "role_body"
 	DriftTypePolicyBody = "policy_body"
 	DriftTypeAuthConfig = "auth_config"
+	DriftTypeAccessor   = "auth_mount_accessor"
 )
 
 var driftDetectedCounter = prometheus.NewCounterVec(

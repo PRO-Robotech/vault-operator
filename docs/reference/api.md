@@ -38,10 +38,14 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `auth.tokenReviewer.serviceAccount.autoCreate` | `bool` | Нет (default `true`) | Создавать ли SA + CRB `system:auth-delegator` в infra-кластере. |
 | `auth.tokenReviewer.ttl` | `duration` | Нет (default `24h`) | TTL JWT, выпускаемого TokenRequest API. Оператор ротирует при остатке <30%. |
 | `policies[].name` | `string` | Да | Имя ACL-policy. Префиксуйте именем claim'а — Vault OSS политики в глобальном NS. |
-| `policies[].rules` | `string` | Да | HCL тело политики. Может содержать `{{ .AuthMountAccessor }}`. |
+| `policies[].rules` | `string` | Да, если нет `identityPaths` | HCL тело политики, не длиннее 16384 байт. Go-шаблон закрытого набора форм: `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}`, строковая константа; прочие конструкции шаблона отвергаются (`RenderFailed`). Шаблон Vault напрямую — только экранированным. См. [identity-templating.md](../concepts/identity-templating.md). |
+| `policies[].identityPaths[].path` | `string` | Да | Путь ACL с плейсхолдерами `{serviceAccountName}`, `{serviceAccountNamespace}` (хотя бы один): сегменты `[a-z0-9._-]`, без ведущего `/`, без `*` и `+`, без сегментов из одних точек. `{meta.<key>}` зарезервирован. |
+| `policies[].identityPaths[].capabilities[]` | `[]enum` | Да | `create`, `read`, `update`, `patch`, `delete`, `list`; `sudo` и `deny` недоступны. |
 | `roles[].name` | `string` | Да | Имя роли под `auth/{mountPath}/role/`. |
-| `roles[].boundServiceAccounts.name` | `string` | Да | SA в infra-кластере. |
-| `roles[].boundServiceAccounts.namespace` | `string` | Да | Namespace SA в infra-кластере. |
+| `roles[].boundServiceAccounts.name` | `string` | Ровно одно из `name`, `names` | SA в infra-кластере. Без `*`, `?`, `[` (ratcheting: сохранённое значение не перепроверяется, пока не меняется). |
+| `roles[].boundServiceAccounts.names[]` | `[]string` | Ровно одно из `name`, `names` | До 32 SA одного namespace, DNS-1123, без глобов. Пишутся в Vault отсортированными: порядок — не дрейф. |
+| `roles[].boundServiceAccounts.namespace` | `string` | Да | Namespace SA в infra-кластере. Без `*`, `?`, `[` (ratcheting). |
+| `roles[].aliasNameSource` | `serviceaccount_uid`\|`serviceaccount_name` | Нет | Имя alias сущности Vault. Пусто — ничего не отправляется: новая роль получает умолчание Vault (`serviceaccount_uid`), существующая сохраняет своё. |
 | `roles[].policies[]` | `[]string` | Да | Имена политик из `policies[]` или существующих в Vault. |
 | `roles[].tokenTTL` | `duration` | Нет | TTL client_token, выпущенного через эту роль. Пусто → system default. |
 | `roles[].tokenMaxTTL` | `duration` | Нет | Max-TTL при renew. |
@@ -56,7 +60,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
 | `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
-| `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |
+| `vault.authMountAccessor` | `string` | Accessor, с которым отрендерены шаблонные политики. Другой accessor в `sys/auth` (mount пересоздан) — дрейф, событие `AuthMountAccessorChanged` и перерендер. |
 | `vault.appliedPolicies[]` | `[]string` | Журнал политик: имя попадает до записи в Vault и уходит после удаления. |
 | `vault.appliedRoles[]` | `[]string` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления. |
 | `vault.authMountOwned` | `bool` | Факт владения mount: 2xx на создание этой заявкой, её описание в `sys/auth` или запись `vault.authMountPath` прежнего прохода. |
@@ -74,7 +78,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `ConfigResolved` | VaultConfig найден, `Reachable=True`, `SharedMountFound=True` | Не найден / VaultConfig недоступен / mount отсутствует |
 | `VaultReachable` | Login в Vault прошёл успешно | Login failed (sealed Vault, network, неверный role) |
 | `KubeconfigAvailable` | Secret kubeconfig'а существует и содержит ключ `value` | Secret отсутствует или malformed |
-| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, или последняя попытка ротации провалилась |
+| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, последняя попытка ротации провалилась, или `ForeignReviewer`: SA/CRB ревьюера чужие |
 | `AuthMountReady` | Auth-mount существует и `auth/{mount}/config` записан | `POST sys/auth` failed (не 400) или `POST .../config` failed |
 | `PoliciesApplied` | Все `spec.policies[]` записаны | Хотя бы один `PUT sys/policies/acl` failed |
 | `RolesApplied` | Все `spec.roles[]` записаны + soft-purge выполнен | Хотя бы один `POST role` failed или `LIST` failed |
@@ -282,6 +286,8 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `ReviewerJWTRotated` | Normal | Reviewer JWT обновлён |
 | `RolesPurged` | Normal | Soft-purge удалил роли, которых нет в spec |
 | `DriftDetected` | Warning | Drift найден на Ready claim'е |
+| `AuthMountAccessorChanged` | Warning | Accessor auth-mount сменился (mount пересоздан); шаблонные политики отрендерены заново |
+| `ForeignReviewer` | Warning | SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки; объекты не тронуты, заявка `Failed` |
 | `DeletionStuck` | Warning | Reverse pipeline застрял на Vault |
 | `TargetCleanupBestEffort` | Warning | Cleanup в infra-кластере не удался (finalizer всё равно снимется) |
 | `VaultClaimDeleted` | Normal | Reverse pipeline завершён, finalizer снят |

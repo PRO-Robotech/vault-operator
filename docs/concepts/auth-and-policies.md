@@ -67,15 +67,15 @@ path "secret/data/clusters/ec8a00/monitoring/vmauth/*" {
 
 **Что:** `POST auth/{mount}/role/{name}` — связывает SA + namespace с policy.
 
-**Один SA на роль** — CRD ограничивает `boundServiceAccounts` единичной парой `{name, namespace}`. Хотя Vault принимает массивы и делает декартово произведение, мы намеренно избегаем этого:
+**Один namespace на роль.** `boundServiceAccounts` — либо один SA (`name`), либо набор имён одного namespace (`names[]`, до 32), ровно одно из двух. Декартово произведение «несколько имён × несколько namespace» CRD не выражает: несколько namespace — несколько ролей.
 
-| Причина | Объяснение |
+| Свойство | Как сохраняется |
 |---|---|
-| Аудит | Лог-запись Vault `login` называет роль; роль 1:1 с SA → ясно, кто залогинился |
-| Per-SA tuning | TTL, max-TTL, bound CIDR можно настроить только если каждая роль — про один SA |
-| Identity mapping | Vault entity ↔ SA однозначен |
+| Аудит | Кто вошёл, видно в метаданных токена (`service_account_name`, `service_account_namespace`) и в audit log, в том числе для роли с `names[]` |
+| Per-role tuning | TTL, max-TTL, политики — у роли; SA с разными настройками — разные роли |
+| Identity mapping | alias сущности — по UID SA (умолчание Vault) или по `<namespace>/<name>` (`aliasNameSource: serviceaccount_name`) |
 
-Если одну политику нужно раздать N SA — создаются N ролей с одинаковыми `policies: [...]`.
+Глобы (`*`, `?`, `[`) в `name`, `names` и `namespace` новой заявки схема отвергает. Сохранённое значение с `*` не перепроверяется, пока его не меняют (CRD validation ratcheting). Шаблонная политика с путём по SA — [identity-templating.md](identity-templating.md).
 
 **Удаление ролей** — по `spec.auth.rolePruning`: `Exclusive` (по умолчанию у владельца) удаляет с mount все имена, которых нет в `spec.roles[]`, но только пока mount доказанно принадлежит заявке; `Owned` — только роли из журнала. См. [ownership.md](ownership.md).
 

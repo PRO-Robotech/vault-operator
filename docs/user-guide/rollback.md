@@ -1,6 +1,6 @@
 # Откат оператора на v0.0.9
 
-Выпуск с журналом и гостевыми заявками отказывает в том, что v0.0.9 применил бы, и удаляет только своё. v0.0.9 так не умеет: роли он чистит по `LIST − spec` и политики пишет без проверок. Поэтому откат разрешён только при двух условиях.
+Выпуск с журналом и гостевыми заявками отказывает в том, что v0.0.9 применил бы, и удаляет только своё. v0.0.9 так не умеет: роли он чистит по `LIST − spec` и политики пишет без проверок. Поэтому откат разрешён только при трёх условиях.
 
 ## Условие 1: нет заявок нового вида
 
@@ -20,11 +20,23 @@ kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json
 ```bash
 kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json \
   | jq '[.items[] | select(any(.status.conditions[]?; .reason as $r
-        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned"]
+        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned","ForeignReviewer"]
         | index($r)))] | length'
 ```
 
 Должно быть `0`. Каждую такую заявку удаляют **до** отката, пока работает новый выпуск: он снимает только имена из её журнала, а отвергнутого в журнале нет.
+
+## Условие 3: нет полей шаблонной роли
+
+v0.0.9 не знает `policies[].identityPaths`, `roles[].boundServiceAccounts.names` и `roles[].aliasNameSource`: из политики он пишет только `rules` (строфы `identityPaths` пропадут), роль с `names` — с пустым именем SA, а запись заявки целиком (добавление и снятие финализера) сотрёт эти поля из spec.
+
+```bash
+kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json \
+  | jq '[.items[] | select(any(.spec.policies[]?; has("identityPaths"))
+        or any(.spec.roles[]?; has("aliasNameSource") or (.boundServiceAccounts | has("names"))))] | length'
+```
+
+Должно быть `0`. Заявку переводят на прежнюю форму (`rules` с экранированием, по роли на SA) до отката.
 
 ## Что остаётся после отката
 

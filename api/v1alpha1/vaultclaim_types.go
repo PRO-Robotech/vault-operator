@@ -11,6 +11,8 @@ You may obtain a copy of the License at
 package v1alpha1
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -161,27 +163,65 @@ type ServiceAccountRef struct {
 	AutoCreate bool `json:"autoCreate,omitempty"`
 }
 
-// BoundServiceAccounts identifies the single ServiceAccount allowed to log
-// in through this role.
+// BoundServiceAccounts identifies the ServiceAccounts allowed to log in
+// through this role: one name, or a set of names, all in one namespace.
 //
-// This CRD intentionally binds ONE SA per role — unlike Vault's native
-// bound_service_account_names / bound_service_account_namespaces which take
-// arrays and produce a Cartesian product. Reasons:
+// A role still maps to one namespace and one list of policies: TTLs,
+// policies and bound CIDRs stay per role. The ServiceAccount that logged in is
+// visible in the token's metadata (service_account_name,
+// service_account_namespace) and in the audit log, so a role with several
+// names does not hide who logged in. Several namespaces need several roles.
 //
-//   - Audit clarity: a Vault login event names a role that maps 1:1 to a
-//     specific SA. Multi-SA roles obscure who logged in.
-//   - Per-SA tuning: TTLs, policies, and bound CIDRs can differ per role —
-//     impossible to express on a shared multi-SA role.
-//   - Identity mapping: Vault entity ↔ SA stays unambiguous.
+// Name and namespace refuse the glob characters Vault reads (*, ?, [): a glob
+// binds ServiceAccounts nobody named. The rule ratchets — a stored value that
+// does not change keeps validating, so claims written before the rule are
+// still updated; a new or changed value is judged.
 //
-// To share a policy across SAs, declare N roles with the same `policies` —
-// policy objects are independent, only roles are scoped.
+// +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.names)",message="exactly one of boundServiceAccounts.name and boundServiceAccounts.names is required"
 type BoundServiceAccounts struct {
+	// Name of the single ServiceAccount.
 	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Names of the ServiceAccounts, without globs. The operator writes them
+	// sorted, so their order here is not drift.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	Names []string `json:"names,omitempty"`
+
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
 	Namespace string `json:"namespace"`
 }
+
+// ServiceAccountNames is the names the role binds, sorted: names, or name
+// alone.
+func (b BoundServiceAccounts) ServiceAccountNames() []string {
+	if len(b.Names) == 0 {
+		return []string{b.Name}
+	}
+	out := append([]string(nil), b.Names...)
+	slices.Sort(out)
+	return out
+}
+
+// AliasNameSource values select how Vault names the entity alias of a login.
+const (
+	// AliasNameSourceUID names the alias by the ServiceAccount UID (Vault's
+	// default): a recreated ServiceAccount is a new entity.
+	AliasNameSourceUID = "serviceaccount_uid"
+	// AliasNameSourceName names it "<namespace>/<name>": a ServiceAccount
+	// recreated under the same name in the same namespace is the same entity.
+	AliasNameSourceName = "serviceaccount_name"
+)
 
 // RoleSpec binds {SA, namespace} to a list of policies inside the
 // per-cluster auth mount.
@@ -221,6 +261,13 @@ type RoleSpec struct {
 	// TokenExplicitMaxTTL is a hard cap that renewal cannot extend past.
 	// +optional
 	TokenExplicitMaxTTL *metav1.Duration `json:"tokenExplicitMaxTTL,omitempty"`
+
+	// AliasNameSource selects how Vault names the entity alias of a login.
+	// Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
+	// an existing one keeps what it has.
+	// +kubebuilder:validation:Enum=serviceaccount_uid;serviceaccount_name
+	// +optional
+	AliasNameSource string `json:"aliasNameSource,omitempty"`
 }
 
 // TransitKeySpec declares one encryption key. Hardening fields default to their
@@ -276,17 +323,69 @@ type TransitSpec struct {
 	Keys []TransitKeySpec `json:"keys,omitempty"`
 }
 
+// Placeholders of an identity path. The operator renders each into the Vault
+// template naming the alias metadata of the auth mount the claim logs in
+// through; single braces pass the operator's own Go template and the
+// templates that render claims untouched. {meta.<key>} is reserved.
+const (
+	PlaceholderServiceAccountName      = "{serviceAccountName}"
+	PlaceholderServiceAccountNamespace = "{serviceAccountNamespace}"
+)
+
+// IdentityPathPattern is the schema pattern of identityPaths[].path, for the
+// operator to judge a path the same way when it renders one.
+const IdentityPathPattern = `^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
+
+// MaxRulesLength is the schema limit of policies[].rules in bytes, for the
+// operator to refuse a longer body the same way when it renders one.
+const MaxRulesLength = 16384
+
+// IdentityPath grants capabilities on a Vault path that names the logged-in
+// ServiceAccount.
+type IdentityPath struct {
+	// Path is a Vault ACL path, without a leading "/", made of segments of
+	// [a-z0-9._-] and the placeholders {serviceAccountName} and
+	// {serviceAccountNamespace}; at least one placeholder, no globs, no
+	// segment made of dots only. The pattern carries every rule: CEL here
+	// would be costed per item of two unbounded lists.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
+	Path string `json:"path"`
+
+	// Capabilities granted on the path. sudo and deny are not offered.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Enum=create;read;update;patch;delete;list
+	Capabilities []string `json:"capabilities"`
+}
+
 // PolicySpec defines an ACL policy written as HCL into Vault. Names should
 // be prefixed with "{metadata.name}-" because Vault OSS policies live in a
 // global namespace.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.rules) || has(self.identityPaths)",message="a policy needs rules, identityPaths or both"
 type PolicySpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-	// templating.
+	// Rules is HCL ACL content rendered as a Go template. {{ .AuthMountAccessor }}
+	// is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
+	// {{ vaultSANamespace }} write the Vault templates naming the logged-in
+	// ServiceAccount. A Vault template written directly must be escaped:
+	// {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+	// 16384 bytes (MaxRulesLength).
 	// +kubebuilder:validation:MinLength=1
-	Rules string `json:"rules"`
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	Rules string `json:"rules,omitempty"`
+
+	// IdentityPaths are appended to the rules, one path stanza each.
+	// +listType=map
+	// +listMapKey=path
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	IdentityPaths []IdentityPath `json:"identityPaths,omitempty"`
 }
 
 // VaultClaimSpec is the desired state of a VaultClaim. One VaultClaim per
@@ -386,8 +485,10 @@ type VaultStatusSummary struct {
 	// +optional
 	SecretsPrefix string `json:"secretsPrefix,omitempty"`
 
-	// AuthMountAccessor is cached from Vault, populated lazily on first
-	// render of a policy that uses {{ .AuthMountAccessor }}.
+	// AuthMountAccessor is the accessor the claim's templated policies were
+	// last rendered with, read from sys/auth on a pass that renders one. A
+	// different accessor in sys/auth means the mount was recreated: the
+	// policies are rendered again.
 	// +optional
 	AuthMountAccessor string `json:"authMountAccessor,omitempty"`
 

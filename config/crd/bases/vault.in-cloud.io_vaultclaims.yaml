@@ -179,19 +179,69 @@ spec:
                     be prefixed with "{metadata.name}-" because Vault OSS policies live in a
                     global namespace.
                   properties:
+                    identityPaths:
+                      description: IdentityPaths are appended to the rules, one path
+                        stanza each.
+                      items:
+                        description: |-
+                          IdentityPath grants capabilities on a Vault path that names the logged-in
+                          ServiceAccount.
+                        properties:
+                          capabilities:
+                            description: Capabilities granted on the path. sudo and
+                              deny are not offered.
+                            items:
+                              enum:
+                              - create
+                              - read
+                              - update
+                              - patch
+                              - delete
+                              - list
+                              type: string
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: set
+                          path:
+                            description: |-
+                              Path is a Vault ACL path, without a leading "/", made of segments of
+                              [a-z0-9._-] and the placeholders {serviceAccountName} and
+                              {serviceAccountNamespace}; at least one placeholder, no globs, no
+                              segment made of dots only. The pattern carries every rule: CEL here
+                              would be costed per item of two unbounded lists.
+                            maxLength: 512
+                            minLength: 1
+                            pattern: ^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$
+                            type: string
+                        required:
+                        - capabilities
+                        - path
+                        type: object
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - path
+                      x-kubernetes-list-type: map
                     name:
                       minLength: 1
                       type: string
                     rules:
                       description: |-
-                        Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-                        templating.
+                        Rules is HCL ACL content rendered as a Go template. {{ .AuthMountAccessor }}
+                        is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
+                        {{ vaultSANamespace }} write the Vault templates naming the logged-in
+                        ServiceAccount. A Vault template written directly must be escaped:
+                        {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+                        16384 bytes (MaxRulesLength).
+                      maxLength: 16384
                       minLength: 1
                       type: string
                   required:
                   - name
-                  - rules
                   type: object
+                  x-kubernetes-validations:
+                  - message: a policy needs rules, identityPaths or both
+                    rule: has(self.rules) || has(self.identityPaths)
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -202,6 +252,15 @@ spec:
                     RoleSpec binds {SA, namespace} to a list of policies inside the
                     per-cluster auth mount.
                   properties:
+                    aliasNameSource:
+                      description: |-
+                        AliasNameSource selects how Vault names the entity alias of a login.
+                        Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
+                        an existing one keeps what it has.
+                      enum:
+                      - serviceaccount_uid
+                      - serviceaccount_name
+                      type: string
                     audience:
                       description: |-
                         Audience is the `aud` claim Vault verifies in the login JWT. Without it the
@@ -209,32 +268,50 @@ spec:
                       type: string
                     boundServiceAccounts:
                       description: |-
-                        BoundServiceAccounts identifies the single ServiceAccount allowed to log
-                        in through this role.
+                        BoundServiceAccounts identifies the ServiceAccounts allowed to log in
+                        through this role: one name, or a set of names, all in one namespace.
 
-                        This CRD intentionally binds ONE SA per role — unlike Vault's native
-                        bound_service_account_names / bound_service_account_namespaces which take
-                        arrays and produce a Cartesian product. Reasons:
+                        A role still maps to one namespace and one list of policies: TTLs,
+                        policies and bound CIDRs stay per role. The ServiceAccount that logged in is
+                        visible in the token's metadata (service_account_name,
+                        service_account_namespace) and in the audit log, so a role with several
+                        names does not hide who logged in. Several namespaces need several roles.
 
-                          - Audit clarity: a Vault login event names a role that maps 1:1 to a
-                            specific SA. Multi-SA roles obscure who logged in.
-                          - Per-SA tuning: TTLs, policies, and bound CIDRs can differ per role —
-                            impossible to express on a shared multi-SA role.
-                          - Identity mapping: Vault entity ↔ SA stays unambiguous.
-
-                        To share a policy across SAs, declare N roles with the same `policies` —
-                        policy objects are independent, only roles are scoped.
+                        Name and namespace refuse the glob characters Vault reads (*, ?, [): a glob
+                        binds ServiceAccounts nobody named. The rule ratchets — a stored value that
+                        does not change keeps validating, so claims written before the rule are
+                        still updated; a new or changed value is judged.
                       properties:
                         name:
+                          description: Name of the single ServiceAccount.
+                          maxLength: 253
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
+                        names:
+                          description: |-
+                            Names of the ServiceAccounts, without globs. The operator writes them
+                            sorted, so their order here is not drift.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
                         namespace:
+                          maxLength: 63
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
                       required:
-                      - name
                       - namespace
                       type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of boundServiceAccounts.name and boundServiceAccounts.names
+                          is required
+                        rule: has(self.name) != has(self.names)
                     name:
                       description: Uniqueness scoped to auth/{mountPath}/role/.
                       minLength: 1
@@ -462,8 +539,10 @@ spec:
                     type: array
                   authMountAccessor:
                     description: |-
-                      AuthMountAccessor is cached from Vault, populated lazily on first
-                      render of a policy that uses {{ .AuthMountAccessor }}.
+                      AuthMountAccessor is the accessor the claim's templated policies were
+                      last rendered with, read from sys/auth on a pass that renders one. A
+                      different accessor in sys/auth means the mount was recreated: the
+                      policies are rendered again.
                     type: string
                   authMountOwned:
                     description: |-

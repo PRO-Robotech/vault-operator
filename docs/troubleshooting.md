@@ -53,6 +53,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 |---|---|---|
 | `TargetClientError` | kubeconfig не парсится / target apiserver unreachable | проверить, что kubeconfig валиден и infra-кластер запущен |
 | `TargetSAFailed` | SSA на namespace/SA/CRB провалилась | проверить RBAC kubeconfig'а в infra-кластере (нужны права на `serviceaccounts`, `clusterrolebindings`, `namespaces`) |
+| `ForeignReviewer` | SA ревьюера или его ClusterRoleBinding уже есть в infra-кластере без меток `vault.in-cloud.io/claim-name`/`claim-namespace` этой заявки; оператор их не трогает, заявка `Failed` | выяснить, чей это объект: свой без меток — проставить метки этой заявки; чужой — выбрать другое `tokenReviewer.serviceAccount.name` |
 | `TokenRequestFailed` | TokenRequest API провалился | k8s ≥ 1.20 в infra-кластере; проверить, что SA существует |
 
 ### AuthMountReady=False
@@ -67,7 +68,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 | reason | причина | действие |
 |---|---|---|
 | `AccessorLookupFailed` | не удалось получить accessor для `{{ .AuthMountAccessor }}` шаблона | сначала должен быть `AuthMountReady=True` — если auth method не создан, шаг 5 неуспешен |
-| `RenderFailed` | template error в HCL | проверить `spec.policies[].rules` — синтаксис Go template, доступная переменная: `.AuthMountAccessor` |
+| `RenderFailed` | template error в HCL либо форма шаблона вне закрытого набора | проверить `spec.policies[].rules`: допустимы текст, `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` и строковые константы; сообщение называет отвергнутую конструкцию и её позицию |
 | `PutPolicyFailed` | Vault отверг policy (часто 400 — invalid HCL) | смотреть message — обычно невалидный HCL |
 
 ### RolesApplied=False

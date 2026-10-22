@@ -351,6 +351,31 @@ func (h *harness) snapshot() []byte {
 	return out
 }
 
+// reviewerName is the token reviewer SA of claim name. Every claim of a
+// harness has its target cluster in the one envtest apiserver, where
+// production has a cluster per claim: a name per claim keeps each reviewer
+// the claim's own.
+func reviewerName(claim string) string { return "vault-token-reviewer-" + claim }
+
+// withoutGlobBindings turns production shapes into claims the current schema
+// admits on creation: it refuses a glob in a new binding, so the read-only
+// role binds a named ServiceAccount. Claims that already hold the glob are
+// covered by the upgrade test, which creates them under the legacy schema.
+func withoutGlobBindings(claims []*vaultv1alpha1.VaultClaim) []*vaultv1alpha1.VaultClaim {
+	for _, c := range claims {
+		for i := range c.Spec.Roles {
+			b := &c.Spec.Roles[i].BoundServiceAccounts
+			if b.Name == "*" {
+				b.Name = "reader"
+			}
+			if b.Namespace == "*" {
+				b.Namespace = "apps"
+			}
+		}
+	}
+	return claims
+}
+
 // prodShapedClaims are the two claim shapes production runs (census of 112
 // claims: 105 of the first, 7 of the second), with names of the same form.
 func prodShapedClaims(ns string) []*vaultv1alpha1.VaultClaim {
@@ -368,7 +393,7 @@ func prodShapedClaims(ns string) []*vaultv1alpha1.VaultClaim {
 					MountPath:  id,
 					AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
-						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-reviewer", Name: "vault-token-reviewer", AutoCreate: true},
+						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-reviewer", Name: reviewerName(name), AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
 					},
 				},
