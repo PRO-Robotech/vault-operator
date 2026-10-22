@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -53,9 +54,15 @@ const (
 	// exponentially between these bounds.
 	bucketBackoffBase = time.Minute
 	bucketBackoffMax  = 30 * time.Minute
-	// bucketCreateGrace is how long a create in flight (status.pendingCreate)
-	// that cloud-manager does not show yet is waited for before creating again,
-	// counted from the end of the last create call without an answer.
+	// bucketCreateGrace is how long, past the create deadline, a create in
+	// flight (status.pendingCreate) that cloud-manager does not list yet is
+	// waited for: no create is repeated before pendingCreate.since + the
+	// create deadline + this grace. since is the decision, persisted before
+	// the call, so the bound holds without any write after the call: a
+	// shutdown or a lost leadership cancels the call and the final status
+	// write of the pass together, while the server goes on with the create.
+	// The grace covers the time from the decision to the call reaching the
+	// server and the lag before a committed bucket is listed.
 	bucketCreateGrace = time.Minute
 )
 
@@ -80,6 +87,11 @@ type S3BucketClaimReconciler struct {
 
 	// Runtime carries the process-wide reconcile settings.
 	Runtime Runtime
+
+	// CreateTimeout is the deadline of a cloud-manager create, as the
+	// Buckets client applies it; 0 means the client default. A create in
+	// flight is not repeated before it and bucketCreateGrace have passed.
+	CreateTimeout time.Duration
 
 	backoff stepBackoff
 }
@@ -271,7 +283,7 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 			fmt.Sprintf("%d buckets of this login match %q; set spec.bucket.name", len(cands), requestedName)), false
 	}
 
-	if pending != nil && r.now().Sub(pending.Since.Time) < bucketCreateGrace {
+	if pending != nil && r.now().Sub(pending.Since.Time) < r.createWait() {
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
 			"Locating", "create in flight; waiting for the bucket to appear")
@@ -368,14 +380,17 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		return ctrl.Result{RequeueAfter: bucketRequeueRace}, false
 	}
-	if echoed.PendingCreate == nil {
-		// The API server dropped the marker: the installed CRD is older than
-		// this operator. Without the marker a create whose answer is lost is
-		// later taken for someone else's bucket (Adopted, never purged), so
-		// nothing is created until the CRD is updated.
+	if !keptPendingCreate(echoed.PendingCreate, claim.Status.PendingCreate) {
+		// The API server dropped the marker or one of its fields: the
+		// installed CRD is older than this operator. Without the marker a
+		// create whose answer is lost is later taken for someone else's
+		// bucket (Adopted, never purged); without existingNames a bucket that
+		// existed before is taken for this create's; without since the wait
+		// for a create in flight is gone. Nothing is created until the CRD is
+		// updated.
 		claim.Status.PendingCreate = nil
 		return r.stateFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "StatusSchemaOutdated", "schema",
-			"the S3BucketClaim CRD does not keep status.pendingCreate; install the CRD of this operator version"), false
+			"the S3BucketClaim CRD does not keep status.pendingCreate with all its fields; install the CRD of this operator version"), false
 	}
 
 	cfgID := claim.Spec.Bucket.ConfigurationID
@@ -423,10 +438,10 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 
 	case errors.Is(err, cloudmanager.ErrCreateRejected):
 		// The server may have done part of the work (an S3 user without the
-		// bucket): pendingCreate stays, the grace restarts now, and repeats
-		// back off, since a repeat of the same name meets the same state.
+		// bucket): pendingCreate stays, so the next create waits for this
+		// one's deadline and the grace, and repeats back off, since a repeat
+		// of the same name meets the same state.
 		logger.V(1).Info("cloud-manager rejected the create", "err", err.Error())
-		claim.Status.PendingCreate.Since = metav1.NewTime(r.now())
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		msg := fmt.Sprintf("cloud-manager rejected the create of %q with code %s; retrying with backoff", requestedName, createRejectedCode(err))
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
@@ -446,11 +461,13 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 		return ctrl.Result{RequeueAfter: bucketRequeueQuota}, false
 
 	default:
-		// Unknown outcome (timeout, transport): the bucket may exist, so
-		// pendingCreate is kept and the next pass looks it up first; the
-		// grace runs from now, the server may still be finishing the create.
+		// Unknown outcome (timeout, transport, a cancelled pass): the bucket
+		// may exist, so pendingCreate is kept and the next pass looks it up
+		// first. The wait for a repeat runs from pendingCreate.since, the
+		// decision persisted before the call, and not from now: the server
+		// may still be finishing the create, and the end of this pass may
+		// never be persisted.
 		logger.V(1).Info("cloud-manager create failed", "err", err.Error())
-		claim.Status.PendingCreate.Since = metav1.NewTime(r.now())
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
 			"CreateFailed", "cloud-manager create failed; retrying")
 		r.event(claim, corev1.EventTypeWarning, "CreateFailed", "cloud-manager create failed; retrying")
@@ -595,6 +612,27 @@ func (r *S3BucketClaimReconciler) event(claim *vaultv1alpha1.S3BucketClaim, even
 	if r.Recorder != nil {
 		r.Recorder.Event(claim, eventType, reason, msg)
 	}
+}
+
+// createWait is how long after pendingCreate.since a create is not repeated:
+// the create deadline, within which cloud-manager finishes a create it got
+// (the deadline is kept above its create latency), and the grace.
+func (r *S3BucketClaimReconciler) createWait() time.Duration {
+	timeout := r.CreateTimeout
+	if timeout <= 0 {
+		timeout = cloudmanager.DefaultOptions().CreateTimeout
+	}
+	return timeout + bucketCreateGrace
+}
+
+// keptPendingCreate reports whether the API server answered the marker with
+// every field the recovery of a lost create reads. since is checked for
+// presence only: the API server keeps it at a one-second resolution.
+func keptPendingCreate(echoed, want *vaultv1alpha1.PendingBucketCreate) bool {
+	return echoed != nil &&
+		echoed.RequestedName == want.RequestedName &&
+		!echoed.Since.IsZero() &&
+		slices.Equal(echoed.ExistingNames, want.ExistingNames)
 }
 
 func (r *S3BucketClaimReconciler) now() time.Time {

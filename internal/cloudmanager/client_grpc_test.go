@@ -344,6 +344,9 @@ func TestClient_CreateRejectedWithoutACodeIsNamed(t *testing.T) {
 	srv := cmfake.New()
 	srv.CreateError = &pb.CreateError{Code: pb.CreateError_CODE_RESERVED, Message: "failed to create user: user already exists"}
 	c := newTestClient(t, srv, Options{})
+	reserved := createRejectedCounter.WithLabelValues(pb.CreateError_CODE_RESERVED.String())
+	limit := createRejectedCounter.WithLabelValues(pb.CreateError_BUCKET_LIMIT_REACHED.String())
+	reservedBefore, limitBefore := testutil.ToFloat64(reserved), testutil.ToFloat64(limit)
 
 	_, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-rej"})
 	if err == nil || !strings.Contains(err.Error(), "create rejected [CODE_RESERVED]") {
@@ -352,9 +355,52 @@ func TestClient_CreateRejectedWithoutACodeIsNamed(t *testing.T) {
 	if !errors.Is(err, ErrCreateRejected) {
 		t.Fatalf("err = %v, want it to wrap ErrCreateRejected", err)
 	}
-	// Twin: a mapped code is not a rejection of this kind.
+	if d := testutil.ToFloat64(reserved) - reservedBefore; d != 1 {
+		t.Fatalf("create_rejected_total{code=CODE_RESERVED} grew by %v, want 1", d)
+	}
+	// Twin: a mapped code is not a rejection of this kind and is not counted.
 	srv.CreateError = &pb.CreateError{Code: pb.CreateError_BUCKET_LIMIT_REACHED, Message: "limit"}
 	if _, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-lim"}); errors.Is(err, ErrCreateRejected) || !errors.Is(err, ErrBucketLimitReached) {
 		t.Fatalf("limit: err = %v, want ErrBucketLimitReached only", err)
+	}
+	if d := testutil.ToFloat64(limit) - limitBefore; d != 0 {
+		t.Fatalf("create_rejected_total{code=BUCKET_LIMIT_REACHED} grew by %v, want 0", d)
+	}
+	if d := testutil.ToFloat64(reserved) - reservedBefore; d != 1 {
+		t.Fatalf("create_rejected_total{code=CODE_RESERVED} grew by %v after a mapped code, want it unchanged at 1", d)
+	}
+}
+
+// A process whose create deadline, with the findAll calls before it, does not
+// fit the reconcile deadline refuses to start: the reconcile deadline would
+// cut the create unseen.
+func TestOptions_CreateMustFitTheReconcileDeadline(t *testing.T) {
+	def := DefaultOptions() // create 2m; findAll 15s, 2 attempts, 200ms apart
+	need := 2*time.Minute + 2*(2*15*time.Second+200*time.Millisecond)
+	for _, tc := range []struct {
+		name      string
+		opts      Options
+		reconcile time.Duration
+		refused   bool
+	}{
+		{"defaults within the default reconcile deadline", def, 5 * time.Minute, false},
+		{"no reconcile deadline", def, 0, false},
+		{"exactly the calls of a creating pass", def, need, true},
+		{"one second above them", def, need + time.Second, false},
+		{"create deadline at the reconcile deadline", Options{CreateTimeout: 5 * time.Minute, FindRetries: 1}, 5 * time.Minute, true},
+		// Zero values take the defaults, no retries: 2m + 2×15s.
+		{"zero options, at the bound", Options{}, 2*time.Minute + 30*time.Second, true},
+		{"zero options, above the bound", Options{}, 2*time.Minute + 31*time.Second, false},
+	} {
+		err := tc.opts.CheckReconcileTimeout(tc.reconcile)
+		if (err != nil) != tc.refused {
+			t.Errorf("%s: CheckReconcileTimeout(%s) = %v, refused want %v", tc.name, tc.reconcile, err, tc.refused)
+		}
+	}
+	if got := (Options{}).CreateDeadline(); got != defaultCreateTimeout {
+		t.Errorf("CreateDeadline of zero options = %s, want the default %s", got, defaultCreateTimeout)
+	}
+	if got := (Options{CreateTimeout: time.Minute}).CreateDeadline(); got != time.Minute {
+		t.Errorf("CreateDeadline = %s, want the configured 1m", got)
 	}
 }

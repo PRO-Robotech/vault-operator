@@ -146,11 +146,13 @@ var _ = Describe("S3BucketClaim create recovery", func() {
 		Expect(creates()).To(Equal(1))
 		Expect(getS3("s3late").Status.PendingCreate).NotTo(BeNil())
 
-		// Pass 2, after the grace: the lookup still misses the bucket, a second
-		// create is issued and cloud-manager answers "user already exists".
+		// Pass 2, past the create deadline and the grace: the lookup still
+		// misses the bucket, a second create is issued and cloud-manager
+		// answers "user already exists".
 		srv.CreateError = userExists
-		clk = clk.Add(2 * time.Minute)
+		clk = clk.Add(createTimeout + bucketCreateGrace + time.Second)
 		reconcileOnce("s3late")
+		Expect(creates()).To(Equal(2))
 
 		// Pass 3: the bucket is listed; it is the first create's.
 		clk = clk.Add(2 * time.Minute)
@@ -178,13 +180,19 @@ var _ = Describe("S3BucketClaim create recovery", func() {
 		Expect(got.Status.PendingCreate).NotTo(BeNil())
 		Expect(res.RequeueAfter).To(Equal(bucketBackoffBase))
 
-		clk = clk.Add(2 * time.Minute)
+		// The backoff requeue comes before the wait for a create in flight
+		// is over: no second create yet.
+		clk = clk.Add(bucketBackoffBase)
+		reconcileOnce("s3rej")
+		Expect(creates()).To(Equal(1))
+
+		clk = clk.Add(createTimeout + bucketCreateGrace)
 		res = reconcileOnce("s3rej")
 		Expect(creates()).To(Equal(2))
 		Expect(res.RequeueAfter).To(Equal(2 * bucketBackoffBase))
 	})
 
-	It("counts the grace of an unanswered create from the end of the call, not from its start", func() {
+	It("waits for an unanswered create until its deadline and the grace have passed since its decision", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-slowcall")
 		// The call runs 90s and ends without an answer; nothing is created.
 		srv.CreateErrs = []error{status.Error(codes.DeadlineExceeded, "cmfake: no answer in time")}
@@ -200,6 +208,12 @@ var _ = Describe("S3BucketClaim create recovery", func() {
 		reconcileOnce("s3slowcall")
 		Expect(creates()).To(Equal(1))
 		Expect(condReason(getS3("s3slowcall").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Locating"))
+
+		// Twin: past the deadline and the grace after the decision, with
+		// nothing listed, the create is repeated.
+		clk = clk.Add(createTimeout + bucketCreateGrace + time.Second - 130*time.Second)
+		reconcileOnce("s3slowcall")
+		Expect(creates()).To(Equal(2))
 	})
 
 	It("does not repeat a create cut by a restart before its deadline and the grace have passed since its decision", func() {

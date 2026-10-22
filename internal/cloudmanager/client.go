@@ -273,6 +273,30 @@ func (o Options) createTimeout() time.Duration {
 	return defaultCreateTimeout
 }
 
+// CreateDeadline is the deadline of one create: CreateTimeout or its default.
+// The reconciler waits for it before repeating a create in flight.
+func (o Options) CreateDeadline() time.Duration { return o.createTimeout() }
+
+// CheckReconcileTimeout refuses a reconcile deadline that a pass which
+// creates cannot finish its cloud-manager calls within: two findAll calls
+// (each with its retries) before the create, then the create itself. A
+// create cut by the reconcile deadline goes on on the server unseen, so a
+// process is not started with such a pair. 0 means no reconcile deadline;
+// rate-limit waits and the Kubernetes calls of the pass are not counted.
+func (o Options) CheckReconcileTimeout(reconcile time.Duration) error {
+	if reconcile <= 0 {
+		return nil
+	}
+	attempts := max(1, 1+o.FindRetries)
+	findAll := time.Duration(attempts)*o.callTimeout() + time.Duration(attempts-1)*findRetryDelay
+	need := o.createTimeout() + 2*findAll
+	if need >= reconcile {
+		return fmt.Errorf("reconcile timeout %s does not exceed the cloud-manager calls of a creating pass, %s "+
+			"(create %s, two findAll calls of %d attempt(s) of %s)", reconcile, need, o.createTimeout(), attempts, o.callTimeout())
+	}
+	return nil
+}
+
 // Close releases the underlying connection.
 func (c *Client) Close() error {
 	if c.conn != nil {
