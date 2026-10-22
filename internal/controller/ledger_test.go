@@ -99,7 +99,10 @@ func newClaim(name, configName, secretName string, opts ...claimOpt) *vaultv1alp
 				MountPath:  "kubernetes-" + name,
 				AutoCreate: ptr.To(true),
 				TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
-					ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-system", Name: "vault-token-reviewer", AutoCreate: true},
+					// One target cluster serves every claim of a test, as one
+					// cluster per claim does in production: the reviewer SA is
+					// each claim's own.
+					ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-system", Name: "vault-token-reviewer-" + name, AutoCreate: true},
 					TTL:            metav1.Duration{Duration: 24 * time.Hour},
 				},
 			},

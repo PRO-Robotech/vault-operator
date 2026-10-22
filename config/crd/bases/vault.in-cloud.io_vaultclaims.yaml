@@ -191,6 +191,13 @@ spec:
                             description: Capabilities granted on the path. sudo and
                               deny are not offered.
                             items:
+                              enum:
+                              - create
+                              - read
+                              - update
+                              - patch
+                              - delete
+                              - list
                               type: string
                             minItems: 1
                             type: array
@@ -204,11 +211,13 @@ spec:
                               would be costed per item of two unbounded lists.
                             maxLength: 512
                             minLength: 1
+                            pattern: ^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$
                             type: string
                         required:
                         - capabilities
                         - path
                         type: object
+                      maxItems: 32
                       type: array
                       x-kubernetes-list-map-keys:
                       - path
@@ -228,6 +237,9 @@ spec:
                   required:
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: a policy needs rules, identityPaths or both
+                    rule: has(self.rules) || has(self.identityPaths)
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -243,6 +255,9 @@ spec:
                         AliasNameSource selects how Vault names the entity alias of a login.
                         Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
                         an existing one keeps what it has.
+                      enum:
+                      - serviceaccount_uid
+                      - serviceaccount_name
                       type: string
                     audience:
                       description: |-
@@ -269,6 +284,7 @@ spec:
                           description: Name of the single ServiceAccount.
                           maxLength: 253
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
                         names:
                           description: |-
@@ -276,17 +292,24 @@ spec:
                             sorted, so their order here is not drift.
                           items:
                             maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                             type: string
+                          maxItems: 32
                           minItems: 1
                           type: array
                           x-kubernetes-list-type: set
                         namespace:
                           maxLength: 63
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
                       required:
                       - namespace
                       type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of boundServiceAccounts.name and boundServiceAccounts.names
+                          is required
+                        rule: has(self.name) != has(self.names)
                     name:
                       description: Uniqueness scoped to auth/{mountPath}/role/.
                       minLength: 1

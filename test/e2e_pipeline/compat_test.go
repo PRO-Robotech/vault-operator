@@ -262,6 +262,7 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	// without looking at its description. The upgrade must keep it so.
 	handMade := claims[1].DeepCopy()
 	handMade.Name, handMade.Spec.ClusterRef.Name, handMade.Spec.ClusterRef.KubeconfigSecret = "hm0001", "hm0001", "hm0001-infra-kubeconfig"
+	handMade.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(handMade.Name)
 	handMade.Spec.Auth.MountPath, handMade.Spec.SecretsPrefix = "acme-hm0001", "clusters/acme-hm0001"
 	handMade.Spec.Transit = nil
 	handMade.Spec.Policies, handMade.Spec.Roles = handMade.Spec.Policies[:1], handMade.Spec.Roles[:1]
@@ -341,6 +342,7 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	refused := claims[1].DeepCopy()
 	refused.ResourceVersion, refused.UID = "", ""
 	refused.Name, refused.Spec.ClusterRef.Name, refused.Spec.ClusterRef.KubeconfigSecret = "rr0001", "rr0001", "rr0001-infra-kubeconfig"
+	refused.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(refused.Name)
 	refused.Spec.Auth.MountPath, refused.Spec.SecretsPrefix = "acme-rr0001", "clusters/acme-rr0001"
 	refused.Spec.Transit, refused.Spec.Roles = nil, nil
 	refused.Spec.Policies = []vaultv1alpha1.PolicySpec{{Name: "acme-rr0001-admin", Rules: `path "sys/policies/acl/*" { capabilities = ["create", "update"] }`}}

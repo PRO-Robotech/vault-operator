@@ -101,6 +101,7 @@ func TestGuestOnOperatorMountE2E(t *testing.T) {
 	squatter := guestClaim("registry", "zot-2", "platform-ro")
 	intruder := withoutGlobBindings(prodShapedClaims("registry"))[0]
 	intruder.Name, intruder.Spec.ClusterRef.Name = "intruder", "intruder"
+	intruder.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(intruder.Name)
 	intruder.Spec.Auth.MountPath = mgmtAuthPath
 	intruder.Spec.SecretsPrefix = "clusters/registry-intruder"
 	intruder.Spec.Transit = nil
@@ -195,6 +196,7 @@ func TestOwnershipE2E(t *testing.T) {
 		time.Sleep(1100 * time.Millisecond)
 		younger := shapes[1].DeepCopy()
 		younger.Name, younger.Spec.ClusterRef.Name, younger.Spec.ClusterRef.KubeconfigSecret = "dd0001", "dd0001", "dd0001-infra-kubeconfig"
+		younger.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(younger.Name)
 		younger.Spec.Auth.MountPath, younger.Spec.SecretsPrefix = "acme-dd0001", "clusters/acme-dd0001"
 		younger.Spec.Policies, younger.Spec.Roles = nil, nil
 		younger.Spec.Transit.Keys[0].Exportable = true
@@ -219,6 +221,7 @@ func TestOwnershipE2E(t *testing.T) {
 		h.root(http.MethodPost, "sys/auth/acme-ee0001", map[string]string{"type": "kubernetes", "description": "created by hand"})
 		c := shapes[1].DeepCopy()
 		c.Name, c.Spec.ClusterRef.Name, c.Spec.ClusterRef.KubeconfigSecret = "ee0001", "ee0001", "ee0001-infra-kubeconfig"
+		c.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(c.Name)
 		c.Spec.Auth.MountPath, c.Spec.SecretsPrefix = "acme-ee0001", "clusters/acme-ee0001"
 		c.Spec.Transit = nil
 		c.Spec.Policies, c.Spec.Roles = c.Spec.Policies[:1], c.Spec.Roles[:1]
@@ -262,6 +265,7 @@ func TestOwnershipE2E(t *testing.T) {
 		mk := func(id string) *vaultv1alpha1.VaultClaim {
 			c := shapes[1].DeepCopy()
 			c.Name, c.Spec.ClusterRef.Name, c.Spec.ClusterRef.KubeconfigSecret = id, id, id+"-infra-kubeconfig"
+			c.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(c.Name)
 			c.Spec.Auth.MountPath, c.Spec.SecretsPrefix = "acme-"+id, "clusters/acme-"+id
 			c.Spec.Transit, c.Spec.Policies, c.Spec.Roles = nil, nil, nil
 			h.kubeconfigSecret("acme", id)
@@ -305,6 +309,7 @@ func TestOwnershipE2E(t *testing.T) {
 	t.Run("the ledger removes what left spec", func(t *testing.T) {
 		c := shapes[1].DeepCopy()
 		c.Name, c.Spec.ClusterRef.Name, c.Spec.ClusterRef.KubeconfigSecret = "ff0001", "ff0001", "ff0001-infra-kubeconfig"
+		c.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(c.Name)
 		c.Spec.Auth.MountPath, c.Spec.SecretsPrefix = "acme-ff0001", "clusters/acme-ff0001"
 		c.Spec.Transit = nil
 		rules := `path "secret/data/clusters/acme-ff0001/x" { capabilities = ["read"] }`
@@ -349,11 +354,13 @@ func TestOwnershipE2E(t *testing.T) {
 		enforce := h.reconciler(controller.OwnershipPolicy{}, policyguard.ModeEnforce)
 		bad := shapes[1].DeepCopy()
 		bad.Name, bad.Spec.ClusterRef.Name, bad.Spec.ClusterRef.KubeconfigSecret = "gg0001", "gg0001", "gg0001-infra-kubeconfig"
+		bad.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(bad.Name)
 		bad.Spec.Auth.MountPath, bad.Spec.SecretsPrefix = "acme-gg0001", "clusters/acme-gg0001"
 		bad.Spec.Transit, bad.Spec.Roles = nil, nil
 		bad.Spec.Policies = []vaultv1alpha1.PolicySpec{{Name: "gg-escalate", Rules: `path "sys/policies/acl/*" { capabilities = ["create", "update"] }`}}
 		twin := bad.DeepCopy()
 		twin.Name, twin.Spec.ClusterRef.Name, twin.Spec.ClusterRef.KubeconfigSecret = "gg0002", "gg0002", "gg0002-infra-kubeconfig"
+		twin.Spec.Auth.TokenReviewer.ServiceAccount.Name = reviewerName(twin.Name)
 		twin.Spec.Auth.MountPath, twin.Spec.SecretsPrefix = "acme-gg0002", "clusters/acme-gg0002"
 		twin.Spec.Policies = []vaultv1alpha1.PolicySpec{{Name: "gg-own", Rules: `path "secret/data/clusters/acme-gg0002/*" { capabilities = ["read"] }`}}
 		for _, c := range []*vaultv1alpha1.VaultClaim{bad, twin} {

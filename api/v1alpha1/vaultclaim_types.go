@@ -176,10 +176,13 @@ type ServiceAccountRef struct {
 // binds ServiceAccounts nobody named. The rule ratchets — a stored value that
 // does not change keeps validating, so claims written before the rule are
 // still updated; a new or changed value is judged.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.names)",message="exactly one of boundServiceAccounts.name and boundServiceAccounts.names is required"
 type BoundServiceAccounts struct {
 	// Name of the single ServiceAccount.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
 	// +optional
 	Name string `json:"name,omitempty"`
 
@@ -187,12 +190,15 @@ type BoundServiceAccounts struct {
 	// sorted, so their order here is not drift.
 	// +listType=set
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
 	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +optional
 	Names []string `json:"names,omitempty"`
 
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
 	Namespace string `json:"namespace"`
 }
 
@@ -259,6 +265,7 @@ type RoleSpec struct {
 	// AliasNameSource selects how Vault names the entity alias of a login.
 	// Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
 	// an existing one keeps what it has.
+	// +kubebuilder:validation:Enum=serviceaccount_uid;serviceaccount_name
 	// +optional
 	AliasNameSource string `json:"aliasNameSource,omitempty"`
 }
@@ -339,17 +346,21 @@ type IdentityPath struct {
 	// would be costed per item of two unbounded lists.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
 	Path string `json:"path"`
 
 	// Capabilities granted on the path. sudo and deny are not offered.
 	// +listType=set
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Enum=create;read;update;patch;delete;list
 	Capabilities []string `json:"capabilities"`
 }
 
 // PolicySpec defines an ACL policy written as HCL into Vault. Names should
 // be prefixed with "{metadata.name}-" because Vault OSS policies live in a
 // global namespace.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.rules) || has(self.identityPaths)",message="a policy needs rules, identityPaths or both"
 type PolicySpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
@@ -366,6 +377,7 @@ type PolicySpec struct {
 	// IdentityPaths are appended to the rules, one path stanza each.
 	// +listType=map
 	// +listMapKey=path
+	// +kubebuilder:validation:MaxItems=32
 	// +optional
 	IdentityPaths []IdentityPath `json:"identityPaths,omitempty"`
 }

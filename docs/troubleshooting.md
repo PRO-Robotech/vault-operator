@@ -53,6 +53,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 |---|---|---|
 | `TargetClientError` | kubeconfig не парсится / target apiserver unreachable | проверить, что kubeconfig валиден и infra-кластер запущен |
 | `TargetSAFailed` | SSA на namespace/SA/CRB провалилась | проверить RBAC kubeconfig'а в infra-кластере (нужны права на `serviceaccounts`, `clusterrolebindings`, `namespaces`) |
+| `ForeignReviewer` | SA ревьюера или его ClusterRoleBinding уже есть в infra-кластере без меток `vault.in-cloud.io/claim-name`/`claim-namespace` этой заявки; оператор их не трогает, заявка `Failed` | выяснить, чей это объект: свой без меток — проставить метки этой заявки; чужой — выбрать другое `tokenReviewer.serviceAccount.name` |
 | `TokenRequestFailed` | TokenRequest API провалился | k8s ≥ 1.20 в infra-кластере; проверить, что SA существует |
 
 ### AuthMountReady=False

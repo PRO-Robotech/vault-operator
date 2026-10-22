@@ -67,6 +67,10 @@ type KubernetesAuthConfig struct {
 	// cluster and the in-pod fallback reads /var/run/secrets which would point
 	// at Vault's own cluster.
 	DisableLocalCAJWT bool `json:"disable_local_ca_jwt,omitempty"`
+	// UseAnnotationsAsAliasMetadata is always sent, and always false: with it
+	// on, whoever may annotate a ServiceAccount adds alias metadata, and
+	// templated policies read alias metadata.
+	UseAnnotationsAsAliasMetadata bool `json:"use_annotations_as_alias_metadata"`
 }
 
 func (c *Client) WriteKubernetesAuthConfig(ctx context.Context, mount string, cfg KubernetesAuthConfig) error {

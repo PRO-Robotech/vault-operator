@@ -46,9 +46,17 @@ const (
 	ReasonKeyAdoptionRestricted = "KeyAdoptionRestricted"
 	// ReasonMountNotOwned (deletion only): the mount was left in place because
 	// sys/auth does not show it as this claim's.
-	ReasonMountNotOwned   = "MountNotOwned"
+	ReasonMountNotOwned = "MountNotOwned"
+	// ReasonForeignReviewer: the token reviewer ServiceAccount or its binding
+	// in the target cluster exists without this claim's labels. The legacy
+	// release force-applied over it.
 	ReasonForeignReviewer = "ForeignReviewer"
 )
+
+// ReasonAuthMountAccessorChanged (event): the claim's auth mount has another
+// accessor than its templated policies were rendered with; they are rendered
+// again. Not a refusal.
+const ReasonAuthMountAccessorChanged = "AuthMountAccessorChanged"
 
 // ReasonMountNotConfigured: a guest claim waits for its host mount to exist,
 // be a kubernetes mount and carry kubernetes_host. Not a refusal: the claim
@@ -63,6 +71,7 @@ var RefusalReasons = []string{
 	ReasonMountConflict,
 	ReasonKeyAdoptionRestricted,
 	ReasonMountNotOwned,
+	ReasonForeignReviewer,
 }
 
 // Failure causes, a closed set. Conditions and events carry the cause text,

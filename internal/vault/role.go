@@ -129,6 +129,7 @@ func (c *Client) ReadKubernetesRole(ctx context.Context, mount, name string) (*K
 			Audience                      string      `json:"audience"`
 			TokenType                     string      `json:"token_type"`
 			TokenNoDefaultPolicy          bool        `json:"token_no_default_policy"`
+			AliasNameSource               string      `json:"alias_name_source"`
 		} `json:"data"`
 	}
 	if err := resp.Decode(&raw); err != nil {
@@ -154,5 +155,6 @@ func (c *Client) ReadKubernetesRole(ctx context.Context, mount, name string) (*K
 		Audience:                      raw.Data.Audience,
 		TokenType:                     raw.Data.TokenType,
 		TokenNoDefaultPolicy:          raw.Data.TokenNoDefaultPolicy,
+		AliasNameSource:               raw.Data.AliasNameSource,
 	}, nil
 }

@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -32,13 +33,15 @@ type DriftReport struct {
 	ChangedPolicies []string
 	// ReviewerJWTUnset: auth/{mount}/config has no token_reviewer_jwt.
 	ReviewerJWTUnset bool
-	AccessorChanged  bool
+	// AccessorChanged: sys/auth shows another accessor for the mount than the
+	// claim's templated policies were rendered with.
+	AccessorChanged bool
 }
 
 func (d DriftReport) Found() bool {
 	return d.MountMissing || len(d.MissingPolicies) > 0 || len(d.MissingRoles) > 0 || len(d.ExtraRoles) > 0 ||
 		d.TransitMissing || len(d.MissingKeys) > 0 || len(d.KeyVersionMoved) > 0 ||
-		len(d.ChangedRoles) > 0 || len(d.ChangedPolicies) > 0 || d.ReviewerJWTUnset
+		len(d.ChangedRoles) > 0 || len(d.ChangedPolicies) > 0 || d.ReviewerJWTUnset || d.AccessorChanged
 }
 
 func (d DriftReport) Summary() string {
@@ -60,6 +63,9 @@ func (d DriftReport) Summary() string {
 	}
 	if d.ReviewerJWTUnset {
 		parts = append(parts, "token_reviewer_jwt not set")
+	}
+	if d.AccessorChanged {
+		parts = append(parts, "auth mount accessor changed")
 	}
 	if d.TransitMissing {
 		parts = append(parts, "transit mount missing")
@@ -130,9 +136,16 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 	}
 
-	var recorded string
+	var recorded, recordedAccessor string
 	if claim.Status.Vault != nil {
 		recorded = claim.Status.Vault.AuthMountPath
+		recordedAccessor = claim.Status.Vault.AuthMountAccessor
+	}
+	// An accessor not recorded yet is not a change: the next full pass
+	// records it.
+	if mountExists && recordedAccessor != "" && info.Accessor != recordedAccessor && claimNeedsAccessor(claim) {
+		report.AccessorChanged = true
+		driftDetectedCounter.WithLabelValues(DriftTypeAccessor).Inc()
 	}
 	owned := mountExists && mountAccepted(info, claim, recorded)
 	if err := r.detectRoleDrift(ctx, vc, claim, owned, &report); err != nil {
@@ -143,6 +156,15 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		return report, err
 	}
 
+	if mountExists {
+		accessor := recordedAccessor
+		if accessor == "" {
+			accessor = info.Accessor
+		}
+		if err := r.detectContentDrift(ctx, vc, claim, &report, accessor); err != nil {
+			return report, err
+		}
+	}
 	return report, nil
 }
 
@@ -247,12 +269,14 @@ func (r *VaultClaimReconciler) detectTransitDrift(ctx context.Context, vc VaultC
 	if len(report.MissingKeys) > 0 || len(report.KeyVersionMoved) > 0 {
 		driftDetectedCounter.WithLabelValues(DriftTypeTransitKey).Inc()
 	}
-	return r.detectContentDrift(ctx, vc, claim, report, "")
+	return nil
 }
 
-// detectContentDrift compares live role and policy bodies against spec.
-// Scoped to claims declaring Transit keys; elsewhere the name check stands.
-func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport, _ string) error {
+// detectContentDrift compares live role and policy bodies against spec, for
+// every claim. A templated policy is compared with its body rendered from
+// accessor — the one recorded in status, so that a recreated mount shows as a
+// changed body as well as a changed accessor.
+func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport, accessor string) error {
 	mount := claim.Spec.Auth.MountPath
 
 	for i := range claim.Spec.Roles {
@@ -278,11 +302,11 @@ func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultC
 			}
 			return fmt.Errorf("read policy %q: %w", want.Name, err)
 		}
-		// Templated bodies are resolved at apply time and cannot be compared here.
-		if strings.Contains(want.Rules, templateAccessorVar) {
-			continue
+		body, err := renderClaimPolicy(want, accessor)
+		if err != nil {
+			return fmt.Errorf("render policy %q: %w", want.Name, err)
 		}
-		if normalizeHCL(live) != normalizeHCL(want.Rules) {
+		if normalizeHCL(live) != normalizeHCL(body) {
 			report.ChangedPolicies = append(report.ChangedPolicies, want.Name)
 		}
 	}
@@ -311,16 +335,26 @@ func roleBodyDiff(want vaultv1alpha1.RoleSpec, live *vault.KubernetesRole) strin
 	if !equalStrings(live.TokenPolicies, want.Policies) {
 		parts = append(parts, fmt.Sprintf("token_policies %v != %v", live.TokenPolicies, want.Policies))
 	}
-	if !equalStrings(live.BoundServiceAccountNames, []string{want.BoundServiceAccounts.Name}) {
-		parts = append(parts, fmt.Sprintf("bound SA names %v != [%s]", live.BoundServiceAccountNames, want.BoundServiceAccounts.Name))
+	wantNames := want.BoundServiceAccounts.ServiceAccountNames()
+	if liveNames := sortedCopy(live.BoundServiceAccountNames); !equalStrings(liveNames, wantNames) {
+		parts = append(parts, fmt.Sprintf("bound SA names %v != %v", liveNames, wantNames))
 	}
 	if !equalStrings(live.BoundServiceAccountNamespaces, []string{want.BoundServiceAccounts.Namespace}) {
 		parts = append(parts, fmt.Sprintf("bound SA namespaces %v != [%s]", live.BoundServiceAccountNamespaces, want.BoundServiceAccounts.Namespace))
+	}
+	if want.AliasNameSource != "" && live.AliasNameSource != want.AliasNameSource {
+		parts = append(parts, fmt.Sprintf("alias_name_source %q != %q", live.AliasNameSource, want.AliasNameSource))
 	}
 	if want.TokenExplicitMaxTTL != nil && live.TokenExplicitMaxTTLSecs != int(want.TokenExplicitMaxTTL.Seconds()) {
 		parts = append(parts, fmt.Sprintf("token_explicit_max_ttl %ds != %ds", live.TokenExplicitMaxTTLSecs, int(want.TokenExplicitMaxTTL.Seconds())))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	slices.Sort(out)
+	return out
 }
 
 func equalStrings(a, b []string) bool {

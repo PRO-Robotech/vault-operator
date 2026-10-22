@@ -20,7 +20,7 @@ kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json
 ```bash
 kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json \
   | jq '[.items[] | select(any(.status.conditions[]?; .reason as $r
-        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned"]
+        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned","ForeignReviewer"]
         | index($r)))] | length'
 ```
 
