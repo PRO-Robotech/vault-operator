@@ -14,7 +14,8 @@ You may obtain a copy of the License at
 // enforce is switched on only after this census reports zero on every cluster.
 //
 // Exit codes: 0 — no violations; 1 — violations found; 2 — input unreadable or
-// empty (a census of nothing is not a pass).
+// empty (a census of nothing is not a pass), or the report was not written (a
+// zero nobody could read is not a pass).
 package main
 
 import (
@@ -38,15 +39,26 @@ func run(args []string, in io.Reader, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("policyguard-census", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	kvMount := fs.String("kv-mount", "secret", "VaultConfig.spec.storage.kvMountPath the claims share")
-	accessor := fs.String("accessor", "auth_kubernetes_00000000", "auth mount accessor templated policies and identity paths are rendered with")
+	accessor := fs.String("accessor", "auth_kubernetes_00000000",
+		"auth mount accessor templated policies and identity paths are rendered with")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
 	var list vaultv1alpha1.VaultClaimList
 	if err := json.NewDecoder(in).Decode(&list); err != nil {
-		fmt.Fprintf(errOut, "decode VaultClaim list: %v\n", err)
+		// errOut is the last channel there is: a failed write to it has no
+		// reader to be reported to, and the exit code already says 2.
+		_, _ = fmt.Fprintf(errOut, "decode VaultClaim list: %v\n", err)
 		return 2
+	}
+	// The report is the census's evidence: its first write failure is kept,
+	// later lines are not attempted, and the exit code is 2, never a pass.
+	var reportErr error
+	report := func(format string, a ...any) {
+		if reportErr == nil {
+			_, reportErr = fmt.Fprintf(out, format, a...)
+		}
 	}
 	claims, policies, violations := 0, 0, 0
 	for i := range list.Items {
@@ -68,17 +80,20 @@ func run(args []string, in io.Reader, out, errOut io.Writer) int {
 			rendered, err := controller.RenderClaimPolicy(p, *accessor)
 			if err != nil {
 				violations++
-				fmt.Fprintf(out, "%s/%s policy %q: does not render: %v\n", c.Namespace, c.Name, p.Name, err)
+				report("%s/%s policy %q: does not render: %v\n", c.Namespace, c.Name, p.Name, err)
 				continue
 			}
 			for _, v := range policyguard.Check(rendered, scope) {
 				violations++
-				fmt.Fprintf(out, "%s/%s policy %q: %s\n", c.Namespace, c.Name, p.Name, v)
+				report("%s/%s policy %q: %s\n", c.Namespace, c.Name, p.Name, v)
 			}
 		}
 	}
-	fmt.Fprintf(out, "census: claims=%d policies=%d violations=%d\n", claims, policies, violations)
+	report("census: claims=%d policies=%d violations=%d\n", claims, policies, violations)
 	switch {
+	case reportErr != nil:
+		_, _ = fmt.Fprintf(errOut, "write census report: %v\n", reportErr)
+		return 2
 	case claims == 0:
 		return 2
 	case violations > 0:
