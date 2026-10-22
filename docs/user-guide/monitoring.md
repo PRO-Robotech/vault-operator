@@ -48,6 +48,8 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 | `vault_api_responses_total` | HTTP-ответы Vault | `verb`, `path`, `code` |
 | `vault_api_calls_total` | Вызовы оператора в Vault | `verb`, `path`, `result` |
 | `vault_client_token_renewal_total` | Лайфцикл client_token оператора | `result` |
+| `vault_operator_s3bucketclaim_owner_unverified_total` | bucket-operator: cloud-manager вернул записанный бакет без логина владельца. Удаление такого бакета блокируется (`DeletionBlocked`), поэтому ненулевой рост — повод разобраться до удаления кластеров | — |
+| `vault_operator_cloudmanager_remove_unknown_response_total` | bucket-operator: `removeBucket` ответил текстом вне словаря (`Not found`, `Already removed`) — удаление считается неудавшимся (`DeletionStuck`) | — |
 | `controller_runtime_*` | Стандартные controller-runtime | `controller`, `result` |
 
 Path-label в `vault_api_*` нормализован через bucketing — `auth_login`, `auth_role`, `sys_mounts`, `sys_policies_acl`, и т.д. — чтобы cardinality оставалась bounded.

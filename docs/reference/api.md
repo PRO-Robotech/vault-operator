@@ -2,10 +2,11 @@
 
 API group: `vault.in-cloud.io/v1alpha1`
 
-Три CRD:
+Четыре CRD:
 
 - [`VaultClaim`](#vaultclaim) — namespaced, per-cluster конфигурация **доступа**
 - [`VaultSecretClaim`](#vaultsecretclaim) — namespaced, per-cluster наполнение Vault **значениями**
+- [`S3BucketClaim`](#s3bucketclaim) — namespaced, per-cluster S3-бакет и его ключи в Vault
 - [`VaultConfig`](#vaultconfig) — cluster-scoped, подключение к Vault
 
 ---
@@ -110,7 +111,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `secretList[].destination.path` | `string` | Да | Путь относительно `secretsPrefix`. |
 | `secretList[].destination.key` | `string` | Да | Ключ в secret'е. |
 | `secretList[].destination.hashedKey` | `string` | Нет | Куда класть хеш (при `generate.hash != none`). |
-| `secretList[].generate.length` | `int` | Нет (default `24`, min `8`) | Длина пароля (при `type=generate`). |
+| `secretList[].generate.length` | `int` | Нет (default `24`, min `8`) | Длина пароля (при `type=generate`). Новое значение генерируется только при энтропии `length × log2(число различных символов алфавита)` ≥ 64 бит (для алфавита по умолчанию — от 11 символов); существующее значение ради этого не перегенерируется. |
 | `secretList[].generate.charset` | `string` | Нет (default `[A-Za-z0-9]`) | Алфавит с range-сокращением `X-Y` (`a-zA-Z0-9`). |
 | `secretList[].generate.hash` | `enum` | Нет (default `none`) | `none` или `bcrypt`. |
 | `secretList[].source.path` | `string` | Да* | Путь источника (* при `type=copy`). |
@@ -128,7 +129,9 @@ CEL: `type=generate` требует `generate` и запрещает `source` (�
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `items[].name` | `string` | Идентификатор элемента. |
 | `items[].state` | `enum` | `Applied`, `Pending`, `Failed`. |
-| `items[].sourceHash` | `string` | Хеш входа для детекта изменений (само **значение** секрета НЕ хранится). |
+| `items[].sourceHash` | `string` | Для `generate` — хеш критериев генерации (`length`/`charset`/`hash`). Для `copy` не заполняется: значение назначения сверяется с источником напрямую, хеш значения в status не хранится. |
+| `items[].destination` | `object` | Журнал: куда элемент записал (`mount`, `path` относительно `secretsPrefix`, `key`, `hashedKey`). Ключ элемента, убранного из spec или сменившего назначение, снимается из Vault, если тот же `(mount, path, key)` не пишет другая заявка. Первый проход заявки, записанной прежним выпуском, только заполняет журнал. |
+| `orphans[]` | `[]object` | Ключи убранных элементов, снять которые пока не удалось (повтор на следующем проходе). |
 | `items[].lastAppliedAt` | `time` | Последняя запись в Vault. |
 | `items[].message` | `string` | Текст ошибки при `Failed`. |
 
@@ -144,11 +147,60 @@ CEL: `type=generate` требует `generate` и запрещает `source` (�
 
 ### Финализатор
 
-`vault.in-cloud.io/vaultsecretclaim-finalizer`. При `Purge` сначала удаляет записанные ключи из Vault, затем снимает finalizer.
+`vault.in-cloud.io/vaultsecretclaim-finalizer`. При `Purge` сначала удаляет из Vault ключи по журналу (`items[].destination`, `orphans[]`; для элементов без журнала — по spec), кроме ключей, которые пишет другая заявка, затем снимает finalizer. Соседние ключи листа остаются; опустевший лист удаляется.
 
 ### Примеры
 
 См. [examples/vaultsecretclaim](../examples/vaultsecretclaim/).
+
+---
+
+## S3BucketClaim
+
+| Поле | Scope | Описание |
+|---|---|---|
+| Kind | Namespaced | `vault.in-cloud.io/v1alpha1` |
+| Short name | `s3bc` | `kubectl get s3bc` |
+| Subresources | `status` | |
+| Print columns | Phase, Bucket, Cluster, Age | |
+| Контроллер | `bucket-operator` | отдельный процесс/SA/роль; ходит в cloud-manager и пишет один лист KV |
+
+### spec
+
+| Поле | Тип | Обязательно | Описание |
+|---|---|:---:|---|
+| `vaultConfigRef.name` | `string` | Да | VaultConfig с ролью bucket-operator. Мутируемо. |
+| `clusterRef.name` | `string` | Да | Имя кластера. **Immutable.** |
+| `customerLogin` | `string` | Да | Логин, под которым создаётся бакет. **Immutable.** |
+| `region` | `string` | Нет | Регион; endpoint `s3.<region>.storage.beget.cloud`, пустой — `ru1`. |
+| `bucket.name` | `string` | Нет | Принять существующий бакет по полному имени сервера вместо создания (`bucketOwnership=Adopted`). **Immutable**: нельзя задать после создания, сменить или убрать. |
+| `bucket.purgeAdopted` | `bool` | Нет | Разрешает `Purge` удалить принятый (`Adopted`) бакет. |
+| `bucket.public` | `bool` | Нет (default `false`) | |
+| `bucket.managedBy` | `enum` | Нет (default `SYSTEM`) | `SYSTEM` или `CUSTOMER`. |
+| `bucket.configurationId` | `string` | Нет | Запись каталога S3-конфигураций cloud-manager; пустая — флаг `--default-s3-configuration-id`. |
+| `vault.secretsPrefix` | `string` | Да | == `VaultClaim.secretsPrefix`. **Immutable.** |
+| `vault.destinationPath` | `string` | Нет (default `backup/s3`) | Лист относительно `secretsPrefix`: без ведущего `/`, без `..`, ≤ 256. Смена переносит ключи заявки на новый лист. |
+| `deletionPolicy` | `enum` | Нет (default `Purge`) | `Purge` — удалить свой бакет и свои ключи; `Retain` — оставить. |
+
+### status
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `phase` | `enum` | `Pending`, `Ready`, `Failed`, `Deleting`. |
+| `bucketName` | `string` | Имя бакета на сервере — источник правды; удаление адресует бакет только по нему. |
+| `bucketOwnership` | `enum` | `Created` (создан этой заявкой) или `Adopted` (существовал до неё). У заявок прежнего выпуска выводится из reason `BucketProvisioned`. |
+| `pendingCreate` | `object` | `requestedName`, `since`: создание в полёте; ставится до вызова `create`, снимается при записи `bucketName`. |
+| `writtenPath` | `string` | `destinationPath`, куда ключи записаны последними. |
+| `bucketStatus` | `string` | Статус бакета в cloud-manager. |
+| `endpoint` | `string` | S3 endpoint без схемы. |
+| `keysWrittenHash` | `string` | Устарело: не пишется и стирается. |
+| `conditions[]` | `[]Condition` | `ConfigResolved`, `VaultReachable`, `BucketProvisioned`, `BucketRunning`, `KeysWritten`, `Ready`. |
+
+Reason отказов: `Conflict` (более старая заявка уже держит тот же логин+кластер, лист KV или бакет), `ForeignBucket`, `AmbiguousBucket`, `BucketNotFound`, `ConfigurationMissing`, `InvalidBucketName` — ошибки spec, повтор через 30m; `BadStatus`, `NoKeys`, `BucketMissing` — ошибки состояния, повтор 1m…30m; при удалении — `DeletionBlocked`, `DeletionStuck`, `BucketRemoving`.
+
+### Финализатор
+
+`vault.in-cloud.io/s3bucketclaim-finalizer`. При `Purge` — см. [S3BUCKETCLAIM-SPEC §5](../S3BUCKETCLAIM-SPEC.md): бакет удаляется, только если он доказуемо свой; после `REMOVED` снимаются только свои ключи листа.
 
 ---
 
