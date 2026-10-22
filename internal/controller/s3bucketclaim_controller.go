@@ -68,6 +68,8 @@ const (
 
 const defaultS3DestinationPath = "backup/s3"
 
+const bucketCreateNameMismatch = "CreateNameMismatch"
+
 // S3BucketClaimReconciler provisions a per-cluster S3 bucket and writes its
 // credentials into Vault.
 type S3BucketClaimReconciler struct {
@@ -237,6 +239,9 @@ func (r *S3BucketClaimReconciler) resolveAndLogin(ctx context.Context, claim *va
 // then a create is issued, with pendingCreate persisted before the call and
 // the name persisted right after it.
 func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, others []vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
+	if c := apimeta.FindStatusCondition(claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned); c != nil && c.Reason == bucketCreateNameMismatch {
+		return r.rejectCreatedName(claim)
+	}
 	if claim.Status.BucketName != "" {
 		return ctrl.Result{}, true
 	}
@@ -408,6 +413,9 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 	})
 	switch {
 	case err == nil && realName != "":
+		if !createdNameMatches(realName, claim.Status.PendingCreate) {
+			return r.rejectCreatedName(claim)
+		}
 		claim.Status.BucketName = realName
 		claim.Status.BucketOwnership = vaultv1alpha1.BucketOwnershipCreated
 		claim.Status.PendingCreate = nil
@@ -474,6 +482,26 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 	}
+}
+
+// createdNameMatches сверяет ответ с решением, записанным перед Create.
+// Имя из снимка не принадлежит этому созданию; суффикс допустим лишь при занятой базе.
+func createdNameMatches(name string, pending *vaultv1alpha1.PendingBucketCreate) bool {
+	if pending == nil || slices.Contains(pending.ExistingNames, name) {
+		return false
+	}
+	baseTaken := slices.ContainsFunc(pending.ExistingNames, func(existing string) bool {
+		return cloudmanager.MatchesRequestedName(existing, pending.RequestedName, false)
+	})
+	return cloudmanager.MatchesRequestedName(name, pending.RequestedName, baseTaken)
+}
+
+// rejectCreatedName оставляет маркер и устойчивый отказ вместо повторных созданий.
+// Неподтверждённое имя не записывается и никогда не становится целью Purge.
+func (r *S3BucketClaimReconciler) rejectCreatedName(claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
+	r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, bucketCreateNameMismatch,
+		"cloud-manager returned an unexpected bucket name; inspect provisioning and recreate the claim")
+	return ctrl.Result{}, false
 }
 
 // fetchCreds looks the recorded bucket up by its exact name and validates its

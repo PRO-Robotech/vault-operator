@@ -125,7 +125,8 @@ func main() {
 		Burst:         cmBurst,
 	}
 	if err := cmOpts.CheckReconcileTimeout(run.ReconcileTimeout); err != nil {
-		setupLog.Error(err, "refusing to start: raise --reconcile-timeout or lower --cloud-manager-create-timeout and --cloud-manager-timeout")
+		setupLog.Error(err, "refusing to start: raise --reconcile-timeout or lower "+
+			"--cloud-manager-create-timeout and --cloud-manager-timeout")
 		os.Exit(1)
 	}
 

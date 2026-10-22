@@ -400,6 +400,12 @@ func (c *Client) NamesByRequested(ctx context.Context, custLogin, requestedName 
 	return out, nil
 }
 
+// MatchesRequestedName проверяет полное серверное имя; allowSuffix разрешает
+// только добавленный числовой суффикс, без изменения самого requestedName.
+func MatchesRequestedName(name, requestedName string, allowSuffix bool) bool {
+	return requestedNameRe(requestedName, allowSuffix).MatchString(name)
+}
+
 // requestedNameRe matches the server-assigned names for a requested name: the
 // server prepends "<hex>-" and, on a taken name, appends "-<N>".
 func requestedNameRe(requestedName string, allowSuffix bool) *regexp.Regexp {

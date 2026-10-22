@@ -424,7 +424,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
 			// Детерминированное несовпадение имени не создаёт новую сироту,
 			// даже когда срок незавершённого создания давно истёк.
-			recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+			recon = &S3BucketClaimReconciler{
+				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
+				VaultFactory: recon.VaultFactory, Buckets: recon.Buckets,
+				Now: func() time.Time { return time.Now().Add(24 * time.Hour) },
+			}
 			reconcileN("s3number-11", 3)
 			Expect(srv.Creates).To(Equal(1))
 			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))

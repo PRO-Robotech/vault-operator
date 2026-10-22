@@ -93,8 +93,8 @@ spec:
                 type: object
               clusterRef:
                 description: |-
-                  SecretClusterRef references the cluster by name. No kubeconfig is needed —
-                  VaultSecretClaim only talks to Vault.
+                  ClusterRef — неизменяемая метка кластера для имени и уникальности заявки.
+                  Оператор не читает объект кластера по этой ссылке.
                 properties:
                   name:
                     minLength: 1
