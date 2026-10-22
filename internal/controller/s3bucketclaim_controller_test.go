@@ -412,6 +412,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(got.Status.BucketName).To(BeEmpty())
 			Expect(got.Status.PendingCreate).NotTo(BeNil())
 			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
+			// A deterministic name mismatch must not make another orphan
+			// when the in-flight deadline has long expired.
+			recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+			reconcileN("s3number-11", 3)
+			Expect(srv.Creates).To(Equal(1))
 			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))
 		})
 
