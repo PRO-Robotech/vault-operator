@@ -1,0 +1,12 @@
+diff --git a/config/crd/bases/vault.in-cloud.io_vaultclaims.yaml b/config/crd/bases/vault.in-cloud.io_vaultclaims.yaml
+index ef0cc44..90d4531 100644
+--- a/config/crd/bases/vault.in-cloud.io_vaultclaims.yaml
++++ b/config/crd/bases/vault.in-cloud.io_vaultclaims.yaml
+@@ -233,7 +233,6 @@ spec:
+                         ServiceAccount. A Vault template written directly must be escaped:
+                         {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+                         16384 bytes (MaxRulesLength).
+-                      maxLength: 16384
+                       minLength: 1
+                       type: string
+                   required:

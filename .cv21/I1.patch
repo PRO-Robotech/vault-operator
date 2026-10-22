@@ -1,0 +1,14 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..e1b4e7f 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -320,9 +320,6 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
+ 		if inspectTemplate(t).bareIdentity {
+ 			return "", errBareIdentity
+ 		}
+-		if err := admitTemplate(t); err != nil {
+-			return "", err
+-		}
+ 		out := &boundedBuffer{max: maxRenderedPolicy}
+ 		if err := t.Execute(out, map[string]string{"AuthMountAccessor": accessor}); err != nil {
+ 			return "", err

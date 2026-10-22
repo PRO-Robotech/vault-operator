@@ -1,0 +1,13 @@
+diff --git a/internal/controller/render_refusal.go b/internal/controller/render_refusal.go
+index 25eced0..637fc50 100644
+--- a/internal/controller/render_refusal.go
++++ b/internal/controller/render_refusal.go
+@@ -68,7 +68,7 @@ func (m *renderRefusals) pending(key types.NamespacedName, claim *vaultv1alpha1.
+ 	if !ok {
+ 		return 0, false
+ 	}
+-	if e.generation != claim.Generation {
++	if false && e.generation != claim.Generation {
+ 		delete(m.entries, key)
+ 		return 0, false
+ 	}

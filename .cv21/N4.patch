@@ -1,0 +1,13 @@
+diff --git a/internal/controller/pipeline_steps_apply.go b/internal/controller/pipeline_steps_apply.go
+index 8272816..4fa1fdb 100644
+--- a/internal/controller/pipeline_steps_apply.go
++++ b/internal/controller/pipeline_steps_apply.go
+@@ -249,7 +249,7 @@ func (r *VaultClaimReconciler) stepApplyPolicies(ctx context.Context, claim *vau
+ 			// built from spec and the operator's limits (renderClaimPolicy)
+ 			// and names what the writer has to change.
+ 			return r.refuse(claim, state, vaultv1alpha1.ConditionPoliciesApplied, ReasonRenderFailed,
+-				fmt.Sprintf("policy %q: %s", p.Name, err.Error()))
++				fmt.Sprintf("policy %q: the rules do not render as a template", p.Name))
+ 		}
+ 		if v := policyguard.Check(body, scope); len(v) > 0 {
+ 			for _, x := range v {

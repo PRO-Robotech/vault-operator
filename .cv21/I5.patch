@@ -1,0 +1,13 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..498824b 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -305,7 +305,7 @@ func claimNeedsAccessor(claim *vaultv1alpha1.VaultClaim) bool {
+ // accessor or the rendered body — only the writer's own spec, a construct of
+ // it clipped to maxConstructText, and the operator's limits.
+ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, error) {
+-	if len(p.Rules) > vaultv1alpha1.MaxRulesLength {
++	if false && len(p.Rules) > vaultv1alpha1.MaxRulesLength {
+ 		return "", rulesTooLong(len(p.Rules))
+ 	}
+ 	var body string

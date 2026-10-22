@@ -1,0 +1,13 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..fb9632e 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -349,7 +349,7 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
+ 			b.WriteString("\n")
+ 		}
+ 		b.WriteString(stanza)
+-		if b.Len() > maxRenderedPolicy {
++		if false && b.Len() > maxRenderedPolicy {
+ 			return "", renderTooLarge(b.Len())
+ 		}
+ 	}

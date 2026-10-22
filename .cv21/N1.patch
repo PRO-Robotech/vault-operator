@@ -1,0 +1,13 @@
+diff --git a/internal/controller/vaultclaim_controller.go b/internal/controller/vaultclaim_controller.go
+index ab75772..15452f1 100644
+--- a/internal/controller/vaultclaim_controller.go
++++ b/internal/controller/vaultclaim_controller.go
+@@ -113,7 +113,7 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request)
+ 
+ 	// Rules this generation was refused for do not render on a second pass:
+ 	// the claim waits for an edit of spec or for the recheck to come due.
+-	if wait, ok := r.renderRefusals.pending(req.NamespacedName, claim, r.now()); ok {
++	if wait, ok := r.renderRefusals.pending(req.NamespacedName, claim, r.now()); false && ok {
+ 		logger.V(1).Info("rules of this generation do not render; pass skipped until the recheck", "requeueAfter", wait.String())
+ 		return ctrl.Result{RequeueAfter: wait}, nil
+ 	}

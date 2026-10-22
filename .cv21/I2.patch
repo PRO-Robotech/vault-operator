@@ -1,0 +1,13 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..cb98cf8 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -215,7 +215,7 @@ func admitNode(tree *parse.Tree, n parse.Node) error {
+ 			return refuse("the operand " + a.String())
+ 		}
+ 	case *parse.RangeNode:
+-		return refuse("range")
++		return nil
+ 	case *parse.IfNode:
+ 		return refuse("if")
+ 	case *parse.WithNode:

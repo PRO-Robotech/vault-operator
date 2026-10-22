@@ -1,0 +1,14 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..d4bf9cd 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -233,6 +233,9 @@ func admitNode(tree *parse.Tree, n parse.Node) error {
+ const maxConstructText = 64
+ 
+ func clipConstruct(s string) string {
++	if s != "" {
++		return s
++	}
+ 	if len(s) <= maxConstructText {
+ 		return s
+ 	}

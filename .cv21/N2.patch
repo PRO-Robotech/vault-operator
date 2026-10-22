@@ -1,0 +1,13 @@
+diff --git a/internal/controller/pipeline.go b/internal/controller/pipeline.go
+index eb1288d..11156b4 100644
+--- a/internal/controller/pipeline.go
++++ b/internal/controller/pipeline.go
+@@ -195,7 +195,7 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
+ 			setPhase(claim, vaultv1alpha1.PhaseFailed)
+ 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation,
+ 				state.RefusedReason, fmt.Sprintf("step %s refused the claim; see its condition", s.name))
+-			if state.RefusedReason == ReasonRenderFailed {
++			if false && state.RefusedReason == ReasonRenderFailed {
+ 				r.renderRefusals.record(key, claim.Generation, r.now())
+ 				return ctrl.Result{RequeueAfter: RequeueClaimRenderRefused}, false
+ 			}

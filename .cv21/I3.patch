@@ -1,0 +1,13 @@
+diff --git a/internal/controller/policy_render.go b/internal/controller/policy_render.go
+index 3d4f8bb..dcf0e52 100644
+--- a/internal/controller/policy_render.go
++++ b/internal/controller/policy_render.go
+@@ -262,7 +262,7 @@ type boundedBuffer struct {
+ }
+ 
+ func (b *boundedBuffer) Write(p []byte) (int, error) {
+-	if n := b.buf.Len() + len(p); n > b.max {
++	if n := b.buf.Len() + len(p); false && n > b.max {
+ 		return 0, renderTooLarge(n)
+ 	}
+ 	return b.buf.Write(p)

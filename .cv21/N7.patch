@@ -1,0 +1,13 @@
+diff --git a/internal/controller/render_refusal.go b/internal/controller/render_refusal.go
+index 25eced0..5e64677 100644
+--- a/internal/controller/render_refusal.go
++++ b/internal/controller/render_refusal.go
+@@ -73,7 +73,7 @@ func (m *renderRefusals) pending(key types.NamespacedName, claim *vaultv1alpha1.
+ 		return 0, false
+ 	}
+ 	left := RequeueClaimRenderRefused - now.Sub(e.at)
+-	if left <= 0 || !renderRefusalPersisted(claim) {
++	if !renderRefusalPersisted(claim) {
+ 		return 0, false
+ 	}
+ 	return min(left, RequeueClaimRenderRefused), true

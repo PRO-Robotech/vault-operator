@@ -1,0 +1,14 @@
+diff --git a/internal/controller/render_refusal.go b/internal/controller/render_refusal.go
+index 25eced0..5a3b0b3 100644
+--- a/internal/controller/render_refusal.go
++++ b/internal/controller/render_refusal.go
+@@ -80,6 +80,9 @@ func (m *renderRefusals) pending(key types.NamespacedName, claim *vaultv1alpha1.
+ }
+ 
+ func renderRefusalPersisted(claim *vaultv1alpha1.VaultClaim) bool {
++	if claim != nil {
++		return true
++	}
+ 	if claim.Status.Phase != vaultv1alpha1.PhaseFailed {
+ 		return false
+ 	}
