@@ -58,7 +58,7 @@ func main() {
 	var pprofAddr string
 	var cloudManagerAddr string
 	var defaultS3ConfigurationID string
-	var cmTimeout, cmKeepalive time.Duration
+	var cmTimeout, cmCreateTimeout, cmKeepalive time.Duration
 	var cmFindByBucket bool
 	var cmFindRetries int
 	var concurrentReconciles int
@@ -88,7 +88,12 @@ func main() {
 	flag.StringVar(&defaultS3ConfigurationID, "default-s3-configuration-id", "s3_v1",
 		"cloud-manager S3 configuration id used when spec.bucket.configurationId is empty.")
 	flag.DurationVar(&cmTimeout, "cloud-manager-timeout", 15*time.Second,
-		"Deadline of every cloud-manager call.")
+		"Deadline of a cloud-manager findAll or removeBucket call.")
+	flag.DurationVar(&cmCreateTimeout, "cloud-manager-create-timeout", cloudmanager.DefaultOptions().CreateTimeout,
+		"Deadline of a cloud-manager create. Kept above the server's create latency: a create cut by the "+
+			"client still runs on the server, and a repeat of the same name may meet its half-made state. "+
+			"A create in flight is repeated no earlier than this plus 1m after its decision; with "+
+			"two findAll calls it must fit --reconcile-timeout, or the process refuses to start.")
 	flag.DurationVar(&cmKeepalive, "cloud-manager-keepalive", 0,
 		"gRPC keepalive ping interval while a cloud-manager call is active; 0 disables pings.")
 	flag.BoolVar(&cmFindByBucket, "cloud-manager-find-by-bucket", true,
@@ -109,6 +114,21 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	cmOpts := cloudmanager.Options{
+		CallTimeout:   cmTimeout,
+		CreateTimeout: cmCreateTimeout,
+		Keepalive:     cmKeepalive,
+		FindByBucket:  cmFindByBucket,
+		FindRetries:   cmFindRetries,
+		QPS:           cmQPS,
+		Burst:         cmBurst,
+	}
+	if err := cmOpts.CheckReconcileTimeout(run.ReconcileTimeout); err != nil {
+		setupLog.Error(err, "refusing to start: raise --reconcile-timeout or lower "+
+			"--cloud-manager-create-timeout and --cloud-manager-timeout")
+		os.Exit(1)
+	}
 
 	// Disable HTTP/2 by default to avoid the Stream Cancellation and Rapid
 	// Reset CVEs (GHSA-qppj-fm5r-hxr3, GHSA-4374-p667-p6c8).
@@ -158,14 +178,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	buckets, err := cloudmanager.NewWithOptions(cloudManagerAddr, cloudmanager.Options{
-		CallTimeout:  cmTimeout,
-		Keepalive:    cmKeepalive,
-		FindByBucket: cmFindByBucket,
-		FindRetries:  cmFindRetries,
-		QPS:          cmQPS,
-		Burst:        cmBurst,
-	})
+	buckets, err := cloudmanager.NewWithOptions(cloudManagerAddr, cmOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to create cloud-manager client", "addr", cloudManagerAddr)
 		os.Exit(1)
@@ -185,6 +198,7 @@ func main() {
 		Buckets:                 buckets,
 		DefaultConfigurationID:  defaultS3ConfigurationID,
 		MaxConcurrentReconciles: concurrentReconciles,
+		CreateTimeout:           cmOpts.CreateDeadline(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "S3BucketClaim")
 		os.Exit(1)

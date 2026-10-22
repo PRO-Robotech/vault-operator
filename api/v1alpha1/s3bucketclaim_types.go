@@ -89,6 +89,8 @@ type S3BucketClaimSpec struct {
 	// +required
 	VaultConfigRef VaultConfigRef `json:"vaultConfigRef"`
 
+	// ClusterRef — неизменяемая метка кластера для имени и уникальности заявки.
+	// Оператор не читает объект кластера по этой ссылке.
 	// +required
 	ClusterRef SecretClusterRef `json:"clusterRef"`
 

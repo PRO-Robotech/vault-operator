@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -73,6 +74,22 @@ type Server struct {
 	LoseCreateResponses int
 	// RemoveMessage, when set, answers removeBucket with this text.
 	RemoveMessage string
+	// CreateDelay holds every create that long before it answers, as a slow
+	// server does; the caller's deadline still cuts it.
+	CreateDelay time.Duration
+	// OnCreate, when set, runs inside every create before it answers (a test
+	// moves its clock there: the call took that long).
+	OnCreate func()
+	// CreateOutlivesCaller makes a create go on after its caller has gone, as
+	// cloud-manager does: past OnCreate it waits for the caller's context to
+	// end (a cancel, a deadline) and only then commits the bucket; the answer
+	// reaches no one.
+	CreateOutlivesCaller bool
+	// HideNewFindAlls hides a bucket a create makes from that many following
+	// findAll calls: the row is committed, the listing does not show it yet.
+	HideNewFindAlls int
+	// hidden counts the findAll calls left before a new bucket is listed.
+	hidden map[string]int
 
 	Creates  int
 	FindAlls int
@@ -83,7 +100,7 @@ type Server struct {
 
 // New returns an empty fake that completes a removal after one observation.
 func New() *Server {
-	return &Server{removing: map[string]int{}, RemovalPolls: 1}
+	return &Server{removing: map[string]int{}, hidden: map[string]int{}, RemovalPolls: 1}
 }
 
 // Prefix is the per-customer prefix the fake prepends to requested names.
@@ -173,10 +190,24 @@ func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateR
 	if len(s.CreateErrs) > 0 {
 		injected, s.CreateErrs = s.CreateErrs[0], s.CreateErrs[1:]
 	}
+	delay, onCreate, outlive := s.CreateDelay, s.OnCreate, s.CreateOutlivesCaller
 	s.mu.Unlock()
 	if hang {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	if onCreate != nil {
+		onCreate()
+	}
+	if outlive {
+		<-ctx.Done()
 	}
 	if injected != nil {
 		return nil, injected
@@ -200,6 +231,9 @@ func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateR
 		ManagedBy: params.GetManagedBy(),
 		Public:    params.GetPublic(),
 	})
+	if s.HideNewFindAlls > 0 {
+		s.hidden[name] = s.HideNewFindAlls
+	}
 	if s.LoseCreateResponses > 0 {
 		s.LoseCreateResponses--
 		return nil, status.Error(codes.Unavailable, "cmfake: create response lost")
@@ -231,9 +265,19 @@ func (s *Server) FindAll(ctx context.Context, req *pb.FindAllRequest) (*pb.FindA
 	defer s.mu.Unlock()
 	resp := &pb.FindAllResponse{}
 	for _, b := range s.buckets {
+		if s.hidden[b.GetName()] > 0 {
+			continue
+		}
 		if s.matches(b, req.GetScope()) {
 			resp.Bucket = append(resp.Bucket, cloneBucket(b))
 		}
+	}
+	for name, left := range s.hidden {
+		if left <= 1 {
+			delete(s.hidden, name)
+			continue
+		}
+		s.hidden[name] = left - 1
 	}
 	// Asynchronous completion: each findAll is one observation of REMOVING.
 	for name, left := range s.removing {
