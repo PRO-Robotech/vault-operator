@@ -64,7 +64,20 @@ type ClusterRef struct {
 	KubeconfigSecret string `json:"kubeconfigSecret,omitempty"`
 }
 
+// RolePruning values select which roles on the auth mount a claim may delete.
+const (
+	// RolePruningExclusive deletes every role on the mount that spec.roles does
+	// not declare. It applies only while the claim provably owns the mount;
+	// otherwise the claim behaves as Owned.
+	RolePruningExclusive = "Exclusive"
+	// RolePruningOwned deletes only roles the claim itself recorded as written.
+	RolePruningOwned = "Owned"
+)
+
 // AuthSpec configures the per-cluster Vault Kubernetes Auth Method.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.manageConfig) || self.manageConfig || (has(self.autoCreate) && !self.autoCreate && has(self.rolePruning) && self.rolePruning == 'Owned')",message="spec.auth.manageConfig=false requires autoCreate=false and rolePruning=Owned"
+// +kubebuilder:validation:XValidation:rule="(has(self.manageConfig) && !self.manageConfig) || has(self.tokenReviewer)",message="spec.auth.tokenReviewer is required unless spec.auth.manageConfig=false"
 type AuthSpec struct {
 	// MountPath of the per-cluster auth method (convention:
 	// "kubernetes-{metadata.name}"). Immutable.
@@ -72,9 +85,27 @@ type AuthSpec struct {
 	MountPath string `json:"mountPath"`
 
 	// AutoCreate enables the operator to POST sys/auth; when false only
-	// auth/{path}/config is written, assuming the mount already exists.
+	// auth/{path}/config is written, assuming the mount already exists and
+	// carries this claim's description.
 	// +kubebuilder:default=true
-	AutoCreate bool `json:"autoCreate,omitempty"`
+	// +optional
+	AutoCreate *bool `json:"autoCreate,omitempty"`
+
+	// ManageConfig makes the claim the owner of the mount: it writes
+	// auth/{path}/config, rotates the reviewer JWT and manages the reviewer SA.
+	// False makes the claim a guest that only adds its own roles and policies
+	// to a mount configured by someone else (an operator mount from a
+	// VaultConfig or an allow-listed one). Immutable.
+	// +kubebuilder:default=true
+	// +optional
+	ManageConfig *bool `json:"manageConfig,omitempty"`
+
+	// RolePruning selects which roles on the mount the claim deletes when they
+	// leave spec.roles. Empty means Exclusive for an owner claim and Owned for
+	// a guest. Exclusive applies only while the claim provably owns the mount.
+	// +kubebuilder:validation:Enum=Exclusive;Owned
+	// +optional
+	RolePruning string `json:"rolePruning,omitempty"`
 
 	// Issuer is the OIDC issuer URL of the infra cluster; empty triggers
 	// auto-discovery via /.well-known/openid-configuration.
@@ -82,8 +113,27 @@ type AuthSpec struct {
 	Issuer string `json:"issuer,omitempty"`
 
 	// TokenReviewer identifies the SA whose JWT Vault uses for TokenReview.
-	// +required
-	TokenReviewer TokenReviewerSpec `json:"tokenReviewer"`
+	// Required unless manageConfig is false.
+	// +optional
+	TokenReviewer TokenReviewerSpec `json:"tokenReviewer,omitzero"`
+}
+
+// AutoCreateEnabled reports spec.auth.autoCreate with its CRD default applied.
+func (a AuthSpec) AutoCreateEnabled() bool { return a.AutoCreate == nil || *a.AutoCreate }
+
+// ManagesConfig reports spec.auth.manageConfig with its CRD default applied.
+func (a AuthSpec) ManagesConfig() bool { return a.ManageConfig == nil || *a.ManageConfig }
+
+// RolePruningMode resolves an empty rolePruning: Exclusive for an owner
+// claim, Owned for a guest.
+func (a AuthSpec) RolePruningMode() string {
+	if a.RolePruning != "" {
+		return a.RolePruning
+	}
+	if a.ManagesConfig() {
+		return RolePruningExclusive
+	}
+	return RolePruningOwned
 }
 
 // TokenReviewerSpec describes the reviewer SA and its JWT TTL.
@@ -243,7 +293,9 @@ type PolicySpec struct {
 // infra cluster (1:1 with ClusterClaim).
 //
 // +kubebuilder:validation:XValidation:rule="self.secretsPrefix == oldSelf.secretsPrefix",message="spec.secretsPrefix is immutable"
-// +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="spec.clusterRef.name is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.clusterRef) == has(oldSelf.clusterRef) && (!has(self.clusterRef) || self.clusterRef.name == oldSelf.clusterRef.name)",message="spec.clusterRef.name is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.auth.manageConfig) && !self.auth.manageConfig) || has(self.clusterRef)",message="spec.clusterRef is required unless spec.auth.manageConfig=false"
+// +kubebuilder:validation:XValidation:rule="(!has(self.auth.manageConfig) || self.auth.manageConfig) == (!has(oldSelf.auth.manageConfig) || oldSelf.auth.manageConfig)",message="spec.auth.manageConfig is immutable"
 // +kubebuilder:validation:XValidation:rule="self.auth.mountPath == oldSelf.auth.mountPath",message="spec.auth.mountPath is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.transit) || !has(oldSelf.transit) || self.transit.mountPath == oldSelf.transit.mountPath",message="spec.transit.mountPath is immutable"
 type VaultClaimSpec struct {
@@ -252,8 +304,11 @@ type VaultClaimSpec struct {
 	// +required
 	VaultConfigRef VaultConfigRef `json:"vaultConfigRef"`
 
-	// +required
-	ClusterRef ClusterRef `json:"clusterRef"`
+	// ClusterRef references the ClusterClaim and its kubeconfig Secret; its
+	// name is immutable. Required unless spec.auth.manageConfig is false: a
+	// guest claim has no cluster of its own.
+	// +optional
+	ClusterRef ClusterRef `json:"clusterRef,omitzero"`
 
 	// SecretsPrefix is the path prefix under the shared KV-v2 mount used in
 	// policies. Convention: "clusters/{metadata.name}". Immutable.
@@ -307,7 +362,10 @@ type TransitKeyStatus struct {
 	// +optional
 	LatestVersion int `json:"latestVersion,omitempty"`
 
-	// CreatedByClaim distinguishes a key this operator created from an adopted one.
+	// CreatedByClaim distinguishes a key this operator created from an adopted
+	// one. An entry with CreatedByClaim and LatestVersion 0 is an intent: it is
+	// recorded before the key is created, so a crash between the create and the
+	// status write cannot turn the claim's own key into an adopted one.
 	// +optional
 	CreatedByClaim bool `json:"createdByClaim,omitempty"`
 }
@@ -317,6 +375,11 @@ type VaultStatusSummary struct {
 	// +optional
 	ConfigName string `json:"configName,omitempty"`
 
+	// AuthMountPath is the auth mount this claim was accepted on. It is written
+	// only once the mount is accepted, never before, so a claim that waited
+	// or was refused does not hold it; a claim whose record names its mount
+	// keeps that mount whatever its description (releases before ownership
+	// checks recorded it for every claim and have configured the mount since).
 	// +optional
 	AuthMountPath string `json:"authMountPath,omitempty"`
 
@@ -328,9 +391,21 @@ type VaultStatusSummary struct {
 	// +optional
 	AuthMountAccessor string `json:"authMountAccessor,omitempty"`
 
+	// AuthMountOwned records a fact, never an intent: the mount answered 2xx
+	// to this claim's POST sys/auth, sys/auth reports it as a kubernetes
+	// mount carrying this claim's description, or authMountPath already
+	// named it.
+	// +optional
+	AuthMountOwned bool `json:"authMountOwned,omitempty"`
+
+	// AppliedRoles is the ledger of roles this claim may have written: a name
+	// enters it before the write and leaves it after the role is deleted.
 	// +optional
 	AppliedRoles []string `json:"appliedRoles,omitempty"`
 
+	// AppliedPolicies is the ledger of policies this claim may have written:
+	// a name enters it before the write and leaves it after the policy is
+	// deleted.
 	// +optional
 	AppliedPolicies []string `json:"appliedPolicies,omitempty"`
 

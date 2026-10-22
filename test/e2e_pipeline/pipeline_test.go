@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -57,23 +57,16 @@ const (
 )
 
 // TestPipelineE2E exercises the full VaultClaim pipeline against a real
-// `vault server -dev` and envtest's kube-apiserver. Skips if either is
-// unavailable (vault binary missing / KUBEBUILDER_ASSETS unset).
+// `vault server -dev` and envtest's kube-apiserver. Fails if either is
+// unavailable (vault binary missing or another version, KUBEBUILDER_ASSETS
+// unset): a skipped run reads nothing and proves nothing.
 func TestPipelineE2E(t *testing.T) {
 	logf.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(os.Stderr)))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Spawn Vault dev (skip if binary missing).
-	vaultSrv, err := NewVaultDevServer(ctx)
-	if err != nil {
-		if errors.Is(err, ErrVaultBinaryMissing) {
-			t.Skipf("vault binary not in PATH; skipping pipeline e2e: %v", err)
-		}
-		t.Fatalf("start vault dev: %v", err)
-	}
-	defer func() { _ = vaultSrv.Close() }()
+	vaultSrv := StartVaultDev(ctx, t)
 
 	if err := EnsureKVMount(ctx, vaultSrv, sharedKVMount); err != nil {
 		t.Fatalf("ensure KV mount: %v", err)
@@ -217,7 +210,7 @@ func TestPipelineE2E(t *testing.T) {
 			SecretsPrefix:  "clusters/" + claimName,
 			Auth: vaultv1alpha1.AuthSpec{
 				MountPath:  "kubernetes-" + claimName,
-				AutoCreate: true,
+				AutoCreate: ptr.To(true),
 				TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 					ServiceAccount: vaultv1alpha1.ServiceAccountRef{
 						Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true,

@@ -161,9 +161,12 @@ func TestDetectDrift_PolicyMissing(t *testing.T) {
 	}
 }
 
+// ownDriftMount is sys/auth's answer for the fixture claim's own mount.
+var ownDriftMount = vault.AuthMountInfo{Type: "kubernetes", Description: "vault-operator: per-cluster auth for dlputi1u/ec8a00"}
+
 func TestDetectDrift_RoleExtra(t *testing.T) {
 	fake := &fakeVaultClient{
-		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
+		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": ownDriftMount},
 		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
 		ListRolesResp:      []string{"vmauth-reader", "argocd-reader", "rogue-role"},
 	}
@@ -174,6 +177,24 @@ func TestDetectDrift_RoleExtra(t *testing.T) {
 	}
 	if len(report.ExtraRoles) != 1 || report.ExtraRoles[0] != "rogue-role" {
 		t.Errorf("expected one ExtraRoles entry, got %+v", report.ExtraRoles)
+	}
+}
+
+// On a mount sys/auth does not show as the claim's, a role the claim never
+// wrote is not its drift.
+func TestDetectDrift_RoleOnForeignMountIsNotExtra(t *testing.T) {
+	fake := &fakeVaultClient{
+		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes", Description: "someone else"}},
+		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
+		ListRolesResp:      []string{"vmauth-reader", "argocd-reader", "rogue-role"},
+	}
+	r := &VaultClaimReconciler{}
+	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
+	if err != nil {
+		t.Fatalf("detectDrift: %v", err)
+	}
+	if len(report.ExtraRoles) != 0 {
+		t.Errorf("ExtraRoles = %v on a foreign mount", report.ExtraRoles)
 	}
 }
 

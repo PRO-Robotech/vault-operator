@@ -13,6 +13,8 @@ package controller
 import (
 	"strings"
 	"testing"
+
+	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 )
 
 func TestBucketBaseName(t *testing.T) {
@@ -53,5 +55,23 @@ func TestS3EndpointForRegion(t *testing.T) {
 	}
 	if strings.Contains(s3EndpointForRegion("ru1"), "://") {
 		t.Error("endpoint must carry no scheme")
+	}
+}
+
+// Every key the leaf gets is one Purge and a destinationPath change remove:
+// a key written but missing from s3OwnKeys would be left behind.
+func TestS3LeafKeysAreAllOwnKeys(t *testing.T) {
+	own := map[string]bool{}
+	for _, k := range s3OwnKeys {
+		own[k] = true
+	}
+	keys := s3LeafKeys(&cloudmanager.Bucket{Name: "b", AccessKey: "a", SecretKey: "s", Cname: "c"}, "e", "r")
+	for k := range keys {
+		if !own[k] {
+			t.Errorf("leaf key %q is not in s3OwnKeys", k)
+		}
+	}
+	if len(keys) != len(own) {
+		t.Errorf("leaf keys %d, own keys %d: a key of s3OwnKeys is never written", len(keys), len(own))
 	}
 }

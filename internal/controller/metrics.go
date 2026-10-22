@@ -55,6 +55,16 @@ var reviewerJWTExpirySeconds = prometheus.NewGaugeVec(
 	[]string{"namespace", "claim"},
 )
 
+// policyGuardViolations counts refused or audited policy stanzas and role
+// references, by guard mode and rule. The rollout gate for enforce reads it.
+var policyGuardViolations = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "vault_operator_policy_guard_violations_total",
+		Help: "Policy stanzas and role references outside the claim's scope, by guard mode and rule.",
+	},
+	[]string{"mode", "rule"},
+)
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter, reviewerJWTExpirySeconds)
+	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter, reviewerJWTExpirySeconds, policyGuardViolations)
 }

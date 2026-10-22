@@ -30,6 +30,8 @@ type SecretVaultClient interface {
 
 	ReadKV(ctx context.Context, mount, path string) (map[string]any, bool, error)
 	WriteKV(ctx context.Context, mount, path string, data map[string]any) error
+	ReadKVVersioned(ctx context.Context, mount, path string) (map[string]any, int, bool, error)
+	WriteKVCAS(ctx context.Context, mount, path string, data map[string]any, cas int) error
 	KVMetadataExists(ctx context.Context, mount, path string) (bool, error)
 	DeleteKVMetadata(ctx context.Context, mount, path string) error
 }

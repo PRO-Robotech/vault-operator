@@ -91,12 +91,13 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 	if err != nil {
 		return report, fmt.Errorf("list auth mounts: %w", err)
 	}
-	key := strings.TrimSuffix(strings.Trim(mount, "/"), "/") + "/"
-	if _, ok := mounts[key]; !ok {
+	info, mountExists := mounts[mountKey(mount)]
+	if !mountExists {
 		report.MountMissing = true
 		driftDetectedCounter.WithLabelValues(DriftTypeMount).Inc()
-	} else {
-		// Running clients only renew, so a wiped reviewer shows up on the next login.
+	} else if claim.Spec.Auth.ManagesConfig() {
+		// Running clients only renew, so a wiped reviewer shows up on the next
+		// login. A guest does not own the mount config and does not judge it.
 		cfg, err := vc.ReadKubernetesAuthConfig(ctx, mount)
 		if err != nil {
 			return report, fmt.Errorf("read auth config: %w", err)
@@ -115,11 +116,11 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 		present := make(map[string]struct{}, len(existing))
 		for _, name := range existing {
-			present[name] = struct{}{}
+			present[nameKey(name)] = struct{}{}
 		}
 		for i := range claim.Spec.Policies {
 			name := claim.Spec.Policies[i].Name
-			if _, ok := present[name]; !ok {
+			if _, ok := present[nameKey(name)]; !ok {
 				report.MissingPolicies = append(report.MissingPolicies, name)
 			}
 		}
@@ -128,28 +129,13 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 	}
 
-	existingRoles, err := vc.ListKubernetesRoles(ctx, mount)
-	if err != nil {
-		return report, fmt.Errorf("list roles: %w", err)
+	var recorded string
+	if claim.Status.Vault != nil {
+		recorded = claim.Status.Vault.AuthMountPath
 	}
-	desired := make(map[string]struct{}, len(claim.Spec.Roles))
-	for i := range claim.Spec.Roles {
-		desired[claim.Spec.Roles[i].Name] = struct{}{}
-	}
-	present := make(map[string]struct{}, len(existingRoles))
-	for _, name := range existingRoles {
-		present[name] = struct{}{}
-		if _, ok := desired[name]; !ok {
-			report.ExtraRoles = append(report.ExtraRoles, name)
-		}
-	}
-	for name := range desired {
-		if _, ok := present[name]; !ok {
-			report.MissingRoles = append(report.MissingRoles, name)
-		}
-	}
-	if len(report.MissingRoles) > 0 || len(report.ExtraRoles) > 0 {
-		driftDetectedCounter.WithLabelValues(DriftTypeRole).Inc()
+	owned := mountExists && mountAccepted(info, claim, recorded)
+	if err := r.detectRoleDrift(ctx, vc, claim, owned, &report); err != nil {
+		return report, err
 	}
 
 	if err := r.detectTransitDrift(ctx, vc, claim, &report); err != nil {
@@ -157,6 +143,72 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 	}
 
 	return report, nil
+}
+
+// detectRoleDrift reports missing roles and extra ones. Exclusive judges
+// every role on a mount the claim owns; otherwise only roles the ledger says
+// the claim wrote can be extra.
+func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, owned bool, report *DriftReport) error {
+	mount := claim.Spec.Auth.MountPath
+	existingRoles, err := vc.ListKubernetesRoles(ctx, mount)
+	if err != nil {
+		return fmt.Errorf("list roles: %w", err)
+	}
+	desired := make(map[string]string, len(claim.Spec.Roles))
+	for i := range claim.Spec.Roles {
+		desired[nameKey(claim.Spec.Roles[i].Name)] = claim.Spec.Roles[i].Name
+	}
+	exclusive := owned && claim.Spec.Auth.ManagesConfig() && claim.Spec.Auth.RolePruningMode() == vaultv1alpha1.RolePruningExclusive
+	var ledger []string
+	if claim.Status.Vault != nil {
+		ledger = claim.Status.Vault.AppliedRoles
+	}
+	keep, err := r.pruneFilter(ctx, claim)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]struct{}, len(existingRoles))
+	for _, name := range existingRoles {
+		present[nameKey(name)] = struct{}{}
+		if _, ok := desired[nameKey(name)]; ok {
+			continue
+		}
+		if (exclusive || containsName(ledger, name)) && !keep(name) {
+			report.ExtraRoles = append(report.ExtraRoles, name)
+		}
+	}
+	for key, name := range desired {
+		if _, ok := present[key]; !ok {
+			report.MissingRoles = append(report.MissingRoles, name)
+		}
+	}
+	if len(report.MissingRoles) > 0 || len(report.ExtraRoles) > 0 {
+		driftDetectedCounter.WithLabelValues(DriftTypeRole).Inc()
+	}
+
+	return nil
+}
+
+// pruneFilter reports roles pruning would leave alone (reserved, or held by
+// another claim), so drift does not report what the full pass will not fix.
+// Without a client (drift unit tests) nothing is kept.
+func (r *VaultClaimReconciler) pruneFilter(ctx context.Context, claim *vaultv1alpha1.VaultClaim) (func(string) bool, error) {
+	if r.Client == nil {
+		return func(string) bool { return false }, nil
+	}
+	view, err := r.buildOwnershipView(ctx, claim)
+	if err != nil {
+		return nil, err
+	}
+	others, err := r.everyOtherClaim(ctx, claim)
+	if err != nil {
+		return nil, err
+	}
+	held := collectHeld(others)
+	mount := normMount(claim.Spec.Auth.MountPath)
+	return func(name string) bool {
+		return len(deletableRoles(view, mount, []string{name}, held)) == 0
+	}, nil
 }
 
 // detectTransitDrift reports keys that vanished or changed version.

@@ -55,57 +55,72 @@ func copyItem() *vaultv1alpha1.SecretListItem {
 	}
 }
 
+const dexValue = "abc"
+
 func TestApplyCopy_WritesAndDetectsNoChange(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
 	item := copyItem()
 
-	h1, changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
 	if err != nil || !changed {
 		t.Fatalf("first apply: changed=%v err=%v", changed, err)
 	}
-	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "abc" {
+	if got := kv.store["secret|clusters/cl1/grafana"]["staticClient"]; got != dexValue {
 		t.Fatalf("destination = %v", got)
 	}
 
-	_, changed, err = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	changed, err = applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
-	if changed {
-		t.Fatalf("expected no change when source hash matches")
+	if changed || kv.writes != 1 {
+		t.Fatalf("expected no write when the destination already holds the source value: changed=%v writes=%d", changed, kv.writes)
 	}
 }
 
 func TestApplyCopy_RecopiesOnSourceChange(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
 	item := copyItem()
-	h1, _, _ := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
 
 	kv.seed("system/dex", map[string]any{"staticClient": "xyz"})
-	h2, changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
 	if err != nil || !changed {
 		t.Fatalf("expected recopy on source change: changed=%v err=%v", changed, err)
 	}
-	if h1 == h2 {
-		t.Fatalf("source hash should change with value")
-	}
-	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "xyz" {
+	if got := kv.store["secret|clusters/cl1/grafana"]["staticClient"]; got != "xyz" {
 		t.Fatalf("destination not updated: %v", got)
+	}
+}
+
+func TestApplyCopy_RepairsAnEditedDestination(t *testing.T) {
+	kv := newFakeKV()
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
+	item := copyItem()
+	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
+
+	kv.store["secret|clusters/cl1/grafana"]["staticClient"] = "tampered"
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item)
+	if err != nil || !changed {
+		t.Fatalf("expected a repair: changed=%v err=%v", changed, err)
+	}
+	if got := kv.store["secret|clusters/cl1/grafana"]["staticClient"]; got != dexValue {
+		t.Fatalf("destination not repaired: %v", got)
 	}
 }
 
 func TestApplyCopy_PreservesSiblingKeys(t *testing.T) {
 	kv := newFakeKV()
 	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
-	kv.seed("clusters/ec8a00/grafana", map[string]any{"other": "keep"})
+	kv.seed("clusters/cl1/grafana", map[string]any{"other": "keep"})
 	item := copyItem()
 
-	if _, _, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, ""); err != nil {
+	if _, err := applyCopyItem(context.Background(), kv, "secret", "clusters/cl1", item); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	dst := kv.store["secret|clusters/ec8a00/grafana"]
+	dst := kv.store["secret|clusters/cl1/grafana"]
 	if dst["other"] != "keep" || dst["staticClient"] != "abc" {
 		t.Fatalf("merge clobbered sibling key: %v", dst)
 	}
@@ -133,40 +148,40 @@ func TestApplyGenerate_CreateOnceThenStable(t *testing.T) {
 	kv := newFakeKV()
 	item := genItem(secretgen.HashNone, "")
 
-	h1, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	h1, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, "")
 	if err != nil || !changed {
 		t.Fatalf("first generate: changed=%v err=%v", changed, err)
 	}
-	gen := kv.store["secret|clusters/ec8a00/argocd"]["admin.password"].(string)
+	gen := kv.store["secret|clusters/cl1/argocd"]["admin.password"].(string)
 	if len(gen) != 16 {
 		t.Fatalf("generated length = %d", len(gen))
 	}
 
-	_, changed, err = applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	_, changed, err = applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, h1)
 	if err != nil {
 		t.Fatalf("second generate: %v", err)
 	}
 	if changed {
 		t.Fatalf("expected create-once: no regenerate when criteria unchanged")
 	}
-	if kv.store["secret|clusters/ec8a00/argocd"]["admin.password"].(string) != gen {
+	if kv.store["secret|clusters/cl1/argocd"]["admin.password"].(string) != gen {
 		t.Fatalf("value changed on stable reconcile")
 	}
 }
 
 func TestApplyGenerate_RecreateProtection(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("clusters/ec8a00/argocd", map[string]any{"admin.password": "preexisting"})
+	kv.seed("clusters/cl1/argocd", map[string]any{"admin.password": "preexisting"})
 	item := genItem(secretgen.HashNone, "")
 
-	_, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	_, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, "")
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if changed {
 		t.Fatalf("key exists + empty baseline must adopt baseline, not regenerate")
 	}
-	if kv.store["secret|clusters/ec8a00/argocd"]["admin.password"] != "preexisting" {
+	if kv.store["secret|clusters/cl1/argocd"]["admin.password"] != "preexisting" {
 		t.Fatalf("value should be untouched")
 	}
 }
@@ -174,18 +189,18 @@ func TestApplyGenerate_RecreateProtection(t *testing.T) {
 func TestApplyGenerate_RegenerateOnCriteriaChange(t *testing.T) {
 	kv := newFakeKV()
 	item := genItem(secretgen.HashNone, "")
-	h1, _, _ := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
-	first := kv.store["secret|clusters/ec8a00/argocd"]["admin.password"].(string)
+	h1, _, _ := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, "")
+	first := kv.store["secret|clusters/cl1/argocd"]["admin.password"].(string)
 
 	item.Generate.Length = 32
-	h2, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	h2, changed, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, h1)
 	if err != nil || !changed {
 		t.Fatalf("expected regenerate on criteria change: changed=%v err=%v", changed, err)
 	}
 	if h1 == h2 {
 		t.Fatalf("criteria hash should change")
 	}
-	second := kv.store["secret|clusters/ec8a00/argocd"]["admin.password"].(string)
+	second := kv.store["secret|clusters/cl1/argocd"]["admin.password"].(string)
 	if len(second) != 32 || second == first {
 		t.Fatalf("value not regenerated: %q", second)
 	}
@@ -195,10 +210,10 @@ func TestApplyGenerate_BcryptWritesRawAndHash(t *testing.T) {
 	kv := newFakeKV()
 	item := genItem(secretgen.HashBcrypt, "admin.passwordBcrypt")
 
-	if _, _, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, ""); err != nil {
+	if _, _, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, ""); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	dst := kv.store["secret|clusters/ec8a00/argocd"]
+	dst := kv.store["secret|clusters/cl1/argocd"]
 	raw := dst["admin.password"].(string)
 	hashed := dst["admin.passwordBcrypt"].(string)
 	if !strings.HasPrefix(hashed, "$2a$") {
@@ -212,7 +227,7 @@ func TestApplyGenerate_BcryptWritesRawAndHash(t *testing.T) {
 func TestApplyGenerate_HashWithoutHashedKeyFails(t *testing.T) {
 	kv := newFakeKV()
 	item := genItem(secretgen.HashBcrypt, "")
-	if _, _, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/ec8a00", item, ""); err == nil {
+	if _, _, err := applyGenerateItem(context.Background(), kv, "secret", "clusters/cl1", item, ""); err == nil {
 		t.Fatalf("expected error when hash != none but hashedKey empty")
 	}
 }

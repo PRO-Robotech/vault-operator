@@ -1,6 +1,6 @@
 # Pipeline reconcile VaultClaim
 
-Каждый reconcile VaultClaim — это последовательность из 7 шагов. Шаги идемпотентны, выполняются по очереди, любой может вернуть `Wait` (ждём внешнего события) или транзиентную ошибку (повтор через `RequeueAfter`).
+Каждый reconcile VaultClaim — это последовательность шагов ниже (у гостевой заявки шаги 2–5 заменены проверкой чужого mount, см. [ownership.md](ownership.md)). Шаги идемпотентны, выполняются по очереди, любой может вернуть `Wait` (ждём внешнего события) или транзиентную ошибку (повтор через `RequeueAfter`).
 
 ## Шаги
 
@@ -10,9 +10,11 @@
 | 2 | **WaitKubeconfig** | Достаёт Secret `{clusterRef.kubeconfigSecret}` из namespace claim'а | Secret отсутствует → `KubeconfigAvailable=False`, ждём watch-события |
 | 3 | **EnsureTargetSA** | Через kubeconfig применяет (SSA) Namespace + SA `vault-token-reviewer` + ClusterRoleBinding `system:auth-delegator` в infra-кластере. Только когда `tokenReviewer.serviceAccount.autoCreate: true` | apiserver недоступен → транзиент, retry |
 | 4 | **IssueReviewerJWT** | Вызывает TokenRequest API: новый JWT для reviewer SA — на **каждом** полном проходе, потому что Step 5 перезаписывает `auth/{mount}/config` целиком (запись без `token_reviewer_jwt` стирает рецензента). В `status` JWT записывается только при плановой ротации (остаток < 30% TTL): иначе повтор упавшего claim'а патчил бы статус и обходил backoff | TokenRequest 4xx/5xx → транзиент |
-| 5 | **EnableAuthMount** | `POST sys/auth/{mount}` (на 400 «уже существует» — продолжаем). Затем `POST auth/{mount}/config` с `kubernetes_host`, `kubernetes_ca_cert`, `token_reviewer_jwt`, `issuer` (или `disable_iss_validation=true`) | Vault 5xx → `AuthMountReady=False`, retry |
-| 6 | **ApplyPolicies** | Для каждой `spec.policies[]` — `PUT sys/policies/acl/{name}`. Если в HCL встречается `{{ .AuthMountAccessor }}`, accessor лениво забирается из `GET sys/auth` | Невалидный HCL → 400 `PutPolicyFailed`, retry |
-| 7 | **ApplyRoles** | Для каждой `spec.roles[]` — `POST auth/{mount}/role/{name}`. После — `LIST auth/{mount}/role` и удаление имён, которых нет в `spec.roles[]` (soft-purge) | Vault 5xx → `RolesApplied=False`, retry |
+| 1a | **CheckOwnership** | Только Kubernetes: резерв, класс mount, индекс владения против остальных заявок | Конфликт → `Phase=Failed` с причиной из закрытого набора |
+| 5 | **EnableAuthMount** | `GET sys/auth`: свой mount (описание этой заявки) — дальше; нет mount — `POST sys/auth/{mount}`; чужой — `MountConflict`. Затем `POST auth/{mount}/config` с `kubernetes_host`, `kubernetes_ca_cert`, `token_reviewer_jwt`, `issuer` (или `disable_iss_validation=true`) | Vault 5xx → `AuthMountReady=False`, retry |
+| 6 | **ApplyPolicies** | Ограда правил, затем для имени не из журнала — проверка, что его нет в Vault, патч журнала и `PUT sys/policies/acl/{name}`. Если в HCL встречается `{{ .AuthMountAccessor }}`, accessor лениво забирается из `GET sys/auth` | Невалидный HCL → 400 `PutPolicyFailed`, retry |
+| 7 | **ApplyRoles** | Патч журнала, затем для каждой `spec.roles[]` — `POST auth/{mount}/role/{name}` | Vault 5xx → `RolesApplied=False`, retry |
+| 8 | **PruneRemoved** | Удаляет роли, затем политики, ушедшие из spec, по журналу (`Exclusive` на своём mount — ещё и роли из `LIST auth/{mount}/role`) | Vault 5xx → retry |
 
 После 7-го шага: `Phase=Ready`, `Ready=True`, RequeueAfter **10 минут** (drift detection).
 
@@ -66,9 +68,9 @@ Timestamps `lastReconcileAt` / `lastDriftCheckAt` / `tokenReviewerJWT.lastRotati
 Phase=Deleting
    │
    ▼
-1. Удаляем все роли по объединению (status.appliedRoles ∪ spec.roles)
-2. Удаляем все политики по объединению (status.appliedPolicies ∪ spec.policies)
-3. DELETE sys/auth/{mount}
+1. Удаляем роли из журнала status.appliedRoles (кроме зарезервированных и чужих)
+2. Удаляем политики из журнала status.appliedPolicies (кроме зарезервированных и чужих)
+3. DELETE sys/auth/{mount} — только если sys/auth показывает его как mount этой заявки
 4. Best-effort: удаляем SA + ClusterRoleBinding в infra-кластере
 5. Снимаем finalizer
 ```

@@ -63,7 +63,7 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 			reason = "MountCheckForbidden"
 		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-			reason, fmt.Sprintf("cannot read sys/mounts: %v", err))
+			reason, "reading sys/mounts failed: "+failureText(err))
 		return Proceed, fmt.Errorf("check transit mount %q: %w", mount, err)
 	}
 	if !exists {
@@ -87,8 +87,10 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 		switch {
 		case err == nil:
 		case vault.IsNotFound(err):
-			// A namesake key is different material: it would strand every existing ciphertext.
-			if prior != nil && prior.CreatedByClaim {
+			// A namesake key is different material: it would strand every existing
+			// ciphertext. An intent entry (version 0) only says a create was about
+			// to happen, so creating is still allowed.
+			if prior != nil && prior.CreatedByClaim && prior.LatestVersion != 0 {
 				setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
 					"KeyMissing", fmt.Sprintf("key %q was created by this claim and no longer exists in Vault; refusing to recreate it", keySpec.Name))
 				if r.Recorder != nil {
@@ -98,13 +100,17 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 				claim.Status.Vault.TransitKeys = keepTransitLedger(claim, observed, claim.Spec.Transit.Keys[i:])
 				return Wait, nil
 			}
+			claim.Status.Vault.TransitKeys = withTransitIntent(keepTransitLedger(claim, observed, claim.Spec.Transit.Keys[i:]), keySpec.Name)
+			if err := state.intent(ctx, claim); err != nil {
+				return Proceed, err
+			}
 			if err := r.createTransitKey(ctx, state, claim, mount, keySpec); err != nil {
 				return Proceed, err
 			}
 			live, err = state.Vault.ReadTransitKey(ctx, mount, keySpec.Name)
 			if err != nil {
 				setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-					"ReadBackFailed", fmt.Sprintf("key %q created but cannot be read back: %v", keySpec.Name, err))
+					"ReadBackFailed", fmt.Sprintf("key %q created but reading it back failed: %s", keySpec.Name, failureText(err)))
 				return Proceed, fmt.Errorf("read back transit key %q: %w", keySpec.Name, err)
 			}
 			observed = append(observed, vaultv1alpha1.TransitKeyStatus{
@@ -123,7 +129,7 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 				reason = "ReadKeyForbidden"
 			}
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-				reason, fmt.Sprintf("key %q: %v", keySpec.Name, err))
+				reason, fmt.Sprintf("key %q: reading it failed: %s", keySpec.Name, failureText(err)))
 			return Proceed, fmt.Errorf("read transit key %q: %w", keySpec.Name, err)
 		}
 
@@ -132,6 +138,16 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 				"KeyMismatch", fmt.Sprintf("key %q: %s", keySpec.Name, mismatch))
 			claim.Status.Vault.TransitKeys = keepTransitLedger(claim, observed, claim.Spec.Transit.Keys[i:])
 			return Wait, nil
+		}
+
+		createdByClaim := prior != nil && prior.CreatedByClaim
+		// Exportable and allow_plaintext_backup cannot be turned off again; on a
+		// key this claim did not create they would hand out material that
+		// belongs to someone else.
+		if !createdByClaim && ((keySpec.Exportable && !live.Exportable) || (keySpec.AllowPlaintextBackup && !live.AllowPlaintextBackup)) {
+			claim.Status.Vault.TransitKeys = keepTransitLedger(claim, observed, claim.Spec.Transit.Keys[i:])
+			return r.refuse(claim, state, vaultv1alpha1.ConditionTransitKeysReady, ReasonKeyAdoptionRestricted,
+				fmt.Sprintf("key %q was not created by this claim; exportable and allowPlaintextBackup cannot be enabled on it", keySpec.Name))
 		}
 
 		if diff := mutableKeyDiff(keySpec, live); diff != "" {
@@ -143,7 +159,7 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 			}
 			if err := state.Vault.UpdateTransitKeyConfig(ctx, mount, keySpec.Name, cfg); err != nil {
 				setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-					"ConfigUpdateFailed", fmt.Sprintf("key %q: %v", keySpec.Name, err))
+					"ConfigUpdateFailed", fmt.Sprintf("key %q: updating its config failed: %s", keySpec.Name, failureText(err)))
 				return Proceed, fmt.Errorf("update transit key %q config: %w", keySpec.Name, err)
 			}
 			if r.Recorder != nil {
@@ -152,7 +168,6 @@ func (r *VaultClaimReconciler) stepEnsureTransitKeys(ctx context.Context, claim 
 			}
 		}
 
-		createdByClaim := prior != nil && prior.CreatedByClaim
 		observed = append(observed, vaultv1alpha1.TransitKeyStatus{
 			Name:           keySpec.Name,
 			LatestVersion:  live.LatestVersion,
@@ -181,7 +196,7 @@ func (r *VaultClaimReconciler) createTransitKey(ctx context.Context, state *pipe
 			reason = "CreateKeyForbidden"
 		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-			reason, fmt.Sprintf("key %q: %v", keySpec.Name, err))
+			reason, fmt.Sprintf("key %q: creating it failed: %s", keySpec.Name, failureText(err)))
 		return fmt.Errorf("create transit key %q: %w", keySpec.Name, err)
 	}
 	// deletion_allowed is rejected at creation and needs its own write.
@@ -193,7 +208,7 @@ func (r *VaultClaimReconciler) createTransitKey(ctx context.Context, state *pipe
 	}
 	if err := state.Vault.UpdateTransitKeyConfig(ctx, mount, keySpec.Name, cfg); err != nil {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTransitKeysReady, metav1.ConditionFalse, claim.Generation,
-			"ConfigUpdateFailed", fmt.Sprintf("key %q: %v", keySpec.Name, err))
+			"ConfigUpdateFailed", fmt.Sprintf("key %q: configuring it failed: %s", keySpec.Name, failureText(err)))
 		return fmt.Errorf("configure transit key %q: %w", keySpec.Name, err)
 	}
 	return nil
@@ -259,6 +274,19 @@ func keepTransitLedger(claim *vaultv1alpha1.VaultClaim, observed []vaultv1alpha1
 			seen[name] = struct{}{}
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// withTransitIntent records that the claim is about to create name: the entry
+// carries CreatedByClaim with version 0 until the key is read back.
+func withTransitIntent(ledger []vaultv1alpha1.TransitKeyStatus, name string) []vaultv1alpha1.TransitKeyStatus {
+	for i := range ledger {
+		if ledger[i].Name == name {
+			return ledger
+		}
+	}
+	out := append(ledger, vaultv1alpha1.TransitKeyStatus{Name: name, CreatedByClaim: true})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }

@@ -14,6 +14,7 @@ Vault Operator превращает заявку «нужен Vault-доступ
 - **Безопасная ротация JWT** — token-reviewer JWT обновляется проактивно при остатке <30% TTL; байты JWT никогда не попадают в `status`.
 - **Sealed Vault aware** — оператор различает sealed/uninitialized Vault и сетевую недоступность, не уходит в шторм 503-ошибок.
 - **Circuit breaker** — 5 подряд неудач → 2 минуты open + half-open probe, защищает Vault от лавины retry.
+- **Значения и бакеты** — тем же репозиторием поставляются ещё два контроллера: `vault-secret-operator` (`VaultSecretClaim`: генерация и копирование секретов) и `bucket-operator` (`S3BucketClaim`: S3-бакет кластера в cloud-manager и его ключи в Vault; удаляет только свой бакет и только свои ключи, см. [docs/S3BUCKETCLAIM-SPEC.md](docs/S3BUCKETCLAIM-SPEC.md)).
 
 ## Архитектура
 
@@ -83,9 +84,9 @@ kubectl apply -f docs/examples/basic-vaultclaim/vaultclaim.yaml
 | Компонент | Версия |
 |---|---|
 | Kubernetes | 1.34+ |
-| HashiCorp Vault | OSS 1.17+ |
+| HashiCorp Vault | OSS 1.17+ (e2e гоняются на 1.20.1 — версии прода) |
 | ClusterClaim Operator | любая (используется только kubeconfig-секрет) |
-| Go | 1.24+ |
+| Go | 1.26.10 (`go.mod`; образы сборки закреплены digest'ом) |
 
 ## Связь с другими операторами Beget
 

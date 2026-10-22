@@ -163,16 +163,36 @@ type SecretItemStatus struct {
 	// +optional
 	State string `json:"state,omitempty"`
 
-	// SourceHash is the input hash (copy: source path+key+value; generate:
-	// the length/charset/hash criteria).
+	// SourceHash is the generate criteria hash (length/charset/hash). Copy
+	// items no longer carry it: the copied value is compared with the source
+	// directly, and a hash of a secret value does not belong in status.
 	// +optional
 	SourceHash string `json:"sourceHash,omitempty"`
+
+	// Destination journals where this item wrote. When the item leaves the spec
+	// or changes its destination, the journaled keys are removed unless another
+	// live claim writes the same (mount, path, key).
+	// +optional
+	Destination *ItemDestination `json:"destination,omitempty"`
 
 	// +optional
 	LastAppliedAt *metav1.Time `json:"lastAppliedAt,omitempty"`
 
 	// +optional
 	Message string `json:"message,omitempty"`
+}
+
+// ItemDestination is a journaled write target.
+type ItemDestination struct {
+	// Mount is the resolved KV mount.
+	Mount string `json:"mount"`
+	// Path is relative to spec.secretsPrefix (immutable), so it is the same
+	// leaf for the whole life of the claim.
+	Path string `json:"path"`
+	Key  string `json:"key"`
+	// HashedKey is set when the item also wrote a hash of the value.
+	// +optional
+	HashedKey string `json:"hashedKey,omitempty"`
 }
 
 // VaultSecretClaimStatus is the observed state.
@@ -193,6 +213,11 @@ type VaultSecretClaimStatus struct {
 	// +listMapKey=name
 	// +optional
 	Items []SecretItemStatus `json:"items,omitempty"`
+
+	// Orphans are journaled keys of items that left the spec (or changed their
+	// destination) and whose removal from Vault has not succeeded yet.
+	// +optional
+	Orphans []ItemDestination `json:"orphans,omitempty"`
 }
 
 // +kubebuilder:object:root=true

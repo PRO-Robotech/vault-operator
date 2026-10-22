@@ -327,7 +327,7 @@ kubectl patch vaultsecretclaim -n <ns> <name> --type=merge -p '{"metadata":{"fin
 
 #### Значение не обновляется, хотя я поменял источник для copy
 
-`copy` перекопирует только при смене **значения** источника (детект по `hash(path+key+value)`). Сверьте `status.items[].sourceHash` — он должен поменяться. Изменение `destination` — это изменение spec, применяется по событию обновления CR.
+`copy` на каждом проходе сравнивает значение назначения со значением источника и перезаписывает при расхождении. Reconcile событийный: смена источника в Vault сама проход не вызывает — тригерните его (`kubectl annotate vaultsecretclaim <name> -n <ns> reconcile=$(date +%s) --overwrite`). Изменение `destination` — изменение spec: ключ записывается по новому месту, со старого снимается (журнал `status.items[].destination`).
 
 #### Сгенерированный пароль не меняется после редактирования CR
 
@@ -338,11 +338,58 @@ kubectl patch vaultsecretclaim -n <ns> <name> --type=merge -p '{"metadata":{"fin
 By design: reconcile событийный, без поллинга значений. Восстановление зависит от типа:
 
 - **generate** — тригерните reconcile (`kubectl annotate vaultsecretclaim <name> -n <ns> reconcile=$(date +%s) --overwrite`): ключа нет → перегенерируется, но **новым** значением (старое было случайным и невосстановимо — consumer'ы должны перечитать).
-- **copy** — обычный reconcile НЕ восстановит (источник не менялся → no-op по `sourceHash`). Восстановить: пересоздать CR (пустой статус → copy перекопирует) либо сменить значение источника.
+- **copy** — восстанавливается тем же reconcile: значение назначения сверяется с источником.
+
+#### Убрал элемент из spec — ключ из Vault пропал
+
+Так и задумано: ключ элемента, убранного из `secretList` (или сменившего `destination`), снимается по журналу `status.items[].destination`; соседние ключи листа остаются. Ключ не снимается, если тот же `(mount, path, key)` пишет другая `VaultSecretClaim`. Неудавшееся снятие остаётся в `status.orphans` и повторяется. Заявка, записанная прежним выпуском, на первом проходе только заполняет журнал.
+
+#### Генерация отказывает: «gives N bits, need >= 64»
+
+Новое значение должно нести не меньше 64 бит: `length × log2(число различных символов charset)`. Для алфавита по умолчанию (62 символа) это от 11 символов. Увеличьте `length` или алфавит.
 
 #### Consumer получает 403 на чтение записанного секрета
 
 Путь `destination` не покрыт consumer-policy. Эти policy пишет `VaultClaim` (`vault-operator`), а не секрет-оператор. Проверьте, что `secretsPrefix` у `VaultSecretClaim` совпадает с `VaultClaim.secretsPrefix`, и что в `VaultClaim` есть policy на `secret/data/clusters/{cluster}/{app}/*`.
+
+---
+
+## S3BucketClaim
+
+`bucket-operator` — отдельный контроллер: бакет кластера в cloud-manager и его ключи в Vault.
+
+```bash
+kubectl get s3bc -n <ns> <name> -o jsonpath='{.status.phase} {.status.bucketName} {.status.bucketOwnership}{"\n"}'
+kubectl get s3bc -n <ns> <name> \
+  -o jsonpath='{range .status.conditions[?(@.status=="False")]}{.type}: {.reason} — {.message}{"\n"}{end}'
+```
+
+### Phase=Failed
+
+| reason | причина | действие |
+|---|---|---|
+| `Conflict` | более старая заявка уже держит тот же (`customerLogin`, `clusterRef.name`), тот же лист KV или тот же бакет (в сообщении — её `ns/name`) | удалить дубль; заявка сама продолжит после ухода старшей |
+| `ForeignBucket` | бакет с этим именем принадлежит другому логину | проверить `customerLogin` / `spec.bucket.name` |
+| `AmbiguousBucket` | под логином несколько живых бакетов с подходящим именем | указать нужный в `spec.bucket.name` |
+| `BucketNotFound` | `spec.bucket.name` не найден у этого логина | исправить имя |
+| `ConfigurationMissing`, `InvalidBucketName` | отказ cloud-manager по входу | исправить spec / каталог cloud-manager |
+| `BadStatus`, `NoKeys`, `BucketMissing` | бакет не `RUNNING`, без ключей или пропал | сам повторяет 1m…30m; при `RUNNING` с ключами возвращается в `Ready` |
+
+Ошибки spec повторяются раз в 30m; правка заявки пересчитывает сразу.
+
+### Phase=Deleting бесконечно
+
+| reason (`Ready=False`) | причина | действие |
+|---|---|---|
+| `BucketRemoving` | cloud-manager ещё удаляет бакет | ждать `REMOVED` (опрос 15s) |
+| `DeletionStuck` | бакет в `ERROR` или `removeBucket` ответил незнакомым текстом | смотреть cloud-manager; метрика `vault_operator_cloudmanager_remove_unknown_response_total` |
+| `DeletionBlocked` | бакет не доказуемо свой: другой или пустой владелец, другой `managedBy`, либо `bucketOwnership=Adopted` без `spec.bucket.purgeAdopted` | если бакет можно удалить — `spec.bucket.purgeAdopted: true`; если нужно сохранить — `deletionPolicy: Retain` |
+
+Событие `BucketNotRecorded` при удалении: в момент удаления создание было в полёте и имя бакета не записано — бакет не удаляется, проверьте его в cloud-manager вручную.
+
+### Ключи в Vault
+
+Лист сверяется с Vault на каждом проходе (раз в 10 минут): удалённый или изменённый свой ключ восстанавливается, чужие ключи листа не трогаются. При смене `destinationPath` свои ключи снимаются со старого листа, только если он называет тот же бакет.
 
 ---
 

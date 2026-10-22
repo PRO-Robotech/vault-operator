@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,11 +24,13 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/secretgen"
 	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
 
@@ -47,6 +50,9 @@ type VaultSecretClaimReconciler struct {
 
 	// Now is an injectable clock for tests; nil → time.Now.
 	Now func() time.Time
+
+	// MaxConcurrentReconciles bounds parallel claims (0 → 1).
+	MaxConcurrentReconciles int
 }
 
 func (r *VaultSecretClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -177,8 +183,10 @@ func (r *VaultSecretClaimReconciler) resolveAndLogin(ctx context.Context, claim 
 	return vc, cfg, ctrl.Result{}, true
 }
 
-// applyItems applies every secretList item, preserving prior per-item status for
-// unchanged entries. Returns false if any item failed.
+// applyItems applies every secretList item, preserving prior per-item status
+// for unchanged entries and journaling where each item wrote. Keys journaled
+// by items that left the spec (or moved) are then removed. Returns false if any
+// item or removal failed.
 func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVaultClient, defMount string, claim *vaultv1alpha1.VaultSecretClaim) bool {
 	prev := make(map[string]vaultv1alpha1.SecretItemStatus, len(claim.Status.Items))
 	for _, it := range claim.Status.Items {
@@ -191,16 +199,16 @@ func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVa
 
 	for i := range claim.Spec.SecretList {
 		item := &claim.Spec.SecretList[i]
-		prevHash := prev[item.Name].SourceHash
+		p := prev[item.Name]
 
 		var newHash string
 		var changed bool
 		var err error
 		switch item.Type {
 		case vaultv1alpha1.SecretTypeCopy:
-			newHash, changed, err = applyCopyItem(ctx, vc, defMount, claim.Spec.SecretsPrefix, item, prevHash)
+			changed, err = applyCopyItem(ctx, vc, defMount, claim.Spec.SecretsPrefix, item)
 		case vaultv1alpha1.SecretTypeGenerate:
-			newHash, changed, err = applyGenerateItem(ctx, vc, defMount, claim.Spec.SecretsPrefix, item, prevHash)
+			newHash, changed, err = applyGenerateItem(ctx, vc, defMount, claim.Spec.SecretsPrefix, item, p.SourceHash)
 		default:
 			err = fmt.Errorf("item %q: unknown type %q", item.Name, item.Type)
 		}
@@ -210,24 +218,216 @@ func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVa
 		case err != nil:
 			st.State = vaultv1alpha1.ItemStateFailed
 			st.Message = err.Error()
-			st.SourceHash = prevHash
-			st.LastAppliedAt = prev[item.Name].LastAppliedAt
+			if item.Type == vaultv1alpha1.SecretTypeGenerate {
+				st.SourceHash = p.SourceHash
+			}
+			st.LastAppliedAt = p.LastAppliedAt
+			// What was written before stays journaled until this item succeeds.
+			st.Destination = p.Destination
 			allOK = false
 			r.event(claim, "ItemApplyFailed", fmt.Sprintf("item %q: %v", item.Name, err))
-		case changed:
-			st.State = vaultv1alpha1.ItemStateApplied
-			st.SourceHash = newHash
-			st.LastAppliedAt = ptrTime(now)
 		default:
 			st.State = vaultv1alpha1.ItemStateApplied
 			st.SourceHash = newHash
-			st.LastAppliedAt = prev[item.Name].LastAppliedAt
+			st.Destination = itemDestination(item, defMount)
+			st.LastAppliedAt = p.LastAppliedAt
+			if changed {
+				st.LastAppliedAt = ptrTime(now)
+			}
 		}
 		out = append(out, st)
 	}
 
+	orphans := orphanedDestinations(claim, out)
 	claim.Status.Items = out
+	if len(orphans) == 0 {
+		claim.Status.Orphans = nil
+		return allOK
+	}
+	left, err := r.removeOrphans(ctx, vc, claim, orphans)
+	claim.Status.Orphans = left
+	if err != nil {
+		r.event(claim, "OrphanRemovalFailed", fmt.Sprintf("removing keys of dropped items: %v", err))
+		return false
+	}
 	return allOK
+}
+
+// itemDestination is the journal entry of an applied item.
+func itemDestination(item *vaultv1alpha1.SecretListItem, defMount string) *vaultv1alpha1.ItemDestination {
+	d := &vaultv1alpha1.ItemDestination{
+		Mount: resolveMount(item.Destination.Mount, defMount),
+		Path:  strings.Trim(item.Destination.Path, "/"),
+		Key:   item.Destination.Key,
+	}
+	if item.Type == vaultv1alpha1.SecretTypeGenerate && item.Generate != nil && effHash(*item.Generate) != secretgen.HashNone {
+		d.HashedKey = item.Destination.HashedKey
+	}
+	return d
+}
+
+// destKey identifies one written key: (mount, path relative to the immutable
+// secretsPrefix, key).
+type destKey struct{ mount, path, key string }
+
+func journalKeys(d *vaultv1alpha1.ItemDestination) []destKey {
+	if d == nil {
+		return nil
+	}
+	keys := []destKey{{d.Mount, d.Path, d.Key}}
+	if d.HashedKey != "" {
+		keys = append(keys, destKey{d.Mount, d.Path, d.HashedKey})
+	}
+	return keys
+}
+
+// orphanedDestinations returns the previously journaled keys (and still pending
+// orphans) that no current item writes. A claim never reconciled by this
+// release has no journal, so its first pass removes nothing.
+func orphanedDestinations(claim *vaultv1alpha1.VaultSecretClaim, current []vaultv1alpha1.SecretItemStatus) []destKey {
+	live := map[destKey]bool{}
+	for i := range current {
+		for _, k := range journalKeys(current[i].Destination) {
+			live[k] = true
+		}
+	}
+	seen := map[destKey]bool{}
+	var out []destKey
+	add := func(k destKey) {
+		if !live[k] && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for i := range claim.Status.Items {
+		for _, k := range journalKeys(claim.Status.Items[i].Destination) {
+			add(k)
+		}
+	}
+	for i := range claim.Status.Orphans {
+		for _, k := range journalKeys(&claim.Status.Orphans[i]) {
+			add(k)
+		}
+	}
+	return out
+}
+
+// removeOrphans removes the given keys, except those another claim writes to
+// the same absolute (mount, path, key). It returns the keys still to remove.
+func (r *VaultSecretClaimReconciler) removeOrphans(ctx context.Context, vc SecretVaultClient, claim *vaultv1alpha1.VaultSecretClaim, keys []destKey) ([]vaultv1alpha1.ItemDestination, error) {
+	foreign, err := r.keysOfOtherClaims(ctx, claim)
+	if err != nil {
+		return toDestinations(keys), err
+	}
+	var left []destKey
+	var firstErr error
+	for leaf, ks := range groupByLeaf(claim.Spec.SecretsPrefix, keys, foreign) {
+		if err := removeKeys(ctx, vc, leaf.mount, leaf.path, ks); err != nil {
+			for _, k := range ks {
+				left = append(left, k.rel)
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return toDestinations(left), firstErr
+}
+
+type leafKey struct{ mount, path string }
+
+type leafEntry struct {
+	key string
+	rel destKey
+}
+
+// groupByLeaf groups keys by absolute leaf, dropping the ones in foreign.
+func groupByLeaf(prefix string, keys []destKey, foreign map[destKey]bool) map[leafKey][]leafEntry {
+	out := map[leafKey][]leafEntry{}
+	for _, k := range keys {
+		abs := destKey{k.mount, joinPath(prefix, k.path), k.key}
+		if foreign[abs] {
+			continue
+		}
+		lk := leafKey{abs.mount, abs.path}
+		out[lk] = append(out[lk], leafEntry{key: k.key, rel: k})
+	}
+	return out
+}
+
+func removeKeys(ctx context.Context, vc SecretVaultClient, mount, path string, ks []leafEntry) error {
+	data, version, ok, err := vc.ReadKVVersioned(ctx, mount, path)
+	if err != nil || !ok {
+		return err
+	}
+	removed := false
+	for _, k := range ks {
+		if _, has := data[k.key]; has {
+			delete(data, k.key)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil
+	}
+	if len(data) == 0 {
+		return vc.DeleteKVMetadata(ctx, mount, path)
+	}
+	return vc.WriteKVCAS(ctx, mount, path, data, version)
+}
+
+func toDestinations(keys []destKey) []vaultv1alpha1.ItemDestination {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]vaultv1alpha1.ItemDestination, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, vaultv1alpha1.ItemDestination{Mount: k.mount, Path: k.path, Key: k.key})
+	}
+	return out
+}
+
+// keysOfOtherClaims returns every absolute (mount, path, key) another claim
+// writes or has journaled, so a shared key is never removed by one of them.
+func (r *VaultSecretClaimReconciler) keysOfOtherClaims(ctx context.Context, claim *vaultv1alpha1.VaultSecretClaim) (map[destKey]bool, error) {
+	var list vaultv1alpha1.VaultSecretClaimList
+	if err := r.List(ctx, &list); err != nil {
+		return nil, fmt.Errorf("list VaultSecretClaims: %w", err)
+	}
+	out := map[destKey]bool{}
+	for i := range list.Items {
+		o := &list.Items[i]
+		if o.UID == claim.UID {
+			continue
+		}
+		// The other claim's default mount: without it its spec keys would not
+		// match and a key it writes could be removed, so an unreadable
+		// VaultConfig fails the pass. An absent one leaves only the keys with
+		// an explicit mount, the ones such a claim can write.
+		cfg := &vaultv1alpha1.VaultConfig{}
+		defMount := ""
+		switch err := r.Get(ctx, client.ObjectKey{Name: o.Spec.VaultConfigRef.Name}, cfg); {
+		case err == nil:
+			defMount = cfg.Spec.Storage.KvMountPath
+		case !apierrors.IsNotFound(err):
+			return nil, fmt.Errorf("get VaultConfig %q of %s/%s: %w", o.Spec.VaultConfigRef.Name, o.Namespace, o.Name, err)
+		}
+		for j := range o.Spec.SecretList {
+			it := &o.Spec.SecretList[j]
+			mount := resolveMount(it.Destination.Mount, defMount)
+			path := joinPath(o.Spec.SecretsPrefix, it.Destination.Path)
+			out[destKey{mount, path, it.Destination.Key}] = true
+			if it.Destination.HashedKey != "" {
+				out[destKey{mount, path, it.Destination.HashedKey}] = true
+			}
+		}
+		for j := range o.Status.Items {
+			for _, k := range journalKeys(o.Status.Items[j].Destination) {
+				out[destKey{k.mount, joinPath(o.Spec.SecretsPrefix, k.path), k.key}] = true
+			}
+		}
+	}
+	return out, nil
 }
 
 func (r *VaultSecretClaimReconciler) handleDeletion(ctx context.Context, claim *vaultv1alpha1.VaultSecretClaim) (ctrl.Result, error) {
@@ -274,49 +474,41 @@ func (r *VaultSecretClaimReconciler) clientForDeletion(ctx context.Context, clai
 	return vc, cfg, true
 }
 
-// purge removes the keys this claim wrote, grouped by destination path. A path
-// left with no keys is deleted entirely; sibling keys not owned here survive.
+// purge removes the keys this claim wrote: the journal, pending orphans and,
+// for items applied by an earlier release without a journal entry, their spec
+// destination. A key another claim writes survives, and so do sibling keys; a
+// leaf left empty is deleted.
 func (r *VaultSecretClaimReconciler) purge(ctx context.Context, vc SecretVaultClient, defMount string, claim *vaultv1alpha1.VaultSecretClaim) error {
-	type group struct {
-		mount string
-		path  string
-		keys  map[string]struct{}
+	journaled := map[string]bool{}
+	keys := make([]destKey, 0, 2*(len(claim.Status.Items)+len(claim.Spec.SecretList))+len(claim.Status.Orphans))
+	for i := range claim.Status.Items {
+		if d := claim.Status.Items[i].Destination; d != nil {
+			journaled[claim.Status.Items[i].Name] = true
+			keys = append(keys, journalKeys(d)...)
+		}
 	}
-	groups := map[string]*group{}
+	for i := range claim.Status.Orphans {
+		keys = append(keys, journalKeys(&claim.Status.Orphans[i])...)
+	}
 	for i := range claim.Spec.SecretList {
 		item := &claim.Spec.SecretList[i]
-		mount := resolveMount(item.Destination.Mount, defMount)
-		path := joinPath(claim.Spec.SecretsPrefix, item.Destination.Path)
-		gk := mount + "|" + path
-		g, ok := groups[gk]
-		if !ok {
-			g = &group{mount: mount, path: path, keys: map[string]struct{}{}}
-			groups[gk] = g
+		if journaled[item.Name] {
+			continue
 		}
-		g.keys[item.Destination.Key] = struct{}{}
+		mount := resolveMount(item.Destination.Mount, defMount)
+		path := strings.Trim(item.Destination.Path, "/")
+		keys = append(keys, destKey{mount, path, item.Destination.Key})
 		if item.Type == vaultv1alpha1.SecretTypeGenerate && item.Destination.HashedKey != "" {
-			g.keys[item.Destination.HashedKey] = struct{}{}
+			keys = append(keys, destKey{mount, path, item.Destination.HashedKey})
 		}
 	}
 
-	for _, g := range groups {
-		data, ok, err := vc.ReadKV(ctx, g.mount, g.path)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		for k := range g.keys {
-			delete(data, k)
-		}
-		if len(data) == 0 {
-			if err := vc.DeleteKVMetadata(ctx, g.mount, g.path); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := vc.WriteKV(ctx, g.mount, g.path, data); err != nil {
+	foreign, err := r.keysOfOtherClaims(ctx, claim)
+	if err != nil {
+		return err
+	}
+	for leaf, ks := range groupByLeaf(claim.Spec.SecretsPrefix, keys, foreign) {
+		if err := removeKeys(ctx, vc, leaf.mount, leaf.path, ks); err != nil {
 			return err
 		}
 	}
@@ -377,6 +569,7 @@ func (r *VaultSecretClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findSecretClaimsForVaultConfig),
 		).
+		WithOptions(controller.Options{MaxConcurrentReconciles: max(1, r.MaxConcurrentReconciles)}).
 		Named("vaultsecretclaim").
 		Complete(r)
 }

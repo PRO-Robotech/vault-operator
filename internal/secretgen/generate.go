@@ -15,6 +15,7 @@ package secretgen
 import (
 	"crypto/rand"
 	"fmt"
+	"math"
 	"math/big"
 )
 
@@ -23,6 +24,9 @@ const (
 	DefaultCharset = "A-Za-z0-9"
 	// MinLength mirrors the CRD's generate.length minimum.
 	MinLength = 8
+	// MinEntropyBits is the floor on length × log2(distinct symbols). Only a
+	// new value is held to it: an existing one is never regenerated for it.
+	MinEntropyBits = 64
 )
 
 // Generate returns a cryptographically random string of length over charset.
@@ -38,6 +42,9 @@ func Generate(length int, charset string) (string, error) {
 	alphabet := expandCharset(charset)
 	if len(alphabet) < 2 {
 		return "", fmt.Errorf("secretgen: charset %q yields %d usable symbols, need >= 2", charset, len(alphabet))
+	}
+	if bits := float64(length) * math.Log2(float64(len(alphabet))); bits < MinEntropyBits {
+		return "", fmt.Errorf("secretgen: length %d over %d distinct symbols gives %.1f bits, need >= %d", length, len(alphabet), bits, MinEntropyBits)
 	}
 
 	n := big.NewInt(int64(len(alphabet)))
