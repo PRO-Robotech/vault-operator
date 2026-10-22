@@ -6,7 +6,7 @@
 
 | # | Шаг | Что делает | Возможные ошибки |
 |---|---|---|---|
-| 1 | **ResolveConfigAndLogin** | Получает VaultConfig из spec, проверяет что он `Reachable=True` и `SharedMountFound=True`, логинится в Vault | VaultConfig не найден → `ConfigResolved=False`; sealed/network → `VaultReachable=False` |
+| 1 | **ResolveConfigAndLogin** | Получает VaultConfig из spec, проверяет что он `Reachable=True` и `SharedMountFound=True`, убеждается, что у процесса есть токен Vault. Свежий токен запроса не стоит; вход — один на процесс и VaultConfig, все воркеры ждут его исход | VaultConfig не найден → `ConfigResolved=False`; sealed/network → `VaultReachable=False` |
 | 2 | **WaitKubeconfig** | Достаёт Secret `{clusterRef.kubeconfigSecret}` из namespace claim'а | Secret отсутствует → `KubeconfigAvailable=False`, ждём watch-события |
 | 3 | **EnsureTargetSA** | Через kubeconfig применяет (SSA) Namespace + SA `vault-token-reviewer` + ClusterRoleBinding `system:auth-delegator` в infra-кластере. Только когда `tokenReviewer.serviceAccount.autoCreate: true` | apiserver недоступен → транзиент, retry |
 | 4 | **IssueReviewerJWT** | Вызывает TokenRequest API: новый JWT для reviewer SA — на **каждом** полном проходе, потому что Step 5 перезаписывает `auth/{mount}/config` целиком (запись без `token_reviewer_jwt` стирает рецензента). В `status` JWT записывается только при плановой ротации (остаток < 30% TTL): иначе повтор упавшего claim'а патчил бы статус и обходил backoff | TokenRequest 4xx/5xx → транзиент |
@@ -22,11 +22,13 @@
 
 Когда reconcile срабатывает уже на `Ready` claim'е и `metadata.generation` не менялся, после шага 1 запускается **read-only drift-проверка**:
 
+Проверка читает только объекты заявки, поштучно: её стоимость зависит от заявки, а не от размера Vault.
+
 | Проверка | Что считается drift |
 |---|---|
-| `ListAuthMounts` | Auth-mount `{spec.auth.mountPath}/` отсутствует |
-| `ListPolicies` | Любое имя из `spec.policies[].name` отсутствует |
-| `ListKubernetesRoles` | Любая роль из spec отсутствует или есть лишняя в Vault |
+| `GET sys/auth/{mount}` | Auth-mount `{spec.auth.mountPath}/` отсутствует. Без `read` на `sys/auth/{mount}` (ответ 403) клиент один раз переходит на `GET sys/auth` и дальше читает список |
+| `GET sys/policies/acl/{name}` на каждую политику spec | Политика отсутствует (404) |
+| `GET auth/{mount}/role/{name}` на каждую роль spec и журнала | Роль из spec отсутствует; роль журнала, ушедшая из spec, ещё есть. При `Exclusive` на своём mount вместо этого один `LIST auth/{mount}/role` — лишней считается любая роль не из spec |
 | `ReadKubernetesAuthConfig` | В `auth/{mount}/config` нет рецензента: `token_reviewer_jwt_set=false` |
 
 - **Нет drift** → claim сразу остаётся `Ready`, шаги 2-7 не выполняются (экономия Vault-запросов).
@@ -55,8 +57,8 @@ Timestamps `lastReconcileAt` / `lastDriftCheckAt` / `tokenReviewerJWT.lastRotati
 Помимо периодического 10-минутного цикла, reconcile запускается на события:
 
 - Изменение `VaultClaim` (стандартный `For()`)
-- Изменение `VaultConfig` — каскад на все ссылающиеся claim'ы (cascade reconcile)
-- Создание/обновление Secret `*-infra-kubeconfig` в том же namespace — реконсилит зависимые claim'ы
+- `VaultConfig` создан, удалён, изменён его spec или переключились `Reachable`/`SharedMountFound` — реконсилятся ссылающиеся claim'ы (через индекс `spec.vaultConfigRef.name`). Проба VaultConfig, обновившая только `lastHealthCheckAt` (heartbeat раз в 5 минут) или другое условие, заявки не будит
+- Создание/обновление Secret `*-infra-kubeconfig` в том же namespace — реконсилит зависимые claim'ы. Secret'ы наблюдаются только по метаданным: тела в памяти оператора не хранятся, kubeconfig читается напрямую из API, когда он нужен проходу
 
 Это позволяет, например, сразу проснуться когда `ClusterClaim` опубликовал kubeconfig, а не ждать 5-минутный fallback.
 
