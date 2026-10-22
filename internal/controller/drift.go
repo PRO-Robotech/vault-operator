@@ -32,6 +32,7 @@ type DriftReport struct {
 	ChangedPolicies []string
 	// ReviewerJWTUnset: auth/{mount}/config has no token_reviewer_jwt.
 	ReviewerJWTUnset bool
+	AccessorChanged  bool
 }
 
 func (d DriftReport) Found() bool {
@@ -246,12 +247,12 @@ func (r *VaultClaimReconciler) detectTransitDrift(ctx context.Context, vc VaultC
 	if len(report.MissingKeys) > 0 || len(report.KeyVersionMoved) > 0 {
 		driftDetectedCounter.WithLabelValues(DriftTypeTransitKey).Inc()
 	}
-	return r.detectContentDrift(ctx, vc, claim, report)
+	return r.detectContentDrift(ctx, vc, claim, report, "")
 }
 
 // detectContentDrift compares live role and policy bodies against spec.
 // Scoped to claims declaring Transit keys; elsewhere the name check stands.
-func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport) error {
+func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport, _ string) error {
 	mount := claim.Spec.Auth.MountPath
 
 	for i := range claim.Spec.Roles {

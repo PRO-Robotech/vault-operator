@@ -351,6 +351,25 @@ func (h *harness) snapshot() []byte {
 	return out
 }
 
+// withoutGlobBindings turns production shapes into claims the current schema
+// admits on creation: it refuses a glob in a new binding, so the read-only
+// role binds a named ServiceAccount. Claims that already hold the glob are
+// covered by the upgrade test, which creates them under the legacy schema.
+func withoutGlobBindings(claims []*vaultv1alpha1.VaultClaim) []*vaultv1alpha1.VaultClaim {
+	for _, c := range claims {
+		for i := range c.Spec.Roles {
+			b := &c.Spec.Roles[i].BoundServiceAccounts
+			if b.Name == "*" {
+				b.Name = "reader"
+			}
+			if b.Namespace == "*" {
+				b.Namespace = "apps"
+			}
+		}
+	}
+	return claims
+}
+
 // prodShapedClaims are the two claim shapes production runs (census of 112
 // claims: 105 of the first, 7 of the second), with names of the same form.
 func prodShapedClaims(ns string) []*vaultv1alpha1.VaultClaim {

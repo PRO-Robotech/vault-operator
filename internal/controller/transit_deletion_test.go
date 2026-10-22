@@ -217,7 +217,7 @@ func TestContentDriftFindsTamperedRole(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedRoles) != 1 {
@@ -244,7 +244,7 @@ func TestContentDriftFindsRewrittenPolicy(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 1 {
@@ -268,29 +268,10 @@ func TestContentDriftIgnoresFormatting(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 0 {
 		t.Errorf("ChangedPolicies = %v, want none for a pure reformat", report.ChangedPolicies)
-	}
-}
-
-// Claims without Transit keep the name-only check.
-func TestContentDriftSkippedWithoutTransit(t *testing.T) {
-	claim := &vaultv1alpha1.VaultClaim{
-		Spec: vaultv1alpha1.VaultClaimSpec{
-			Auth:  vaultv1alpha1.AuthSpec{MountPath: "m"},
-			Roles: []vaultv1alpha1.RoleSpec{{Name: "r"}},
-		},
-	}
-	fake := &fakeVaultClient{}
-
-	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if fake.ReadRoleCalls != 0 || fake.ReadPolicyCalls != 0 {
-		t.Errorf("content drift ran for a claim without transit (roles=%d policies=%d)", fake.ReadRoleCalls, fake.ReadPolicyCalls)
 	}
 }

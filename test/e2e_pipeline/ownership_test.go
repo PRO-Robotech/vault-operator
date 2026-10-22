@@ -99,7 +99,7 @@ func TestGuestOnOperatorMountE2E(t *testing.T) {
 	// No reserved role list is configured: the ledger rule alone must protect
 	// a platform role the guest names.
 	squatter := guestClaim("registry", "zot-2", "platform-ro")
-	intruder := prodShapedClaims("registry")[0]
+	intruder := withoutGlobBindings(prodShapedClaims("registry"))[0]
 	intruder.Name, intruder.Spec.ClusterRef.Name = "intruder", "intruder"
 	intruder.Spec.Auth.MountPath = mgmtAuthPath
 	intruder.Spec.SecretsPrefix = "clusters/registry-intruder"
@@ -159,7 +159,7 @@ func TestOwnershipE2E(t *testing.T) {
 	h := newHarness(t, "")
 	h.vaultConfig("default", "vault-operator")
 	h.namespace("acme")
-	shapes := prodShapedClaims("acme")
+	shapes := withoutGlobBindings(prodShapedClaims("acme"))
 	r := h.reconciler(controller.OwnershipPolicy{ReservedPolicyNames: []string{"vault-operator-admin"}}, policyguard.ModeAudit)
 
 	t.Run("a policy that exists before the claim keeps its body", func(t *testing.T) {

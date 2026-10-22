@@ -111,3 +111,5 @@ func DeleteTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alp
 	}
 	return nil
 }
+
+func IsForeignReviewer(err error) bool { return false }

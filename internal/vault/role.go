@@ -32,6 +32,9 @@ type KubernetesRole struct {
 	TokenType               string `json:"token_type,omitempty"`
 	TokenNoDefaultPolicy    bool   `json:"token_no_default_policy,omitempty"`
 	TokenExplicitMaxTTLSecs int    `json:"token_explicit_max_ttl,omitempty"`
+	// AliasNameSource is sent only when set: an empty value leaves the role's
+	// stored value as it is.
+	AliasNameSource string `json:"alias_name_source,omitempty"`
 }
 
 func (c *Client) PutKubernetesRole(ctx context.Context, mount, name string, role KubernetesRole) error {

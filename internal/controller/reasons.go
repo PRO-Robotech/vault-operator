@@ -46,7 +46,8 @@ const (
 	ReasonKeyAdoptionRestricted = "KeyAdoptionRestricted"
 	// ReasonMountNotOwned (deletion only): the mount was left in place because
 	// sys/auth does not show it as this claim's.
-	ReasonMountNotOwned = "MountNotOwned"
+	ReasonMountNotOwned   = "MountNotOwned"
+	ReasonForeignReviewer = "ForeignReviewer"
 )
 
 // ReasonMountNotConfigured: a guest claim waits for its host mount to exist,

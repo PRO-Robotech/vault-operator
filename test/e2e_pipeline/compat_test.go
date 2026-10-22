@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
@@ -296,6 +297,7 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 
 	// Upgrade: new CRDs, then the new reconciler.
 	h.installCRDs(filepath.Join("..", "..", "config", "crd", "bases"))
+	h.assertGlobBindingsRatchet(claims[0])
 	upgradeStart := len(auditLines(t, audit))
 	r := h.reconciler(controller.OwnershipPolicy{}, policyguard.ModeAudit)
 	h.cycles(r, 3, claims...)
@@ -373,6 +375,51 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	}
 	if h.root(http.MethodGet, "sys/policies/acl/acme-rr0001-admin", nil) != nil {
 		t.Fatal("the refused policy reached Vault")
+	}
+}
+
+// assertGlobBindingsRatchet: the new schema refuses a glob in a new binding,
+// and a claim the legacy release admitted with one is still updated while that
+// binding stays as it is. Every write is a dry run, so Vault and the claims are
+// as the legacy release left them.
+func (h *harness) assertGlobBindingsRatchet(stored *vaultv1alpha1.VaultClaim) {
+	h.t.Helper()
+	fresh := func(name string) *vaultv1alpha1.VaultClaim {
+		c := stored.DeepCopy()
+		c.ObjectMeta = metav1.ObjectMeta{Name: name, Namespace: stored.Namespace}
+		c.Status = vaultv1alpha1.VaultClaimStatus{}
+		return c
+	}
+	if got := fresh("x").Spec.Roles[0].BoundServiceAccounts.Name; got != "*" {
+		h.t.Fatalf("the ratchet fixture binds %q, want the production glob", got)
+	}
+	// The served schema follows the CRD update with a delay: wait until the new
+	// rule answers before trusting an admission.
+	var refusal string
+	reconcileUntil(h.t, h.ctx, "new schema refuses a new glob binding", 20*time.Second, func() (bool, error) {
+		err := h.k8s.Create(h.ctx, fresh("rt0001"), client.DryRunAll)
+		if err == nil {
+			return false, nil
+		}
+		refusal = err.Error()
+		return strings.Contains(refusal, "boundServiceAccounts.name"), nil
+	})
+	h.t.Logf("new glob binding refused: %s", refusal)
+	twin := fresh("rt0002")
+	twin.Spec.Roles[0].BoundServiceAccounts = vaultv1alpha1.BoundServiceAccounts{Name: "reader", Namespace: "apps"}
+	if err := h.k8s.Create(h.ctx, twin, client.DryRunAll); err != nil {
+		h.t.Fatalf("a binding without a glob refused: %v", err)
+	}
+
+	old := h.claim(stored)
+	old.Spec.Roles[0].TokenTTL = &metav1.Duration{Duration: 2 * time.Hour}
+	if err := h.k8s.Update(h.ctx, old, client.DryRunAll); err != nil {
+		h.t.Fatalf("an update next to a stored glob binding refused: %v", err)
+	}
+	old = h.claim(stored)
+	old.Spec.Roles[0].BoundServiceAccounts.Name = "app-*"
+	if err := h.k8s.Update(h.ctx, old, client.DryRunAll); err == nil {
+		h.t.Fatal("a stored glob binding changed into another glob was admitted")
 	}
 }
 
