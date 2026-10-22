@@ -12,12 +12,16 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"text/template"
+	"time"
 
 	"sigs.k8s.io/yaml"
 
@@ -229,9 +233,10 @@ func TestRenderedIdentityPathsAreJudgedByThePolicyGuard(t *testing.T) {
 	}
 }
 
-// The renderer and the schema judge a path by one pattern: the CRD must carry
-// the constant the renderer compiles.
-func TestIdentityPathPatternIsTheOneInTheCRD(t *testing.T) {
+// crdPolicyField is the schema of spec.policies[].<field> in the VaultClaim CRD
+// the tree ships.
+func crdPolicyField(t *testing.T, field ...string) map[string]any {
+	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "vault.in-cloud.io_vaultclaims.yaml"))
 	if err != nil {
 		t.Fatalf("read CRD: %v", err)
@@ -249,18 +254,143 @@ func TestIdentityPathPatternIsTheOneInTheCRD(t *testing.T) {
 		t.Fatalf("decode CRD: %v", err)
 	}
 	node := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
-	for _, step := range []string{"spec", "policies", "identityPaths", "path"} {
+	for _, step := range append([]string{"spec", "policies"}, field...) {
 		props, _ := node["properties"].(map[string]any)
 		next, _ := props[step].(map[string]any)
 		if next == nil {
-			t.Fatalf("CRD has no %q on the way to identityPaths[].path", step)
+			t.Fatalf("CRD has no %q on the way to policies[].%s", step, strings.Join(field, "."))
 		}
 		if items, ok := next["items"].(map[string]any); ok {
 			next = items
 		}
 		node = next
 	}
+	return node
+}
+
+// The renderer and the schema judge a path by one pattern: the CRD must carry
+// the constant the renderer compiles.
+func TestIdentityPathPatternIsTheOneInTheCRD(t *testing.T) {
+	node := crdPolicyField(t, "identityPaths", "path")
 	if got, _ := node["pattern"].(string); got != vaultv1alpha1.IdentityPathPattern {
 		t.Fatalf("CRD pattern %q differs from IdentityPathPattern %q", got, vaultv1alpha1.IdentityPathPattern)
+	}
+}
+
+// The renderer and the schema bound the rules by one length.
+func TestMaxRulesLengthIsTheOneInTheCRD(t *testing.T) {
+	node := crdPolicyField(t, "rules")
+	if got, _ := node["maxLength"].(float64); int(got) != vaultv1alpha1.MaxRulesLength {
+		t.Fatalf("CRD maxLength of rules = %v, want MaxRulesLength %d", node["maxLength"], vaultv1alpha1.MaxRulesLength)
+	}
+}
+
+// renderChildEnv carries the rules a child run of the bounded-time probe renders.
+const renderChildEnv = "VAULT_OPERATOR_RENDER_PROBE_RULES"
+
+// A loop or a self-calling template in the rules is refused at once, both on
+// the apply path and on the drift check that renders every claim. The render
+// runs in a child process of the test binary, so one that does not return is
+// killed at the deadline instead of holding the run or its memory.
+func TestRenderClaimPolicyRefusesALoopWithinBoundedTime(t *testing.T) {
+	if rules, child := os.LookupEnv(renderChildEnv); child {
+		_, err := renderClaimPolicy(vaultv1alpha1.PolicySpec{Name: "p", Rules: rules}, "")
+		fmt.Printf("render outcome: %v\n", err)
+		return
+	}
+	const deadline = 10 * time.Second
+	for name, rules := range map[string]string{
+		"range over a number with a body": "{{range 100000000000}}x{{end}}",
+		"range over a number":             "{{range 100000000000}}{{end}}",
+		"self-calling template":           `{{define "a"}}{{template "a"}}{{template "a"}}{{end}}{{template "a"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), deadline)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRenderClaimPolicyRefusesALoopWithinBoundedTime$")
+			cmd.Env = append(os.Environ(), renderChildEnv+"="+rules)
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("the render of %q did not return within %s", rules, deadline)
+			}
+			if err != nil {
+				t.Fatalf("child run: %v\n%s", err, out)
+			}
+			if want := "render outcome: " + errTemplateForm.Error(); !strings.Contains(string(out), want) {
+				t.Fatalf("the render of %q was not refused as a template form:\n%s", rules, out)
+			}
+		})
+	}
+}
+
+// Only text, the accessor field, the SA functions and string constants are
+// admitted; every other construct of the template language is refused by its
+// parse tree before anything executes. The admitted twins render.
+func TestRenderClaimPolicyAdmitsOnlyTheClosedForms(t *testing.T) {
+	for _, rules := range []string{
+		`{{range 3}}x{{end}}`,
+		`{{if true}}x{{end}}`,
+		`{{with .AuthMountAccessor}}{{.}}{{end}}`,
+		`{{block "b" .}}x{{end}}`,
+		`{{define "a"}}x{{end}}{{template "a"}}`,
+		`{{printf "%09d" 1}}`,
+		`{{ .AuthMountAccessor | printf "%s" }}`,
+		`{{ len "x" }}`,
+		`{{ $x := "a" }}{{ $x }}`,
+		`{{ . }}`,
+		`{{ 1 }}`,
+		`{{ .Other }}`,
+	} {
+		_, err := renderClaimPolicy(vaultv1alpha1.PolicySpec{Name: "p", Rules: rules}, testAccessor)
+		if !errors.Is(err, errTemplateForm) {
+			t.Errorf("rules %q: err = %v, want errTemplateForm", rules, err)
+		}
+	}
+	for rules, want := range map[string]string{
+		`a {{- .AuthMountAccessor -}} b`: "a" + testAccessor + "b",
+		"{{ `x` }}":                      "x",
+		`{{ "x" }}`:                      "x",
+		`{{vaultSAName}}`:                "{{identity.entity.aliases." + testAccessor + ".metadata.service_account_name}}",
+	} {
+		got, err := renderClaimPolicy(vaultv1alpha1.PolicySpec{Name: "p", Rules: rules}, testAccessor)
+		if err != nil || got != want {
+			t.Errorf("admitted rules %q: got %q, %v; want %q", rules, got, err, want)
+		}
+	}
+}
+
+// The renderer refuses rules longer than the schema admits, so a claim stored
+// before the limit renders nothing larger; rules at the limit render.
+func TestRenderClaimPolicyRefusesRulesLongerThanTheSchema(t *testing.T) {
+	at := "#" + strings.Repeat("x", vaultv1alpha1.MaxRulesLength-1)
+	if got, err := renderClaimPolicy(vaultv1alpha1.PolicySpec{Name: "p", Rules: at}, testAccessor); err != nil || got != at {
+		t.Fatalf("rules at the limit: %d bytes, %v", len(got), err)
+	}
+	if _, err := renderClaimPolicy(vaultv1alpha1.PolicySpec{Name: "p", Rules: at + "x"}, testAccessor); !errors.Is(err, errRulesTooLong) {
+		t.Fatalf("rules past the limit: err = %v, want errRulesTooLong", err)
+	}
+}
+
+// A rendered body is bounded whatever the accessor holds, through the rules
+// and through identity paths alike; the same policy renders with an accessor
+// of the usual form.
+func TestRenderClaimPolicyBoundsTheRenderedBody(t *testing.T) {
+	long := strings.Repeat("a", 64<<10)
+	rules := strings.Repeat(`path "x/{{ .AuthMountAccessor }}" { capabilities = ["read"] }`+"\n", 8)
+	paths := make([]vaultv1alpha1.IdentityPath, 0, 8)
+	for i := range 8 {
+		paths = append(paths, vaultv1alpha1.IdentityPath{
+			Path: fmt.Sprintf("x/{serviceAccountNamespace}/{serviceAccountName}/%d", i), Capabilities: []string{"read"}})
+	}
+	for name, p := range map[string]vaultv1alpha1.PolicySpec{
+		"rules":          {Name: "p", Rules: rules},
+		"identity paths": {Name: "p", IdentityPaths: paths},
+	} {
+		if _, err := renderClaimPolicy(p, long); !errors.Is(err, errRenderTooLarge) {
+			t.Errorf("%s with a %d-byte accessor: err = %v, want errRenderTooLarge", name, len(long), err)
+		}
+		if _, err := renderClaimPolicy(p, testAccessor); err != nil {
+			t.Errorf("%s with the usual accessor: %v", name, err)
+		}
 	}
 }

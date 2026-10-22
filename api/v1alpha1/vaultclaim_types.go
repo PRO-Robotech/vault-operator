@@ -336,6 +336,10 @@ const (
 // operator to judge a path the same way when it renders one.
 const IdentityPathPattern = `^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
 
+// MaxRulesLength is the schema limit of policies[].rules in bytes, for the
+// operator to refuse a longer body the same way when it renders one.
+const MaxRulesLength = 16384
+
 // IdentityPath grants capabilities on a Vault path that names the logged-in
 // ServiceAccount.
 type IdentityPath struct {

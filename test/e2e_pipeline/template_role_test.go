@@ -196,6 +196,38 @@ func TestTemplateRoleE2E(t *testing.T) {
 		}
 	}
 
+	// Injection: a template that widens the path. The bodies as written, with
+	// each ServiceAccount segment widened to +, are read through by the same
+	// token where the probes above are refused, so those probes judge the
+	// rendered path; the bodies written back refuse again.
+	shared, _ := dataOf(h.root(http.MethodGet, "sys/policies/acl/"+id+"-shared", nil))["policy"].(string)
+	written := map[string]string{id + "-own": policy, id + "-shared": shared}
+	widen := strings.NewReplacer(
+		"{{identity.entity.aliases."+accessor+".metadata.service_account_namespace}}", "+",
+		"{{identity.entity.aliases."+accessor+".metadata.service_account_name}}", "+",
+	)
+	for name, body := range written {
+		wide := widen.Replace(body)
+		if wide == body {
+			t.Fatalf("policy %s names no ServiceAccount segment to widen: %q", name, body)
+		}
+		h.root(http.MethodPut, "sys/policies/acl/"+name, map[string]string{"policy": wide})
+	}
+	refused := []string{"ns2/a", "ns1/b", "shared/ns2"}
+	for _, path := range refused {
+		if got := h.readAs(token, "secret/data/"+prefix+"/"+path); got != http.StatusOK {
+			t.Errorf("widened path: a/ns1 reading %s: status %d, want 200 (the probe does not judge the rendered path)", path, got)
+		}
+	}
+	for name, body := range written {
+		h.root(http.MethodPut, "sys/policies/acl/"+name, map[string]string{"policy": body})
+	}
+	for _, path := range refused {
+		if got := h.readAs(token, "secret/data/"+prefix+"/"+path); got != http.StatusForbidden {
+			t.Errorf("bodies written back: a/ns1 reading %s: status %d, want 403", path, got)
+		}
+	}
+
 	// A full pass over the same Vault rewrites nothing.
 	before := h.snapshot()
 	fresh := h.claim(claim)

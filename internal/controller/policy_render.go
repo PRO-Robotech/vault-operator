@@ -31,6 +31,13 @@ const (
 	funcBareVault   = "identity"
 )
 
+// maxRenderedPolicy bounds the HCL one policy renders to. Admitted rules expand
+// at most a few times over (an SA function writes a Vault template of under a
+// hundred bytes), so a body of MaxRulesLength with identity paths stays well
+// inside it; the bound is what keeps an accessor of unexpected length from
+// growing a body without limit.
+const maxRenderedPolicy = 256 << 10
+
 // Alias metadata keys the Kubernetes auth method writes on every login.
 const (
 	metaSAName      = "service_account_name"
@@ -41,6 +48,10 @@ var (
 	errBareIdentity = errors.New("the rules use a Vault template ({{identity...}}) unescaped: " +
 		"write {{`{{`}}identity...{{`}}`}}, or use {{ vaultSAName }} / {{ vaultSANamespace }} or identityPaths")
 	errAccessorForm = errors.New("the auth mount accessor has an unexpected form")
+	errTemplateForm = errors.New("the rules use a template form outside the admitted ones " +
+		"(text, {{ .AuthMountAccessor }}, {{ vaultSAName }}, {{ vaultSANamespace }}, a string constant such as {{`{{`}})")
+	errRulesTooLong   = fmt.Errorf("the rules are longer than %d bytes", vaultv1alpha1.MaxRulesLength)
+	errRenderTooLarge = fmt.Errorf("the rendered policy is larger than %d bytes", maxRenderedPolicy)
 
 	// accessorForm is what an accessor may hold to be embedded in a Vault
 	// template; Vault's own are auth_<type>_<hex>.

@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -144,6 +145,12 @@ var _ = Describe("VaultClaim schema for template roles", func() {
 		}, false),
 		Entry("no capabilities", func(p *vaultv1alpha1.PolicySpec) {
 			p.IdentityPaths = []vaultv1alpha1.IdentityPath{{Path: "secret/data/clusters/schema/{serviceAccountName}"}}
+		}, false),
+		Entry("rules at the length limit", func(p *vaultv1alpha1.PolicySpec) {
+			p.Rules = "#" + strings.Repeat("x", vaultv1alpha1.MaxRulesLength-1)
+		}, true),
+		Entry("rules past the length limit", func(p *vaultv1alpha1.PolicySpec) {
+			p.Rules = "#" + strings.Repeat("x", vaultv1alpha1.MaxRulesLength)
 		}, false),
 	)
 })
