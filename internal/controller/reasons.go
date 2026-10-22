@@ -28,6 +28,7 @@ import (
 // Reasons a VaultClaim is refused rather than retried. Each one means "the new
 // operator declines what v0.0.9 would have applied"; a rollback to v0.0.9 is
 // allowed only while no claim carries any of them (docs/user-guide/rollback.md).
+// ReasonRenderFailed below is in the same set.
 const (
 	// ReasonOwnershipConflict: a policy, role, Transit key or KV prefix the
 	// claim declares belongs to another claim, is reserved, or already exists
@@ -70,6 +71,13 @@ const ReasonMountNotConfigured = "MountNotConfigured"
 // decided by spec and the auth mount accessor, so the claim is refused, not
 // retried: it is rendered again when spec changes or when
 // RequeueClaimRenderRefused has passed (renderRefusals).
+//
+// It is a refusal reason for the rollback gate: v0.0.9 renders rules without
+// the closed set of forms and without the size limit, so a claim refused for
+// a form outside the set (`{{ range 1e11 }}`) runs to the end under it. The
+// reason does not tell that cause from a parse error or an unescaped Vault
+// template, which v0.0.9 does not apply either; the gate counts them all, a
+// stricter gate than the causes need.
 const ReasonRenderFailed = "RenderFailed"
 
 // ReasonReconciled: Degraded=False after a pass that completed.
@@ -84,6 +92,7 @@ var RefusalReasons = []string{
 	ReasonKeyAdoptionRestricted,
 	ReasonMountNotOwned,
 	ReasonForeignReviewer,
+	ReasonRenderFailed,
 }
 
 // Failure causes, a closed set. Conditions and events carry the cause text,
