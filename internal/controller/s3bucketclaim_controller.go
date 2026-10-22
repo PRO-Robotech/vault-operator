@@ -239,7 +239,7 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 			"FindFailed", "cloud-manager lookup failed; retrying")
 		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 	}
-	cands = withoutClaimedBuckets(cands, others, login)
+	cands = withoutClaimedBuckets(cands, others, claim)
 	switch {
 	case len(cands) == 1:
 		b := cands[0]

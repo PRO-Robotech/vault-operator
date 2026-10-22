@@ -78,23 +78,26 @@ func olderClaim(a, b *vaultv1alpha1.S3BucketClaim) bool {
 // withoutClaimedBuckets drops candidates another claim already records, or
 // whose name is the derived name of another claim of the same login (a
 // "-N"-suffixed candidate can otherwise be a neighbour cluster "<name>-N").
-func withoutClaimedBuckets(cands []*cloudmanager.Bucket, others []vaultv1alpha1.S3BucketClaim, login string) []*cloudmanager.Bucket {
+// Claims with this claim's own (login, cluster) are duplicates that lost the
+// conflict check to it; they do not take its bucket away.
+func withoutClaimedBuckets(cands []*cloudmanager.Bucket, others []vaultv1alpha1.S3BucketClaim, claim *vaultv1alpha1.S3BucketClaim) []*cloudmanager.Bucket {
 	out := cands[:0:0]
 	for _, c := range cands {
-		if !claimedElsewhere(c.Name, others, login) {
+		if !claimedElsewhere(c.Name, others, claim) {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-func claimedElsewhere(name string, others []vaultv1alpha1.S3BucketClaim, login string) bool {
+func claimedElsewhere(name string, others []vaultv1alpha1.S3BucketClaim, claim *vaultv1alpha1.S3BucketClaim) bool {
+	login := claim.Spec.CustomerLogin
 	for i := range others {
 		o := &others[i]
 		if o.Status.BucketName == name || o.Spec.Bucket.Name == name {
 			return true
 		}
-		if o.Spec.CustomerLogin != login {
+		if o.Spec.CustomerLogin != login || o.Spec.ClusterRef.Name == claim.Spec.ClusterRef.Name {
 			continue
 		}
 		if i := strings.IndexByte(name, '-'); i >= 0 && name[i+1:] == bucketBaseName(o.Spec.CustomerLogin, o.Spec.ClusterRef.Name) {

@@ -287,6 +287,46 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(reasonOf(got.Status.Conditions, vaultv1alpha1.ConditionReady)).To(Equal("Conflict"))
 			Expect(srv.Creates).To(Equal(1))
 		})
+		It("does not take a neighbour cluster's \"<name>-N\" bucket while recovering a create", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-nbr")
+			// The neighbour claim's cluster is "s3nbr-1": its bucket looks like a
+			// suffixed bucket of "s3nbr".
+			nb := newS3BucketClaim("s3nbrb", "s3-cfg-nbr")
+			nb.Spec.ClusterRef.Name = "s3nbr-1"
+			Expect(k8sClient.Create(ctx, nb)).To(Succeed())
+			srv.Seed(&pb.Bucket{Name: serverName("s3nbr-1"), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+
+			makeS3BucketClaim(ctx, "s3nbr", "s3-cfg-nbr")
+			got := getS3("s3nbr")
+			got.Finalizers = []string{vaultv1alpha1.S3BucketClaimFinalizer}
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			// A create was in flight and lost: only the marker is recorded.
+			got = getS3("s3nbr")
+			got.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{
+				RequestedName: bucketBaseName(cust, "s3nbr"), Since: metav1.NewTime(time.Now().Add(-time.Hour)),
+			}
+			Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+
+			reconcileN("s3nbr", 2)
+			Expect(getS3("s3nbr").Status.BucketName).To(Equal(serverName("s3nbr")))
+		})
+
+		It("lets the older of two duplicate claims adopt its existing bucket", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-dupadopt")
+			srv.Seed(&pb.Bucket{Name: serverName("s3dupadopt"), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+			makeS3BucketClaim(ctx, "s3dupadopt", "s3-cfg-dupadopt")
+			time.Sleep(1100 * time.Millisecond) // creationTimestamp has a one-second resolution
+			b := newS3BucketClaim("s3dupadoptb", "s3-cfg-dupadopt")
+			b.Spec.ClusterRef.Name = "s3dupadopt"
+			b.Spec.Vault.SecretsPrefix = "clusters/s3dupadoptb"
+			Expect(k8sClient.Create(ctx, b)).To(Succeed())
+
+			reconcileN("s3dupadopt", 2)
+			got := getS3("s3dupadopt")
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3dupadopt")))
+			Expect(srv.Creates).To(Equal(0))
+		})
 	})
 
 	Context("state errors", func() {
