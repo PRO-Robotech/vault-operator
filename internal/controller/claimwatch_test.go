@@ -76,6 +76,24 @@ func deleteWatched(obj client.Object) {
 	}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
 }
 
+// expectNoPass expects the controller to start no pass after baseline.
+func expectNoPass(controllerName string, baseline float64, why string) {
+	Consistently(func() float64 { return reconcileTotal(controllerName) - baseline }, 3*time.Second, 100*time.Millisecond).
+		Should(BeZero(), why)
+}
+
+// addHoldFinalizer adds a test finalizer, a metadata write that changes no
+// generation, label or annotation. A conflict means another writer changed
+// the claim in between; the write is retried on the fresh copy, and whether a
+// pass ran is judged by the pass count, not by the conflict.
+func addHoldFinalizer(get func() client.Object) {
+	Eventually(func() error {
+		fresh := get()
+		fresh.SetFinalizers(append(fresh.GetFinalizers(), "vault-operator-test/hold"))
+		return k8sClient.Update(context.Background(), fresh)
+	}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
+}
+
 // expectWakes applies edit and expects the controller to start a pass.
 func expectWakes(controllerName string, edit func()) {
 	baseline := settled(controllerName)
@@ -112,11 +130,9 @@ var _ = Describe("S3BucketClaim and VaultSecretClaim watches", func() {
 		base := fresh.DeepCopy()
 		fresh.Status.Phase = vaultv1alpha1.PhaseReady
 		Expect(k8sClient.Status().Patch(context.Background(), fresh, client.MergeFrom(base))).To(Succeed())
-		fresh = getS3(name)
-		fresh.Finalizers = append(fresh.Finalizers, "vault-operator-test/hold")
-		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
-		Consistently(func() float64 { return reconcileTotal(controllerName) - baseline }, 3*time.Second, 100*time.Millisecond).
-			Should(BeZero(), "a status or finalizer write of the claim started a pass")
+		expectNoPass(controllerName, baseline, "a status write of the claim started a pass")
+		addHoldFinalizer(func() client.Object { return getS3(name) })
+		expectNoPass(controllerName, baseline, "a finalizer write of the claim started a pass")
 
 		expectWakes(controllerName, func() {
 			fresh := getS3(name)
@@ -170,11 +186,9 @@ var _ = Describe("S3BucketClaim and VaultSecretClaim watches", func() {
 		base := fresh.DeepCopy()
 		fresh.Status.Phase = vaultv1alpha1.PhaseReady
 		Expect(k8sClient.Status().Patch(context.Background(), fresh, client.MergeFrom(base))).To(Succeed())
-		fresh = get()
-		fresh.Finalizers = append(fresh.Finalizers, "vault-operator-test/hold")
-		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
-		Consistently(func() float64 { return reconcileTotal(controllerName) - baseline }, 3*time.Second, 100*time.Millisecond).
-			Should(BeZero(), "a status or finalizer write of the claim started a pass")
+		expectNoPass(controllerName, baseline, "a status write of the claim started a pass")
+		addHoldFinalizer(func() client.Object { return get() })
+		expectNoPass(controllerName, baseline, "a finalizer write of the claim started a pass")
 
 		expectWakes(controllerName, func() {
 			fresh := get()
@@ -315,6 +329,7 @@ var _ = Describe("S3BucketClaim and VaultSecretClaim status texts", func() {
 		got := getVSC(name)
 		cond = findCond(got.Status.Conditions, vaultv1alpha1.ConditionSourcesResolved)
 		Expect(cond).NotTo(BeNil())
+		Expect(cond.Message).NotTo(ContainSubstring(vaultAddr))
 		Expect(cond.Reason).To(Equal("MissingSource"))
 		Expect(cond.Message).To(Equal(`item "grafana-oidc": reading source secret/system/dex failed: the remote endpoint is unreachable`))
 		expectNoAddress(got.Status.Conditions, recorder)
