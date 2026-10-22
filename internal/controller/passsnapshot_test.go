@@ -92,9 +92,11 @@ var _ = Describe("A pass works on the spec it admitted", func() {
 		evil := role("metrics-reader", "vault-operator-admin")
 		recon.Client = editOnIntent(name, rolesIntent, &evil, &fired)
 
-		_, _ = reconcileClaim(recon, name)
+		res, _ := reconcileClaim(recon, name)
 		Expect(fired).To(BeTrue(), "the edit landed during the roles intent")
 		Expect(fakeVC.WrittenRoles["metrics-reader"].TokenPolicies).To(Equal([]string{"metrics"}))
+		Expect(fakeVC.PutRoleCalls).To(Equal(0), "the pass stopped at the intent that saw the edit")
+		Expect(res.RequeueAfter).To(Equal(RequeueClaimSpecChanged))
 		got := claimNamed(name)
 		Expect(got.Generation).To(Equal(int64(2)))
 		Expect(got.Status.ObservedGeneration).NotTo(Equal(got.Generation), "a pass that never applied generation 2 reported it observed")
@@ -135,6 +137,7 @@ var _ = Describe("A pass works on the spec it admitted", func() {
 		_, _ = reconcileClaim(recon, name)
 		Expect(fired).To(BeTrue())
 		Expect(fakeVC.WrittenRoles).NotTo(HaveKey(name + "-evil"))
+		Expect(fakeVC.EnableAuthCalls).To(Equal(0), "the pass stopped at the intent that saw the edit")
 		got := claimNamed(name)
 		Expect(got.Status.ObservedGeneration).NotTo(Equal(got.Generation))
 
