@@ -398,6 +398,37 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(purgeAndLook("s3sdr", neighbour)).To(Equal(pb.Status_RUNNING))
 		})
 
+		It("rejects a create response that changed the numeric cluster suffix", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-number")
+			// cloud-manager increments an existing numeric tail instead of
+			// appending a new suffix: s3number-11 becomes s3number-12.
+			srv.Seed(&pb.Bucket{Name: serverName("s3number-11"), CustLogin: cust, Status: pb.Status_REMOVED})
+			makeS3BucketClaim(ctx, "s3number-11", "s3-cfg-number")
+			reconcileN("s3number-11", 2)
+
+			got := getS3("s3number-11")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(srv.Get(serverName("s3number-12"))).NotTo(BeNil())
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(got.Status.PendingCreate).NotTo(BeNil())
+			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
+			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))
+		})
+
+		It("accepts a create response with an appended suffix when the base was taken", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-appended")
+			srv.Seed(&pb.Bucket{Name: serverName("s3appended"), CustLogin: cust, Status: pb.Status_REMOVED})
+			makeS3BucketClaim(ctx, "s3appended", "s3-cfg-appended")
+			reconcileN("s3appended", 2)
+
+			got := getS3("s3appended")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3appended") + "-1"))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(purgeAndLook("s3appended", serverName("s3appended")+"-1")).To(Equal(pb.Status_REMOVED))
+		})
+
 		It("records a suffixed bucket it cannot prove as its own as Adopted, so Purge does not remove it", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-sfx")
 			// A previous bucket of this cluster is REMOVED and an unclaimed
