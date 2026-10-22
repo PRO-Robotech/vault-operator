@@ -30,3 +30,20 @@ jobs:
         run: |
           go mod tidy
           make test-e2e
+
+  test-e2e-pipeline:
+    name: Pipeline e2e (envtest + Vault dev)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Downloads the pinned, checksum-verified vault binary; a missing
+      # binary fails the run instead of skipping it.
+      - name: Running pipeline e2e
+        run: make test-e2e-pipeline

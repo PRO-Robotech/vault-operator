@@ -32,7 +32,12 @@ import (
 	pb "github.com/PRO-Robotech/vault-operator/internal/cloudmanager/proto"
 )
 
-const s3TestDest = "s3"
+const (
+	s3TestDest = "s3"
+	// s3Foreign is a value written into the claim's leaf by someone else.
+	s3Foreign = "theirs"
+	s3Cust    = "cust1"
+)
 
 func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Result, error) {
 	return r.Reconcile(context.Background(), reconcile.Request{
@@ -40,13 +45,13 @@ func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Res
 	})
 }
 
-func newS3BucketClaim(name, configName, custLogin string) *vaultv1alpha1.S3BucketClaim {
+func newS3BucketClaim(name, configName string) *vaultv1alpha1.S3BucketClaim {
 	return &vaultv1alpha1.S3BucketClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: vaultv1alpha1.S3BucketClaimSpec{
 			VaultConfigRef: vaultv1alpha1.VaultConfigRef{Name: configName},
 			ClusterRef:     vaultv1alpha1.SecretClusterRef{Name: name},
-			CustomerLogin:  custLogin,
+			CustomerLogin:  s3Cust,
 			Region:         "ru1",
 			Bucket:         vaultv1alpha1.S3BucketSpec{ManagedBy: cloudmanager.ManagedBySystem, ConfigurationID: "s3_v1"},
 			Vault:          vaultv1alpha1.S3VaultSpec{SecretsPrefix: "clusters/" + name, DestinationPath: s3TestDest},
@@ -55,8 +60,8 @@ func newS3BucketClaim(name, configName, custLogin string) *vaultv1alpha1.S3Bucke
 	}
 }
 
-func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) {
-	Expect(k8sClient.Create(ctx, newS3BucketClaim(name, configName, custLogin))).To(Succeed())
+func makeS3BucketClaim(ctx context.Context, name, configName string) {
+	Expect(k8sClient.Create(ctx, newS3BucketClaim(name, configName))).To(Succeed())
 }
 
 func getS3(name string) *vaultv1alpha1.S3BucketClaim {
@@ -82,7 +87,7 @@ func reasonOf(conds []metav1.Condition, condType string) string {
 }
 
 var _ = Describe("S3BucketClaim Controller", func() {
-	const cust = "cust1"
+	const cust = s3Cust
 	var (
 		fakeSV *fakeSecretVaultClient
 		srv    *cmfake.Server
@@ -103,7 +108,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 	}
 	readyClaim := func(cfgName, name string) *vaultv1alpha1.S3BucketClaim {
 		makeHealthyVaultConfig(ctx, cfgName)
-		makeS3BucketClaim(ctx, name, cfgName, cust)
+		makeS3BucketClaim(ctx, name, cfgName)
 		reconcileN(name, 2)
 		got := getS3(name)
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
@@ -166,7 +171,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("adopts a bucket of its own login found before create, and does not create", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-adopt")
 			srv.Seed(&pb.Bucket{Name: serverName("s3adopt"), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			makeS3BucketClaim(ctx, "s3adopt", "s3-cfg-adopt", cust)
+			makeS3BucketClaim(ctx, "s3adopt", "s3-cfg-adopt")
 			reconcileN("s3adopt", 2)
 
 			got := getS3("s3adopt")
@@ -179,7 +184,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("does not adopt a same-named bucket of another login", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-foreignname")
 			srv.Seed(&pb.Bucket{Name: serverName("s3foreignname"), CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			makeS3BucketClaim(ctx, "s3foreignname", "s3-cfg-foreignname", cust)
+			makeS3BucketClaim(ctx, "s3foreignname", "s3-cfg-foreignname")
 			reconcileN("s3foreignname", 2)
 
 			got := getS3("s3foreignname")
@@ -190,7 +195,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 		It("survives a lost status patch after create without creating a second bucket", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-crash")
-			makeS3BucketClaim(ctx, "s3crash", "s3-cfg-crash", cust)
+			makeS3BucketClaim(ctx, "s3crash", "s3-cfg-crash")
 
 			// The first pass loses every status patch that would record the name.
 			ww, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
@@ -224,7 +229,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("adopts an explicitly named bucket and never creates", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-named")
 			srv.Seed(&pb.Bucket{Name: "ffff00-shared-bucket", CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			c := newS3BucketClaim("s3named", "s3-cfg-named", cust)
+			c := newS3BucketClaim("s3named", "s3-cfg-named")
 			c.Spec.Bucket.Name = "ffff00-shared-bucket"
 			Expect(k8sClient.Create(ctx, c)).To(Succeed())
 			reconcileN("s3named", 2)
@@ -239,7 +244,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("refuses an explicitly named bucket of another login, and retries later", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-namedforeign")
 			srv.Seed(&pb.Bucket{Name: "ffff00-foreign-bucket", CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			c := newS3BucketClaim("s3namedforeign", "s3-cfg-namedforeign", cust)
+			c := newS3BucketClaim("s3namedforeign", "s3-cfg-namedforeign")
 			c.Spec.Bucket.Name = "ffff00-foreign-bucket"
 			Expect(k8sClient.Create(ctx, c)).To(Succeed())
 			res := reconcileN("s3namedforeign", 2)
@@ -255,7 +260,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("fails a missing s3 configuration as a spec error that is retried", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-cnf")
 			srv.CreateError = &pb.CreateError{Code: pb.CreateError_CONFIGURATION_NOT_FOUND, Message: "nope"}
-			makeS3BucketClaim(ctx, "s3cnf", "s3-cfg-cnf", cust)
+			makeS3BucketClaim(ctx, "s3cnf", "s3-cfg-cnf")
 			res := reconcileN("s3cnf", 2)
 
 			got := getS3("s3cnf")
@@ -267,9 +272,9 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 		It("loses the younger of two claims on the same (login, cluster) without creating for it", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-dup")
-			makeS3BucketClaim(ctx, "s3dupa", "s3-cfg-dup", cust)
+			makeS3BucketClaim(ctx, "s3dupa", "s3-cfg-dup")
 			time.Sleep(1100 * time.Millisecond) // creationTimestamp has a one-second resolution
-			b := newS3BucketClaim("s3dupb", "s3-cfg-dup", cust)
+			b := newS3BucketClaim("s3dupb", "s3-cfg-dup")
 			b.Spec.ClusterRef.Name = "s3dupa"
 			b.Spec.Vault.SecretsPrefix = "clusters/s3dupb"
 			Expect(k8sClient.Create(ctx, b)).To(Succeed())
@@ -319,18 +324,18 @@ var _ = Describe("S3BucketClaim Controller", func() {
 				}
 				injected = true
 				d := cloneData(fakeSV.store[mount+"|"+path])
-				d["registry"] = "theirs"
+				d["registry"] = s3Foreign
 				fakeSV.seed(mount, path, d)
 			}
 			reconcileN("s3race", 2)
 			leaf := s3Leaf(fakeSV, "s3race", s3TestDest)
-			Expect(leaf["registry"]).To(Equal("theirs"))
+			Expect(leaf["registry"]).To(Equal(s3Foreign))
 			Expect(leaf["accessKey"]).To(HavePrefix("AK-"))
 		})
 
 		It("moves its keys on a destinationPath change and leaves a foreign value in place", func() {
 			got := readyClaim("s3-cfg-move", "s3move")
-			fakeSV.store["secret|clusters/s3move/s3"]["registry"] = "theirs"
+			fakeSV.store["secret|clusters/s3move/s3"]["registry"] = s3Foreign
 
 			got.Spec.Vault.DestinationPath = "backup/s3"
 			Expect(k8sClient.Update(ctx, got)).To(Succeed())
@@ -338,7 +343,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 			Expect(s3Leaf(fakeSV, "s3move", "backup/s3")["accessKey"]).To(HavePrefix("AK-"))
 			old := s3Leaf(fakeSV, "s3move", s3TestDest)
-			Expect(old).To(Equal(map[string]any{"registry": "theirs"}))
+			Expect(old).To(Equal(map[string]any{"registry": s3Foreign}))
 			Expect(getS3("s3move").Status.WrittenPath).To(Equal("backup/s3"))
 		})
 
@@ -359,7 +364,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 	Context("deletion with Purge", func() {
 		It("removes its Created bucket, waits for REMOVED, then removes only its own keys", func() {
 			readyClaim("s3-cfg-purge", "s3purge")
-			fakeSV.store["secret|clusters/s3purge/s3"]["registry"] = "theirs"
+			fakeSV.store["secret|clusters/s3purge/s3"]["registry"] = s3Foreign
 			deleteClaim("s3purge")
 
 			reconcileN("s3purge", 1) // remove requested: REMOVING
@@ -373,7 +378,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 			reconcileN("s3purge", 1) // REMOVED
 			Expect(s3Gone("s3purge")).To(BeTrue())
-			Expect(s3Leaf(fakeSV, "s3purge", s3TestDest)).To(Equal(map[string]any{"registry": "theirs"}))
+			Expect(s3Leaf(fakeSV, "s3purge", s3TestDest)).To(Equal(map[string]any{"registry": s3Foreign}))
 		})
 
 		It("deletes the KV leaf when only its own keys were there", func() {
@@ -388,7 +393,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-nobucket")
 			srv.CreateError = &pb.CreateError{Code: pb.CreateError_INVALID_BUCKET_NAME, Message: "bad"}
 			srv.Seed(&pb.Bucket{Name: "beefbeef-unrelated", CustLogin: cust, Status: pb.Status_RUNNING})
-			makeS3BucketClaim(ctx, "s3nobucket", "s3-cfg-nobucket", cust)
+			makeS3BucketClaim(ctx, "s3nobucket", "s3-cfg-nobucket")
 			reconcileN("s3nobucket", 2)
 			Expect(getS3("s3nobucket").Status.BucketName).To(BeEmpty())
 
@@ -430,7 +435,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("blocks an Adopted bucket until purgeAdopted is set", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-adoptpurge")
 			srv.Seed(&pb.Bucket{Name: serverName("s3adoptpurge"), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			makeS3BucketClaim(ctx, "s3adoptpurge", "s3-cfg-adoptpurge", cust)
+			makeS3BucketClaim(ctx, "s3adoptpurge", "s3-cfg-adoptpurge")
 			reconcileN("s3adoptpurge", 2)
 			deleteClaim("s3adoptpurge")
 			reconcileN("s3adoptpurge", 1)
@@ -469,7 +474,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		legacyClaim := func(cfgName, name, reason string) {
 			makeHealthyVaultConfig(ctx, cfgName)
 			srv.Seed(&pb.Bucket{Name: serverName(name), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-old", SecretKey: "SK-old"})
-			makeS3BucketClaim(ctx, name, cfgName, cust)
+			makeS3BucketClaim(ctx, name, cfgName)
 			got := getS3(name)
 			got.Finalizers = []string{vaultv1alpha1.S3BucketClaimFinalizer}
 			Expect(k8sClient.Update(ctx, got)).To(Succeed())
@@ -525,7 +530,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		It("self-heals a status holding the requested (pre-prefix) name", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-heal")
 			srv.Seed(&pb.Bucket{Name: serverName("s3heal"), CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
-			makeS3BucketClaim(ctx, "s3heal", "s3-cfg-heal", cust)
+			makeS3BucketClaim(ctx, "s3heal", "s3-cfg-heal")
 			got := getS3("s3heal")
 			got.Status.BucketName = bucketBaseName(cust, "s3heal")
 			got.Status.Conditions = []metav1.Condition{{
@@ -545,17 +550,17 @@ var _ = Describe("S3BucketClaim Controller", func() {
 	Context("schema", func() {
 		It("rejects an absolute or escaping destinationPath and accepts a relative one", func() {
 			for _, p := range []string{"/abs", "a/../b", ".."} {
-				c := newS3BucketClaim("s3celbad", "x", cust)
+				c := newS3BucketClaim("s3celbad", "x")
 				c.Spec.Vault.DestinationPath = p
 				Expect(k8sClient.Create(ctx, c)).NotTo(Succeed(), "destinationPath %q", p)
 			}
-			c := newS3BucketClaim("s3celok", "x", cust)
+			c := newS3BucketClaim("s3celok", "x")
 			c.Spec.Vault.DestinationPath = "apps/registry"
 			Expect(k8sClient.Create(ctx, c)).To(Succeed())
 		})
 
 		It("keeps spec.bucket.name immutable", func() {
-			c := newS3BucketClaim("s3celname", "x", cust)
+			c := newS3BucketClaim("s3celname", "x")
 			c.Spec.Bucket.Name = "abc-one"
 			Expect(k8sClient.Create(ctx, c)).To(Succeed())
 			got := getS3("s3celname")
@@ -566,7 +571,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(k8sClient.Update(ctx, got)).NotTo(Succeed())
 
 			// Twin: a claim created without a name cannot get one later either.
-			d := newS3BucketClaim("s3celnoname", "x", cust)
+			d := newS3BucketClaim("s3celnoname", "x")
 			Expect(k8sClient.Create(ctx, d)).To(Succeed())
 			gd := getS3("s3celnoname")
 			gd.Spec.Bucket.Name = "abc-late"

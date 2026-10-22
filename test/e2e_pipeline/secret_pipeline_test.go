@@ -15,7 +15,6 @@ package e2e_pipeline
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,20 +41,13 @@ const (
 )
 
 // TestSecretPipelineE2E exercises the VaultSecretClaim pipeline (generate +
-// copy + Purge) against a real `vault server -dev` and envtest. Skips if the
+// copy + Purge) against a real `vault server -dev` and envtest. Fails if the
 // vault binary or envtest assets are unavailable.
 func TestSecretPipelineE2E(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	vaultSrv, err := NewVaultDevServer(ctx)
-	if err != nil {
-		if errors.Is(err, ErrVaultBinaryMissing) {
-			t.Skipf("vault binary not in PATH; skipping secret pipeline e2e: %v", err)
-		}
-		t.Fatalf("start vault dev: %v", err)
-	}
-	defer func() { _ = vaultSrv.Close() }()
+	vaultSrv := StartVaultDev(ctx, t)
 
 	if err := EnsureKVMount(ctx, vaultSrv, sharedKVMount); err != nil {
 		t.Fatalf("ensure KV mount: %v", err)
@@ -224,6 +216,48 @@ func TestSecretPipelineE2E(t *testing.T) {
 	}
 	if bh, _ := argocd["admin.passwordBcrypt"].(string); !strings.HasPrefix(bh, "$2a$") {
 		t.Fatalf("admin.passwordBcrypt = %q, want $2a$ prefix", bh)
+	}
+
+	// An item dropped from the spec takes its key with it; the neighbour key
+	// in the same leaf is untouched (checked in Vault, not in a fake).
+	got := &vaultv1alpha1.VaultSecretClaim{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, got); err != nil {
+		t.Fatalf("get claim: %v", err)
+	}
+	got.Spec.SecretList = append(got.Spec.SecretList, vaultv1alpha1.SecretListItem{
+		Name:        "argocd-extra",
+		Type:        vaultv1alpha1.SecretTypeGenerate,
+		Destination: vaultv1alpha1.DestinationSpec{Path: "argocd", Key: "extra"},
+		Generate:    &vaultv1alpha1.GenerateSpec{Length: 16, Hash: vaultv1alpha1.HashNone},
+	})
+	if err := k8sClient.Update(ctx, got); err != nil {
+		t.Fatalf("add item: %v", err)
+	}
+	if _, err := claimReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}}); err != nil {
+		t.Fatalf("reconcile after add: %v", err)
+	}
+	if argocd, err = ReadKVRoot(ctx, vaultSrv, sharedKVMount, "clusters/"+secretClaimName+"/argocd"); err != nil || argocd["extra"] == nil {
+		t.Fatalf("extra key not written: %v %v", argocd, err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, got); err != nil {
+		t.Fatalf("get claim: %v", err)
+	}
+	got.Spec.SecretList = got.Spec.SecretList[:len(got.Spec.SecretList)-1]
+	if err := k8sClient.Update(ctx, got); err != nil {
+		t.Fatalf("drop item: %v", err)
+	}
+	if _, err := claimReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}}); err != nil {
+		t.Fatalf("reconcile after drop: %v", err)
+	}
+	after, err := ReadKVRoot(ctx, vaultSrv, sharedKVMount, "clusters/"+secretClaimName+"/argocd")
+	if err != nil {
+		t.Fatalf("read argocd after drop: %v", err)
+	}
+	if _, ok := after["extra"]; ok {
+		t.Fatalf("dropped item's key still present: %v", after)
+	}
+	if after["admin.password"] != pw {
+		t.Fatalf("neighbour key changed: %v, want %q", after["admin.password"], pw)
 	}
 
 	// Delete with Purge → secrets removed.

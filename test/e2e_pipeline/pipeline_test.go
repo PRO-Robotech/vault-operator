@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -57,23 +56,15 @@ const (
 )
 
 // TestPipelineE2E exercises the full VaultClaim pipeline against a real
-// `vault server -dev` and envtest's kube-apiserver. Skips if either is
-// unavailable (vault binary missing / KUBEBUILDER_ASSETS unset).
+// `vault server -dev` and envtest's kube-apiserver. Fails if either is
+// unavailable: a skipped run executes nothing.
 func TestPipelineE2E(t *testing.T) {
 	logf.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(os.Stderr)))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Spawn Vault dev (skip if binary missing).
-	vaultSrv, err := NewVaultDevServer(ctx)
-	if err != nil {
-		if errors.Is(err, ErrVaultBinaryMissing) {
-			t.Skipf("vault binary not in PATH; skipping pipeline e2e: %v", err)
-		}
-		t.Fatalf("start vault dev: %v", err)
-	}
-	defer func() { _ = vaultSrv.Close() }()
+	vaultSrv := StartVaultDev(ctx, t)
 
 	if err := EnsureKVMount(ctx, vaultSrv, sharedKVMount); err != nil {
 		t.Fatalf("ensure KV mount: %v", err)

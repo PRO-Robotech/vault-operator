@@ -473,7 +473,7 @@ func (r *VaultSecretClaimReconciler) clientForDeletion(ctx context.Context, clai
 // leaf left empty is deleted.
 func (r *VaultSecretClaimReconciler) purge(ctx context.Context, vc SecretVaultClient, defMount string, claim *vaultv1alpha1.VaultSecretClaim) error {
 	journaled := map[string]bool{}
-	var keys []destKey
+	keys := make([]destKey, 0, 2*(len(claim.Status.Items)+len(claim.Spec.SecretList))+len(claim.Status.Orphans))
 	for i := range claim.Status.Items {
 		if d := claim.Status.Items[i].Destination; d != nil {
 			journaled[claim.Status.Items[i].Name] = true

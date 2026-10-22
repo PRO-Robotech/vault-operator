@@ -55,16 +55,18 @@ func copyItem() *vaultv1alpha1.SecretListItem {
 	}
 }
 
+const dexValue = "abc"
+
 func TestApplyCopy_WritesAndDetectsNoChange(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
 	item := copyItem()
 
 	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 	if err != nil || !changed {
 		t.Fatalf("first apply: changed=%v err=%v", changed, err)
 	}
-	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "abc" {
+	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != dexValue {
 		t.Fatalf("destination = %v", got)
 	}
 
@@ -79,7 +81,7 @@ func TestApplyCopy_WritesAndDetectsNoChange(t *testing.T) {
 
 func TestApplyCopy_RecopiesOnSourceChange(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
 	item := copyItem()
 	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 
@@ -95,7 +97,7 @@ func TestApplyCopy_RecopiesOnSourceChange(t *testing.T) {
 
 func TestApplyCopy_RepairsAnEditedDestination(t *testing.T) {
 	kv := newFakeKV()
-	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	kv.seed("system/dex", map[string]any{"staticClient": dexValue})
 	item := copyItem()
 	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 
@@ -104,7 +106,7 @@ func TestApplyCopy_RepairsAnEditedDestination(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("expected a repair: changed=%v err=%v", changed, err)
 	}
-	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "abc" {
+	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != dexValue {
 		t.Fatalf("destination not repaired: %v", got)
 	}
 }

@@ -259,7 +259,7 @@ func (c *Client) FindByRequested(ctx context.Context, custLogin, requestedName s
 		return nil, err
 	}
 	re := requestedNameRe(requestedName, allowSuffix)
-	var out []*Bucket
+	out := make([]*Bucket, 0, len(resp.GetBucket()))
 	for _, b := range resp.GetBucket() {
 		if b.GetCustLogin() != custLogin || !re.MatchString(b.GetName()) {
 			continue

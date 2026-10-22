@@ -12,8 +12,10 @@ You may obtain a copy of the License at
 // VaultClaim / VaultSecretClaim pipelines against a real `vault server -dev`
 // instance plus envtest k8s. Build-gated with `e2e`.
 //
-// These tests skip cleanly when the `vault` binary is not in PATH, so the
-// local dev workflow (`make test`) is unaffected.
+// They are not part of `make test` (build tag), and they fail, not skip, when
+// the `vault` binary is missing or is not the version in VAULT_VERSION: a
+// skipped run executes nothing and must not read as green. `make
+// test-e2e-pipeline` downloads the pinned binary into bin/.
 package e2e_pipeline
 
 import (
@@ -23,10 +25,34 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"strings"
 	"syscall"
+	"testing"
 	"time"
 )
+
+// StartVaultDev starts a dev Vault for t, failing t when the binary is
+// missing or its version differs from VAULT_VERSION (when set).
+func StartVaultDev(ctx context.Context, t *testing.T) *VaultDevServer {
+	t.Helper()
+	if want := os.Getenv("VAULT_VERSION"); want != "" {
+		out, err := exec.CommandContext(ctx, "vault", "version").CombinedOutput()
+		if err != nil {
+			t.Fatalf("vault version: %v (%s)", err, out)
+		}
+		if !strings.Contains(string(out), "v"+want+" ") && !strings.HasSuffix(strings.TrimSpace(string(out)), "v"+want) {
+			t.Fatalf("vault binary is %q, VAULT_VERSION wants %s", strings.TrimSpace(string(out)), want)
+		}
+	}
+	srv, err := NewVaultDevServer(ctx)
+	if err != nil {
+		t.Fatalf("start vault dev: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv
+}
 
 // VaultDevServer is a process handle for an out-of-process `vault server -dev`
 // instance. Use NewVaultDevServer to spawn one and call Close to terminate.
@@ -48,7 +74,7 @@ const devRootToken = "root-e2e"
 // NewVaultDevServer spawns `vault server -dev` on a self-allocated port (Vault's
 // `-dev-listen-address=:0` reports a literal ":0" we can't parse back) with a
 // known root token, then waits until the API answers. A missing `vault` binary
-// returns an error wrapping ErrVaultBinaryMissing — callers should Skip.
+// returns an error wrapping ErrVaultBinaryMissing.
 func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 	if _, err := exec.LookPath("vault"); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrVaultBinaryMissing, err)
@@ -94,7 +120,7 @@ func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 }
 
 // ErrVaultBinaryMissing is wrapped by NewVaultDevServer when `vault` is not in
-// PATH. Test fixtures should `errors.Is` this and Skip rather than Fail.
+// PATH.
 var ErrVaultBinaryMissing = errors.New("vault binary not found in PATH")
 
 // freePort asks the OS for an unused TCP port on loopback. There is a small
