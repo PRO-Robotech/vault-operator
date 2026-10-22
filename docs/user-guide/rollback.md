@@ -15,16 +15,18 @@ kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json
 
 ## Условие 2: нет отвергнутых заявок
 
-Заявка, которой новый выпуск отказал, под v0.0.9 будет применена: политика вне ограды запишется, чужая роль перезапишется.
+Заявка, которой новый выпуск отказал, под v0.0.9 будет применена: политика вне ограды запишется, чужая роль перезапишется, `rules` с формой вне закрытого набора (`RenderFailed`, например `{{ range 1e11 }}{{ end }}`) отрендерятся без ограничений по времени и размеру.
 
 ```bash
 kubectl --kubeconfig <kubeconfig> --context <context> get vaultclaims -A -o json \
   | jq '[.items[] | select(any(.status.conditions[]?; .reason as $r
-        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned","ForeignReviewer"]
+        | ["OwnershipConflict","PolicyGuardViolation","PolicyReferenceForbidden","MountConflict","KeyAdoptionRestricted","MountNotOwned","ForeignReviewer","RenderFailed"]
         | index($r)))] | length'
 ```
 
 Должно быть `0`. Каждую такую заявку удаляют **до** отката, пока работает новый выпуск: он снимает только имена из её журнала, а отвергнутого в журнале нет.
+
+`RenderFailed` считается целиком: причина не отличает форму вне набора от ошибки разбора или неэкранированного шаблона Vault, которые v0.0.9 тоже не применит. Шлюз от этого строже, чем нужно, но не пропускает ни одной заявки, которую v0.0.9 исполнил бы без ограничений.
 
 ## Условие 3: нет полей шаблонной роли
 
