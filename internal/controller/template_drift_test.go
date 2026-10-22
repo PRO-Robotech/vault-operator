@@ -234,26 +234,14 @@ func TestApplyPoliciesRendersAgainOnAChangedAccessor(t *testing.T) {
 	if claim.Status.Vault.AuthMountAccessor != "auth_kubernetes_new" {
 		t.Fatalf("status accessor = %q", claim.Status.Vault.AuthMountAccessor)
 	}
-	if got := drainEvents(rec); !strings.Contains(got, "AuthMountAccessorChanged") {
+	if got := strings.Join(drainEvents(rec), "\n"); !strings.Contains(got, "AuthMountAccessorChanged") {
 		t.Fatalf("no AuthMountAccessorChanged event: %q", got)
 	}
 
 	if _, err := r.stepApplyPolicies(context.Background(), claim, state); err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
-	if got := drainEvents(rec); strings.Contains(got, "AuthMountAccessorChanged") {
+	if got := strings.Join(drainEvents(rec), "\n"); strings.Contains(got, "AuthMountAccessorChanged") {
 		t.Fatalf("unchanged accessor reported: %q", got)
-	}
-}
-
-func drainEvents(rec *record.FakeRecorder) string {
-	var out []string
-	for {
-		select {
-		case e := <-rec.Events:
-			out = append(out, e)
-		default:
-			return strings.Join(out, "\n")
-		}
 	}
 }
