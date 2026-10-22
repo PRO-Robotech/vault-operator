@@ -58,7 +58,7 @@ func main() {
 	var pprofAddr string
 	var cloudManagerAddr string
 	var defaultS3ConfigurationID string
-	var cmTimeout, cmKeepalive time.Duration
+	var cmTimeout, cmCreateTimeout, cmKeepalive time.Duration
 	var cmFindByBucket bool
 	var cmFindRetries int
 	var concurrentReconciles int
@@ -88,7 +88,10 @@ func main() {
 	flag.StringVar(&defaultS3ConfigurationID, "default-s3-configuration-id", "s3_v1",
 		"cloud-manager S3 configuration id used when spec.bucket.configurationId is empty.")
 	flag.DurationVar(&cmTimeout, "cloud-manager-timeout", 15*time.Second,
-		"Deadline of every cloud-manager call.")
+		"Deadline of a cloud-manager findAll or removeBucket call.")
+	flag.DurationVar(&cmCreateTimeout, "cloud-manager-create-timeout", cloudmanager.DefaultOptions().CreateTimeout,
+		"Deadline of a cloud-manager create. Kept above the server's create latency: a create cut by the "+
+			"client still runs on the server, and a repeat of the same name may meet its half-made state.")
 	flag.DurationVar(&cmKeepalive, "cloud-manager-keepalive", 0,
 		"gRPC keepalive ping interval while a cloud-manager call is active; 0 disables pings.")
 	flag.BoolVar(&cmFindByBucket, "cloud-manager-find-by-bucket", true,
@@ -159,12 +162,13 @@ func main() {
 	}
 
 	buckets, err := cloudmanager.NewWithOptions(cloudManagerAddr, cloudmanager.Options{
-		CallTimeout:  cmTimeout,
-		Keepalive:    cmKeepalive,
-		FindByBucket: cmFindByBucket,
-		FindRetries:  cmFindRetries,
-		QPS:          cmQPS,
-		Burst:        cmBurst,
+		CallTimeout:   cmTimeout,
+		CreateTimeout: cmCreateTimeout,
+		Keepalive:     cmKeepalive,
+		FindByBucket:  cmFindByBucket,
+		FindRetries:   cmFindRetries,
+		QPS:           cmQPS,
+		Burst:         cmBurst,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create cloud-manager client", "addr", cloudManagerAddr)

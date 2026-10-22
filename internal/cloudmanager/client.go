@@ -68,7 +68,27 @@ var (
 	ErrAlreadyRemoved = errors.New("cloud-manager: bucket already removed")
 	// ErrRemoveFailed: removeBucket answered a text outside the known vocabulary.
 	ErrRemoveFailed = errors.New("cloud-manager: remove failed")
+	// ErrCreateRejected: create answered an error code outside the mapped set,
+	// CODE_RESERVED (no code) included. The server may have done part of the
+	// work: on system-test it answered "failed to create user: user already
+	// exists" for a name whose user it had made without the bucket.
+	ErrCreateRejected = errors.New("cloud-manager: create rejected")
 )
+
+// CreateRejectedError is a create answered with an error code outside the
+// mapped set. Code is the enum name (a closed set); Message is the server's
+// free text, for the log only.
+type CreateRejectedError struct {
+	Code    string
+	Message string
+}
+
+func (e *CreateRejectedError) Error() string {
+	return fmt.Sprintf("%s [%s]: %s", ErrCreateRejected, e.Code, e.Message)
+}
+
+// Is makes errors.Is(err, ErrCreateRejected) hold.
+func (e *CreateRejectedError) Is(target error) bool { return target == ErrCreateRejected }
 
 // removeBucket answers outside of success; the vocabulary is closed.
 const (
@@ -123,8 +143,13 @@ type BucketAPI interface {
 
 // Options tune the transport. Zero values pick the defaults below.
 type Options struct {
-	// CallTimeout bounds every RPC (default 15s).
+	// CallTimeout bounds findAll and removeBucket (default 15s).
 	CallTimeout time.Duration
+	// CreateTimeout bounds create (default 2m). A create is not idempotent on
+	// the server: cut by the client it still runs there, and a retry of the
+	// same name may meet its half-made state. It is therefore kept above the
+	// server's create latency rather than at the read deadline.
+	CreateTimeout time.Duration
 	// Keepalive is the gRPC client ping interval while an RPC is active; 0
 	// disables pings (the server's ping policy is unknown, and an aggressive
 	// ping rate gets the connection closed with GOAWAY).
@@ -144,7 +169,11 @@ type Options struct {
 
 const (
 	defaultCallTimeout = 15 * time.Second
-	findRetryDelay     = 200 * time.Millisecond
+	// defaultCreateTimeout: on system-test 2026-10-22 creates cut at 15s
+	// finished on the server within ~75s (bucket listed on the next pass);
+	// the previous release had no create deadline at all.
+	defaultCreateTimeout = 2 * time.Minute
+	findRetryDelay       = 200 * time.Millisecond
 )
 
 // The default limit sits well above what the default two workers issue (a
@@ -156,7 +185,7 @@ const (
 
 // DefaultOptions returns the production defaults.
 func DefaultOptions() Options {
-	return Options{CallTimeout: defaultCallTimeout, FindByBucket: true, FindRetries: 1}
+	return Options{CallTimeout: defaultCallTimeout, CreateTimeout: defaultCreateTimeout, FindByBucket: true, FindRetries: 1}
 }
 
 // Client talks to cloud-manager over gRPC.
@@ -236,6 +265,14 @@ func (o Options) callTimeout() time.Duration {
 	return defaultCallTimeout
 }
 
+// createTimeout is how long one create may run (CreateTimeout or its default).
+func (o Options) createTimeout() time.Duration {
+	if o.CreateTimeout > 0 {
+		return o.CreateTimeout
+	}
+	return defaultCreateTimeout
+}
+
 // Close releases the underlying connection.
 func (c *Client) Close() error {
 	if c.conn != nil {
@@ -248,7 +285,7 @@ func (c *Client) Create(ctx context.Context, in CreateInput) (string, error) {
 	if err := c.wait(ctx); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.opts.callTimeout())
+	ctx, cancel := context.WithTimeout(ctx, c.opts.createTimeout())
 	defer cancel()
 	start := time.Now()
 	resp, err := c.cloud.Create(ctx, &pb.CreateRequest{
@@ -460,6 +497,7 @@ func mapCreateError(e *pb.CreateError) error {
 	case pb.CreateError_INSUFFICIENT_FUNDS:
 		return fmt.Errorf("%w: %s", ErrInsufficientFunds, e.GetMessage())
 	default:
-		return fmt.Errorf("cloud-manager create error [%s]: %s", e.GetCode(), e.GetMessage())
+		createRejectedCounter.WithLabelValues(e.GetCode().String()).Inc()
+		return &CreateRejectedError{Code: e.GetCode().String(), Message: e.GetMessage()}
 	}
 }

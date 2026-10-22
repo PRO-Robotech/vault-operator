@@ -42,14 +42,15 @@ func seedBucket(srv *cmfake.Server, name, login string, st pb.Status) {
 	srv.Seed(&pb.Bucket{Name: name, CustLogin: login, Status: st, AccessKey: "AK", SecretKey: "SK"})
 }
 
-// A hanging server must not hang the caller past the per-call timeout.
+// A hanging server must not hang the caller past the per-call timeout (the
+// create deadline for create).
 func TestClient_HangingServerIsCutByTheCallTimeout(t *testing.T) {
 	srv := cmfake.New()
 	srv.HangFindAll = true
 	srv.HangCreate = true
 	srv.HangRemove = true
 	const timeout = 200 * time.Millisecond
-	c := newTestClient(t, srv, Options{CallTimeout: timeout})
+	c := newTestClient(t, srv, Options{CallTimeout: timeout, CreateTimeout: timeout})
 
 	calls := map[string]func(context.Context) error{
 		"findAll": func(ctx context.Context) error { _, err := c.FindByBucket(ctx, "c1", "b1"); return err },
@@ -319,6 +320,14 @@ func TestClient_CreateIsNotCutByTheReadDeadline(t *testing.T) {
 		t.Fatalf("name = %q", name)
 	}
 
+	// Twin: a create slower than the create deadline is cut by it.
+	cut := cmfake.New()
+	cut.CreateDelay = 400 * time.Millisecond
+	cc := newTestClient(t, cut, Options{CallTimeout: time.Second, CreateTimeout: 100 * time.Millisecond})
+	if _, err := cc.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-cut"}); status.Code(errors.Unwrap(err)) != codes.DeadlineExceeded {
+		t.Fatalf("create past the create deadline: err = %v, want DeadlineExceeded", err)
+	}
+
 	// Twin: a read slower than the read deadline is still cut by it.
 	hung := cmfake.New()
 	hung.HangFindAll = true
@@ -339,5 +348,13 @@ func TestClient_CreateRejectedWithoutACodeIsNamed(t *testing.T) {
 	_, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-rej"})
 	if err == nil || !strings.Contains(err.Error(), "create rejected [CODE_RESERVED]") {
 		t.Fatalf("err = %v, want a rejected create naming CODE_RESERVED", err)
+	}
+	if !errors.Is(err, ErrCreateRejected) {
+		t.Fatalf("err = %v, want it to wrap ErrCreateRejected", err)
+	}
+	// Twin: a mapped code is not a rejection of this kind.
+	srv.CreateError = &pb.CreateError{Code: pb.CreateError_BUCKET_LIMIT_REACHED, Message: "limit"}
+	if _, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-lim"}); errors.Is(err, ErrCreateRejected) || !errors.Is(err, ErrBucketLimitReached) {
+		t.Fatalf("limit: err = %v, want ErrBucketLimitReached only", err)
 	}
 }

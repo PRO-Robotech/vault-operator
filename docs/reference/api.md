@@ -328,6 +328,7 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `vault_operator_managed_objects` | `kind`, `type` | Объекты Vault в журналах заявок |
 | `vault_operator_inventory_errors` | `kind` | Scrape не прочитал заявки вида |
 | `vault_operator_cloudmanager_request_duration_seconds` | `method`, `code` | Задержка вызовов cloud-manager (bucket-operator) |
+| `vault_operator_cloudmanager_create_rejected_total` | `code` | Ответы create с кодом ошибки вне известного набора, `CODE_RESERVED` включительно (bucket-operator) |
 
 Подробнее — [user-guide/monitoring.md](../user-guide/monitoring.md).
 

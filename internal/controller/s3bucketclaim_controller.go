@@ -54,7 +54,8 @@ const (
 	bucketBackoffBase = time.Minute
 	bucketBackoffMax  = 30 * time.Minute
 	// bucketCreateGrace is how long a create in flight (status.pendingCreate)
-	// that cloud-manager does not show yet is waited for before creating again.
+	// that cloud-manager does not show yet is waited for before creating again,
+	// counted from the end of the last create call without an answer.
 	bucketCreateGrace = time.Minute
 )
 
@@ -342,21 +343,39 @@ func (r *S3BucketClaimReconciler) adoptNamed(ctx context.Context, claim *vaultv1
 
 func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, requestedName string) (ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
-	// The names taken before the create: a later pass that has to locate the
-	// bucket this create made never takes one of them.
-	existing, err := r.Buckets.NamesByRequested(ctx, claim.Spec.CustomerLogin, requestedName)
-	if err != nil {
-		logger.V(1).Info("cloud-manager findAll failed; not creating", "err", err.Error())
-		claim.Status.Phase = vaultv1alpha1.PhasePending
-		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
-			"FindFailed", "cloud-manager lookup failed; retrying")
-		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
+	// The names taken before the FIRST create of this name: a later pass that
+	// has to locate the bucket a create made never takes one of them. A repeat
+	// keeps that baseline: a bucket the earlier create made may become visible
+	// only now, and re-reading the names would mark it "existed before".
+	var existing []string
+	if prev := claim.Status.PendingCreate; prev != nil && prev.RequestedName == requestedName {
+		existing = prev.ExistingNames
+	} else {
+		var err error
+		existing, err = r.Buckets.NamesByRequested(ctx, claim.Spec.CustomerLogin, requestedName)
+		if err != nil {
+			logger.V(1).Info("cloud-manager findAll failed; not creating", "err", err.Error())
+			claim.Status.Phase = vaultv1alpha1.PhasePending
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+				"FindFailed", "cloud-manager lookup failed; retrying")
+			return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
+		}
 	}
 	claim.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{RequestedName: requestedName, Since: metav1.NewTime(r.now()), ExistingNames: existing}
-	if err := r.persist(ctx, claim, base); err != nil {
+	echoed, err := r.persistEcho(ctx, claim, base)
+	if err != nil {
 		logger.V(1).Info("persist pendingCreate failed; not creating", "err", err.Error())
 		claim.Status.Phase = vaultv1alpha1.PhasePending
 		return ctrl.Result{RequeueAfter: bucketRequeueRace}, false
+	}
+	if echoed.PendingCreate == nil {
+		// The API server dropped the marker: the installed CRD is older than
+		// this operator. Without the marker a create whose answer is lost is
+		// later taken for someone else's bucket (Adopted, never purged), so
+		// nothing is created until the CRD is updated.
+		claim.Status.PendingCreate = nil
+		return r.stateFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "StatusSchemaOutdated", "schema",
+			"the S3BucketClaim CRD does not keep status.pendingCreate; install the CRD of this operator version"), false
 	}
 
 	cfgID := claim.Spec.Bucket.ConfigurationID
@@ -402,6 +421,19 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 		return r.specFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "InvalidBucketName",
 			fmt.Sprintf("bucket name %q rejected by cloud-manager", requestedName)), false
 
+	case errors.Is(err, cloudmanager.ErrCreateRejected):
+		// The server may have done part of the work (an S3 user without the
+		// bucket): pendingCreate stays, the grace restarts now, and repeats
+		// back off, since a repeat of the same name meets the same state.
+		logger.V(1).Info("cloud-manager rejected the create", "err", err.Error())
+		claim.Status.PendingCreate.Since = metav1.NewTime(r.now())
+		claim.Status.Phase = vaultv1alpha1.PhasePending
+		msg := fmt.Sprintf("cloud-manager rejected the create of %q with code %s; retrying with backoff", requestedName, createRejectedCode(err))
+		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+			"CreateRejected", msg)
+		r.event(claim, corev1.EventTypeWarning, "CreateRejected", msg)
+		return ctrl.Result{RequeueAfter: r.backoff.Next(client.ObjectKeyFromObject(claim), "create", bucketBackoffBase, bucketBackoffMax)}, false
+
 	case errors.Is(err, cloudmanager.ErrBucketLimitReached), errors.Is(err, cloudmanager.ErrInsufficientFunds):
 		claim.Status.PendingCreate = nil
 		reason, msg := "QuotaExceeded", "customer bucket limit reached"
@@ -415,8 +447,10 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 
 	default:
 		// Unknown outcome (timeout, transport): the bucket may exist, so
-		// pendingCreate is kept and the next pass looks it up first.
+		// pendingCreate is kept and the next pass looks it up first; the
+		// grace runs from now, the server may still be finishing the create.
 		logger.V(1).Info("cloud-manager create failed", "err", err.Error())
+		claim.Status.PendingCreate.Since = metav1.NewTime(r.now())
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
 			"CreateFailed", "cloud-manager create failed; retrying")
 		r.event(claim, corev1.EventTypeWarning, "CreateFailed", "cloud-manager create failed; retrying")
@@ -582,16 +616,34 @@ func (r *S3BucketClaimReconciler) updateStatusIfChanged(ctx context.Context, cla
 // persist patches the status now and, on success, advances base, so the
 // final patch of the pass sends only what changed after it.
 func (r *S3BucketClaimReconciler) persist(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus) error {
+	_, err := r.persistEcho(ctx, claim, base)
+	return err
+}
+
+// persistEcho is persist that also returns the status as the API server
+// answered it: a field the installed CRD does not know is missing there.
+func (r *S3BucketClaimReconciler) persistEcho(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus) (*vaultv1alpha1.S3BucketClaimStatus, error) {
 	want := claim.Status.DeepCopy()
 	if err := r.updateStatusIfChanged(ctx, claim, base); err != nil {
 		claim.Status = *want
-		return err
+		return nil, err
 	}
 	// The patch response overwrites claim with the server object; keep the
 	// in-memory status this pass is building.
+	echoed := claim.Status.DeepCopy()
 	claim.Status = *want
 	*base = *want.DeepCopy()
-	return nil
+	return echoed, nil
+}
+
+// createRejectedCode is the cloud-manager code name of a rejected create,
+// from the closed enum; the server's free text stays in the log.
+func createRejectedCode(err error) string {
+	var rej *cloudmanager.CreateRejectedError
+	if errors.As(err, &rej) {
+		return rej.Code
+	}
+	return "unknown"
 }
 
 func (r *S3BucketClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -55,6 +55,7 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 | `vault_operator_managed_objects` | Объекты Vault, записанные в журналах заявок | `kind`, `type` ∈ {`policy`, `role`, `transit_key`, `bucket`, `secret_item`} |
 | `vault_operator_inventory_errors` | 1, если scrape не смог прочитать заявки вида | `kind` |
 | `vault_operator_cloudmanager_request_duration_seconds` | bucket-operator: гистограмма задержки вызовов cloud-manager | `method`, `code` |
+| `vault_operator_cloudmanager_create_rejected_total` | bucket-operator: ответы create с кодом ошибки вне известного набора, `CODE_RESERVED` включительно | `code` |
 | `vault_operator_s3bucketclaim_owner_unverified_total` | bucket-operator: cloud-manager вернул записанный бакет без логина владельца. Удаление такого бакета блокируется (`DeletionBlocked`), поэтому ненулевой рост — повод разобраться до удаления кластеров | — |
 | `vault_operator_cloudmanager_remove_unknown_response_total` | bucket-operator: `removeBucket` ответил текстом вне словаря (`Not found`, `Already removed`) — удаление считается неудавшимся (`DeletionStuck`) | — |
 | `controller_runtime_*` | Стандартные controller-runtime | `controller`, `result` |
