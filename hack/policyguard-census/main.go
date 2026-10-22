@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"text/template"
 
@@ -30,14 +31,23 @@ import (
 )
 
 func main() {
-	kvMount := flag.String("kv-mount", "secret", "VaultConfig.spec.storage.kvMountPath the claims share")
-	accessor := flag.String("accessor", "auth_kubernetes_00000000", "accessor substituted for {{ .AuthMountAccessor }}")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+// run is the census over the list read from in; it returns the exit code.
+func run(args []string, in io.Reader, out, errOut io.Writer) int {
+	fs := flag.NewFlagSet("policyguard-census", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	kvMount := fs.String("kv-mount", "secret", "VaultConfig.spec.storage.kvMountPath the claims share")
+	accessor := fs.String("accessor", "auth_kubernetes_00000000", "accessor substituted for {{ .AuthMountAccessor }}")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	var list vaultv1alpha1.VaultClaimList
-	if err := json.NewDecoder(os.Stdin).Decode(&list); err != nil {
-		fmt.Fprintf(os.Stderr, "decode VaultClaim list: %v\n", err)
-		os.Exit(2)
+	if err := json.NewDecoder(in).Decode(&list); err != nil {
+		fmt.Fprintf(errOut, "decode VaultClaim list: %v\n", err)
+		return 2
 	}
 	claims, policies, violations := 0, 0, 0
 	for i := range list.Items {
@@ -57,22 +67,23 @@ func main() {
 			rendered, err := render(p.Rules, *accessor)
 			if err != nil {
 				violations++
-				fmt.Printf("%s/%s policy %q: does not render\n", c.Namespace, c.Name, p.Name)
+				fmt.Fprintf(out, "%s/%s policy %q: does not render\n", c.Namespace, c.Name, p.Name)
 				continue
 			}
 			for _, v := range policyguard.Check(rendered, scope) {
 				violations++
-				fmt.Printf("%s/%s policy %q: %s\n", c.Namespace, c.Name, p.Name, v)
+				fmt.Fprintf(out, "%s/%s policy %q: %s\n", c.Namespace, c.Name, p.Name, v)
 			}
 		}
 	}
-	fmt.Printf("census: claims=%d policies=%d violations=%d\n", claims, policies, violations)
+	fmt.Fprintf(out, "census: claims=%d policies=%d violations=%d\n", claims, policies, violations)
 	switch {
 	case claims == 0:
-		os.Exit(2)
+		return 2
 	case violations > 0:
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func render(rules, accessor string) (string, error) {
