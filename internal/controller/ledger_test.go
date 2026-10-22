@@ -327,6 +327,39 @@ var _ = Describe("VaultClaim ledger, ownership and guest mode", func() {
 			Expect(fakeVC.PutRoleCalls).To(Equal(0))
 		})
 
+		// The mount already carries this claim's description, so the first
+		// ledger write of the pass is the one before the policy or role write:
+		// each write must wait for its own entry.
+		It("a failed intent patch before policies writes no policy", func() {
+			name := nextClaimName()
+			cfg, sec := fixture(name)
+			createClaim(newClaim(name, cfg, sec, withPolicies(policy(name+"-p", ownRules(name)))))
+			fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
+			recon.Client = interceptor.NewClient(watchClient(), interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					return errors.New("injected status patch failure")
+				},
+			})
+			_, _ = reconcileClaim(recon, name)
+			Expect(fakeVC.WriteConfigCalls).To(Equal(1), "the pass reached the policy step")
+			Expect(fakeVC.PutPolicyCalls).To(Equal(0))
+		})
+
+		It("a failed intent patch before roles writes no role", func() {
+			name := nextClaimName()
+			cfg, sec := fixture(name)
+			createClaim(newClaim(name, cfg, sec, withRoles(role(name+"-r", "registry-guest"))))
+			fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
+			recon.Client = interceptor.NewClient(watchClient(), interceptor.Funcs{
+				SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+					return errors.New("injected status patch failure")
+				},
+			})
+			_, _ = reconcileClaim(recon, name)
+			Expect(fakeVC.WriteConfigCalls).To(Equal(1), "the pass reached the role step")
+			Expect(fakeVC.PutRoleCalls).To(Equal(0))
+		})
+
 		It("a final status patch failure is returned, not swallowed", func() {
 			name := nextClaimName()
 			cfg, sec := fixture(name)
