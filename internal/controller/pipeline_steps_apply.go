@@ -67,7 +67,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 			return Proceed, err
 		}
 		err := state.Vault.EnableAuthMethod(ctx, mount, vault.EnableAuthRequest{
-			Type:        "kubernetes",
+			Type:        authTypeKubernetes,
 			Description: mountDescription(claim),
 		})
 		switch {
@@ -142,7 +142,7 @@ func (r *VaultClaimReconciler) stepVerifyGuestMount(ctx context.Context, claim *
 			"MountLookupFailed", "reading sys/auth failed: "+failureText(err))
 		return Proceed, fmt.Errorf("list auth mounts: %w", err)
 	}
-	if info, ok := mounts[mountKey(mount)]; !ok || info.Type != "kubernetes" {
+	if info, ok := mounts[mountKey(mount)]; !ok || info.Type != authTypeKubernetes {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady, metav1.ConditionFalse, claim.Generation,
 			ReasonMountNotConfigured, fmt.Sprintf("auth mount %q does not exist or is not a kubernetes mount", mount))
 		return Wait, nil

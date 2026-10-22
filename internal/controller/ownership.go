@@ -377,7 +377,7 @@ func mountDescription(claim *vaultv1alpha1.VaultClaim) string {
 // description, which only the operator's own POST sys/auth writes. Deletion
 // disables a mount on this evidence alone.
 func mountIsOurs(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim) bool {
-	return info.Type == "kubernetes" && info.Description == mountDescription(claim)
+	return info.Type == authTypeKubernetes && info.Description == mountDescription(claim)
 }
 
 // mountAccepted: the claim may configure the kubernetes mount sys/auth shows
@@ -389,7 +389,7 @@ func mountIsOurs(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim) bool
 // configured that mount since; its claims keep their mount whatever its
 // description, and the description is left as it is.
 func mountAccepted(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim, recorded string) bool {
-	if info.Type != "kubernetes" {
+	if info.Type != authTypeKubernetes {
 		return false
 	}
 	if info.Description == mountDescription(claim) {
@@ -400,6 +400,9 @@ func mountAccepted(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim, re
 }
 
 func mountKey(mount string) string { return normMount(mount) + "/" }
+
+// authTypeKubernetes is the sys/auth type of every mount a claim uses.
+const authTypeKubernetes = "kubernetes"
 
 // union returns the sorted set union.
 func union(a, b []string) []string {
