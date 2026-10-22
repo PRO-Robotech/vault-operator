@@ -1,0 +1,72 @@
+# Alerts on the operators' own metrics. Series counts are bounded by kind,
+# phase, VaultConfig and path bucket, never by the number of claims. Every
+# replica reports the claim inventory, hence max rather than sum.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: vault-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-alerts
+  namespace: system
+spec:
+  groups:
+    - name: vault-operator
+      rules:
+        - alert: VaultOperatorCircuitOpen
+          expr: max by (vault_config) (vault_circuit_state) == 2
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Vault calls of VaultConfig {{ $labels.vault_config }} are short-circuited by an open breaker.
+        - alert: VaultOperatorVaultErrors
+          expr: sum by (path) (rate(vault_api_calls_total{result=~"server_error|transport_error"}[10m])) > 0.1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Vault calls to {{ $labels.path }} keep failing with 5xx or transport errors.
+        - alert: VaultOperatorVaultSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(vault_api_request_duration_seconds_bucket[10m]))) > 2
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The 99th percentile of Vault call latency is above 2s.
+        - alert: VaultOperatorCloudManagerSlow
+          expr: histogram_quantile(0.99, sum by (le, method) (rate(vault_operator_cloudmanager_request_duration_seconds_bucket[10m]))) > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The 99th percentile of cloud-manager {{ $labels.method }} latency is above 5s.
+        - alert: VaultOperatorClaimsFailed
+          expr: max by (kind) (vault_operator_claims{phase="Failed"}) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} {{ $labels.kind }} claims have been Failed for 30 minutes."
+        - alert: VaultOperatorInventoryUnavailable
+          expr: max by (kind) (vault_operator_inventory_errors) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The operator cannot list {{ $labels.kind }} claims for its metrics.
+        - alert: VaultOperatorReviewerJWTExpiring
+          expr: min by (namespace, claim) (vault_reviewer_jwt_expiry_seconds) < 3600
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: The token reviewer JWT of {{ $labels.namespace }}/{{ $labels.claim }} expires within an hour.
+        - alert: VaultOperatorReconcileErrors
+          expr: sum by (controller) (rate(controller_runtime_reconcile_errors_total[15m])) > 0.05
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Controller {{ $labels.controller }} keeps returning reconcile errors.

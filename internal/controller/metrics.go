@@ -23,6 +23,7 @@ const (
 	DriftTypeRoleBody   = "role_body"
 	DriftTypePolicyBody = "policy_body"
 	DriftTypeAuthConfig = "auth_config"
+	DriftTypeAccessor   = "auth_mount_accessor"
 )
 
 var driftDetectedCounter = prometheus.NewCounterVec(
@@ -65,6 +66,38 @@ var policyGuardViolations = prometheus.NewCounterVec(
 	[]string{"mode", "rule"},
 )
 
+// pipelineStepTotal counts VaultClaim pipeline step outcomes. The outcome is
+// Proceed, Wait, Refused or the failure cause from the closed set: both label
+// sets are bounded, whatever the number of claims.
+var pipelineStepTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "vault_operator_pipeline_step_total",
+		Help: "VaultClaim pipeline step outcomes by step and outcome (Proceed, Wait, Refused, or the failure cause).",
+	},
+	[]string{"step", "outcome"},
+)
+
+// Step outcomes other than a failure cause.
+const (
+	stepOutcomeProceed = "Proceed"
+	stepOutcomeWait    = "Wait"
+	stepOutcomeRefused = "Refused"
+)
+
+func countStep(step string, res StepResult, err error) {
+	outcome := stepOutcomeProceed
+	switch {
+	case err != nil:
+		outcome = string(classifyFailure(err))
+	case res == Wait:
+		outcome = stepOutcomeWait
+	case res == Refuse:
+		outcome = stepOutcomeRefused
+	}
+	pipelineStepTotal.WithLabelValues(step, outcome).Inc()
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter, reviewerJWTExpirySeconds, policyGuardViolations)
+	ctrlmetrics.Registry.MustRegister(driftDetectedCounter, reviewerJWTRenewalCounter, reviewerJWTExpirySeconds,
+		policyGuardViolations, pipelineStepTotal)
 }

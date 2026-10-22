@@ -14,10 +14,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/secretgen"
@@ -91,10 +92,11 @@ func validateCopySources(ctx context.Context, kv kvClient, defMount string, item
 		mount := resolveMount(item.Source.Mount, defMount)
 		data, ok, err := kv.ReadKV(ctx, mount, item.Source.Path)
 		if err != nil {
-			return fmt.Errorf("item %q: read source %s/%s: %w", item.Name, mount, item.Source.Path, err)
+			log.FromContext(ctx).V(1).Info("reading a copy source failed", "item", item.Name, "err", err.Error())
+			return statusErrorf("item %q: reading source %s/%s failed: %s", item.Name, mount, item.Source.Path, failureText(err))
 		}
 		if !ok || !hasKey(data, item.Source.Key) {
-			return fmt.Errorf("item %q: source %s/%s#%s not found", item.Name, mount, item.Source.Path, item.Source.Key)
+			return statusErrorf("item %q: source %s/%s#%s not found", item.Name, mount, item.Source.Path, item.Source.Key)
 		}
 	}
 	return nil
@@ -111,7 +113,7 @@ func applyCopyItem(ctx context.Context, kv kvClient, defMount, secretsPrefix str
 		return false, err
 	}
 	if !ok || !hasKey(srcData, item.Source.Key) {
-		return false, fmt.Errorf("item %q: source %s/%s#%s not found", item.Name, srcMount, item.Source.Path, item.Source.Key)
+		return false, statusErrorf("item %q: source %s/%s#%s not found", item.Name, srcMount, item.Source.Path, item.Source.Key)
 	}
 	value := srcData[item.Source.Key]
 
@@ -151,19 +153,21 @@ func applyGenerateItem(ctx context.Context, kv kvClient, defMount, secretsPrefix
 		return ch, false, nil
 	}
 
+	// secretgen refuses only what the generate spec asks for; its text names
+	// the spec values, never a remote endpoint.
 	raw, err := secretgen.Generate(effLength(g), g.Charset)
 	if err != nil {
-		return "", false, err
+		return "", false, statusErrorf("item %q: %v", item.Name, err)
 	}
 	merged := cloneData(data)
 	merged[item.Destination.Key] = raw
 	if effHash(g) != secretgen.HashNone {
 		if item.Destination.HashedKey == "" {
-			return "", false, fmt.Errorf("item %q: generate.hash=%s requires destination.hashedKey", item.Name, effHash(g))
+			return "", false, statusErrorf("item %q: generate.hash=%s requires destination.hashedKey", item.Name, effHash(g))
 		}
 		hashed, err := secretgen.Hash(effHash(g), raw)
 		if err != nil {
-			return "", false, err
+			return "", false, statusErrorf("item %q: %v", item.Name, err)
 		}
 		merged[item.Destination.HashedKey] = hashed
 	}

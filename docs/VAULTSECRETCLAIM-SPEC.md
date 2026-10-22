@@ -184,6 +184,7 @@ path "secret/metadata/<source-prefix>/*" { capabilities = ["read", "list"] }
 # Ротация собственного токена.
 path "auth/token/renew-self"             { capabilities = ["update"] }
 path "auth/token/lookup-self"            { capabilities = ["read"] }
+path "auth/token/revoke-self"            { capabilities = ["update"] }
 ```
 
 Не выдаются `sys/auth/*`, `sys/policies/*`, `auth/+/role/*` — настройка доступа остаётся за `vault-operator`. Разделение прав: один контроллер пишет конфигурацию доступа и не может писать данные, второй пишет данные и не может изменять конфигурацию доступа.

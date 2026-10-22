@@ -83,9 +83,11 @@ func TestClient_DisableAuthMethod_NotFoundIsOK(t *testing.T) {
 func TestClient_WriteKubernetesAuthConfig(t *testing.T) {
 	fv := newFakeVault(t)
 	var receivedBody KubernetesAuthConfig
+	var rawBody []byte
 	fv.override = func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/auth/kubernetes-ec8a00/config" {
 			b, _ := io.ReadAll(r.Body)
+			rawBody = b
 			_ = json.Unmarshal(b, &receivedBody)
 			w.WriteHeader(http.StatusNoContent)
 			return true
@@ -111,6 +113,11 @@ func TestClient_WriteKubernetesAuthConfig(t *testing.T) {
 	}
 	if !receivedBody.DisableLocalCAJWT {
 		t.Fatalf("expected disable_local_ca_jwt=true")
+	}
+	// Sent explicitly false: SA annotations never become alias metadata that a
+	// templated policy reads.
+	if !strings.Contains(string(rawBody), `"use_annotations_as_alias_metadata":false`) {
+		t.Fatalf("use_annotations_as_alias_metadata=false not sent: %s", rawBody)
 	}
 }
 

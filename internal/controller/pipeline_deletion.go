@@ -93,7 +93,7 @@ func (r *VaultClaimReconciler) deleteVaultObjects(ctx context.Context, claim *va
 	if err != nil {
 		return fmt.Errorf("build vault client: %w", err)
 	}
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		return fmt.Errorf("vault login: %w", err)
 	}
 
@@ -156,7 +156,8 @@ func (r *VaultClaimReconciler) deleteVaultObjects(ctx context.Context, claim *va
 	return nil
 }
 
-// deleteTargetObjects best-effort cleans up the token-reviewer SA + CRB.
+// deleteTargetObjects best-effort cleans up the claim's own token-reviewer SA
+// + CRB; objects without the claim's labels are left in place.
 // Failures never block the finalizer — a missing kubeconfig Secret
 // or unreachable infra apiserver is preferable to leaving the VaultClaim
 // stuck in Deleting.
@@ -187,6 +188,11 @@ func (r *VaultClaimReconciler) deleteTargetObjects(ctx context.Context, claim *v
 		return
 	}
 	if err := target.DeleteTokenReviewerSA(ctx, cs, claim); err != nil {
+		if target.IsForeignReviewer(err) {
+			log.FromContext(ctx).V(1).Info("target cleanup left a foreign object", "error", err.Error())
+			r.warnTargetCleanup(ctx, claim, nil, "token reviewer ServiceAccount or binding left in place: not labelled for this claim")
+			return
+		}
 		r.warnTargetCleanup(ctx, claim, err, "delete target SA")
 		return
 	}

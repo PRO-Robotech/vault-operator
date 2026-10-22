@@ -6,7 +6,7 @@ on:
 
 jobs:
   test-e2e:
-    name: Run on Ubuntu
+    name: E2E Tests
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -51,3 +51,20 @@ jobs:
       # binary fails the run instead of skipping it.
       - name: Running pipeline e2e
         run: make test-e2e-pipeline
+
+  # 1000 guest claims under a manager against Vault 1.20.1: passes per claim
+  # in a ten-minute steady window, new Vault tokens, process RSS.
+  load:
+    name: Load (1000 claims, envtest + Vault dev)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Running the load measurement
+        run: make test-load

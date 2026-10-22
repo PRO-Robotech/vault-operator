@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    name: Run on Ubuntu
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -24,6 +24,9 @@ jobs:
 
       - name: Running Tests
         run: make test
+
+      - name: Race detector on the packages with shared state
+        run: make test-race
 
       # make test regenerates CRDs, RBAC, deepcopy and formatting; anything
       # it changed was not committed.

@@ -11,12 +11,10 @@ You may obtain a copy of the License at
 package controller
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
-	"strings"
-	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,10 +25,6 @@ import (
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
-
-// templateAccessorVar must match the variable name Vault expects when policies
-// interpolate the auth-mount accessor.
-const templateAccessorVar = ".AuthMountAccessor"
 
 // stepEnableAuthMount (owner claims) makes sure the claim's own mount exists
 // and writes its config. A mount that exists is configured only when
@@ -167,16 +161,31 @@ func (r *VaultClaimReconciler) stepVerifyGuestMount(ctx context.Context, claim *
 	return Proceed, nil
 }
 
-// resolveIssuer: explicit spec, then OIDC discovery, then disable ISS validation.
+// resolveIssuer: explicit spec, then OIDC discovery, then the issuer an
+// earlier discovery recorded on the same API server, then disable ISS
+// validation. A discovery that fails for a pass does not turn ISS validation
+// off on a mount it once had; an issuer of another cluster (the kubeconfig
+// now points elsewhere) is never applied.
 func (r *VaultClaimReconciler) resolveIssuer(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (string, bool) {
 	if claim.Spec.Auth.Issuer != "" {
 		return claim.Spec.Auth.Issuer, false
 	}
+	if claim.Status.Vault == nil {
+		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
+	}
+	st := claim.Status.Vault
+	host := ""
 	if state.Target != nil {
+		host = state.Target.Host
 		if issuer, err := target.DiscoverIssuer(ctx, state.Target); err == nil && issuer != "" {
+			st.Issuer, st.IssuerHost = issuer, host
 			return issuer, false
 		}
 	}
+	if st.Issuer != "" && st.IssuerHost == host {
+		return st.Issuer, false
+	}
+	st.Issuer, st.IssuerHost = "", ""
 	return "", true
 }
 
@@ -206,38 +215,44 @@ func (r *VaultClaimReconciler) stepApplyPolicies(ctx context.Context, claim *vau
 		return Proceed, nil
 	}
 
-	needsAccessor := false
-	for i := range claim.Spec.Policies {
-		if strings.Contains(claim.Spec.Policies[i].Rules, templateAccessorVar) {
-			needsAccessor = true
-			break
-		}
-	}
-
 	var accessor string
-	if needsAccessor {
+	if claimNeedsAccessor(claim) {
 		acc, err := state.Vault.GetAuthMountAccessor(ctx, claim.Spec.Auth.MountPath)
 		if err != nil {
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionPoliciesApplied, metav1.ConditionFalse, claim.Generation,
 				"AccessorLookupFailed", "reading the auth mount accessor failed: "+failureText(err))
 			return Proceed, fmt.Errorf("get auth mount accessor: %w", err)
 		}
+		if !accessorForm.MatchString(acc) {
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionPoliciesApplied, metav1.ConditionFalse, claim.Generation,
+				"AccessorLookupFailed", errAccessorForm.Error())
+			return Proceed, errAccessorForm
+		}
+		// A recreated mount has a new accessor: the bodies in Vault name the
+		// old one and grant nothing until they are rendered again, below.
+		if prior := claim.Status.Vault.AuthMountAccessor; prior != "" && prior != acc && r.Recorder != nil {
+			r.Recorder.Eventf(claim, corev1.EventTypeWarning, ReasonAuthMountAccessorChanged,
+				"auth mount %q has a new accessor; its templated policies are rendered again", claim.Spec.Auth.MountPath)
+		}
 		accessor = acc
 		claim.Status.Vault.AuthMountAccessor = accessor
 	}
 
-	ctxData := map[string]string{"AuthMountAccessor": accessor}
 	mode := r.guardMode(claim)
 	scope := r.guardScope(claim, state)
 	rendered := make(map[string]string, len(claim.Spec.Policies))
 	names := make([]string, 0, len(claim.Spec.Policies))
 	for i := range claim.Spec.Policies {
 		p := claim.Spec.Policies[i]
-		body, err := renderPolicy(p.Rules, ctxData)
+		body, err := renderClaimPolicy(p, accessor)
 		if err != nil {
 			log.FromContext(ctx).V(1).Info("policy does not render", "policy", p.Name, "error", err.Error())
+			msg := fmt.Sprintf("policy %q: the rules do not render as a template", p.Name)
+			if errors.Is(err, errBareIdentity) {
+				msg = fmt.Sprintf("policy %q: %s", p.Name, errBareIdentity.Error())
+			}
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionPoliciesApplied, metav1.ConditionFalse, claim.Generation,
-				"RenderFailed", fmt.Sprintf("policy %q: the rules do not render as a template", p.Name))
+				"RenderFailed", msg)
 			return Proceed, fmt.Errorf("render policy %q: %w", p.Name, err)
 		}
 		if v := policyguard.Check(body, scope); len(v) > 0 {
@@ -287,22 +302,10 @@ func (r *VaultClaimReconciler) stepApplyPolicies(ctx context.Context, claim *vau
 	return Proceed, nil
 }
 
-func renderPolicy(hcl string, data map[string]string) (string, error) {
-	tmpl, err := template.New("policy").Option("missingkey=error").Parse(hcl)
-	if err != nil {
-		return "", err
-	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
 func roleBody(role vaultv1alpha1.RoleSpec) vault.KubernetesRole {
 	body := vault.KubernetesRole{
-		// CRD allows one SA per role; Vault accepts arrays.
-		BoundServiceAccountNames:      []string{role.BoundServiceAccounts.Name},
+		// Sorted, so that the order in spec is never drift.
+		BoundServiceAccountNames:      role.BoundServiceAccounts.ServiceAccountNames(),
 		BoundServiceAccountNamespaces: []string{role.BoundServiceAccounts.Namespace},
 		TokenPolicies:                 role.Policies,
 	}
@@ -315,6 +318,7 @@ func roleBody(role vaultv1alpha1.RoleSpec) vault.KubernetesRole {
 	body.Audience = role.Audience
 	body.TokenType = role.TokenType
 	body.TokenNoDefaultPolicy = role.TokenNoDefaultPolicy
+	body.AliasNameSource = role.AliasNameSource
 	if role.TokenExplicitMaxTTL != nil {
 		body.TokenExplicitMaxTTLSecs = int(role.TokenExplicitMaxTTL.Seconds())
 	}

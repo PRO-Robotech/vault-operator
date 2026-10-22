@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -47,12 +48,24 @@ const (
 	// ReasonMountNotOwned (deletion only): the mount was left in place because
 	// sys/auth does not show it as this claim's.
 	ReasonMountNotOwned = "MountNotOwned"
+	// ReasonForeignReviewer: the token reviewer ServiceAccount or its binding
+	// in the target cluster exists without this claim's labels. The legacy
+	// release force-applied over it.
+	ReasonForeignReviewer = "ForeignReviewer"
 )
+
+// ReasonAuthMountAccessorChanged (event): the claim's auth mount has another
+// accessor than its templated policies were rendered with; they are rendered
+// again. Not a refusal.
+const ReasonAuthMountAccessorChanged = "AuthMountAccessorChanged"
 
 // ReasonMountNotConfigured: a guest claim waits for its host mount to exist,
 // be a kubernetes mount and carry kubernetes_host. Not a refusal: the claim
 // proceeds once the owner configures the mount.
 const ReasonMountNotConfigured = "MountNotConfigured"
+
+// ReasonReconciled: Degraded=False after a pass that completed.
+const ReasonReconciled = "Reconciled"
 
 // RefusalReasons is the closed set the rollback gate counts.
 var RefusalReasons = []string{
@@ -62,6 +75,7 @@ var RefusalReasons = []string{
 	ReasonMountConflict,
 	ReasonKeyAdoptionRestricted,
 	ReasonMountNotOwned,
+	ReasonForeignReviewer,
 }
 
 // Failure causes, a closed set. Conditions and events carry the cause text,
@@ -187,4 +201,24 @@ func classifyTransport(err error) failureCause {
 // one cause, with no part of the raw error in it.
 func failureText(err error) string {
 	return causeText[classifyFailure(err)]
+}
+
+// statusError is an error whose text is built from the claim's spec and from
+// cause texts only, so status and events may carry it as it is.
+type statusError struct{ text string }
+
+func (e *statusError) Error() string { return e.text }
+
+func statusErrorf(format string, a ...any) error {
+	return &statusError{text: fmt.Sprintf(format, a...)}
+}
+
+// statusText is what status and events say about err: a statusError as it
+// is, any other error as its cause text.
+func statusText(err error) string {
+	var se *statusError
+	if errors.As(err, &se) {
+		return se.text
+	}
+	return failureText(err)
 }

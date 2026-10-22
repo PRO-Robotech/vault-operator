@@ -38,10 +38,14 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `auth.tokenReviewer.serviceAccount.autoCreate` | `bool` | Нет (default `true`) | Создавать ли SA + CRB `system:auth-delegator` в infra-кластере. |
 | `auth.tokenReviewer.ttl` | `duration` | Нет (default `24h`) | TTL JWT, выпускаемого TokenRequest API. Оператор ротирует при остатке <30%. |
 | `policies[].name` | `string` | Да | Имя ACL-policy. Префиксуйте именем claim'а — Vault OSS политики в глобальном NS. |
-| `policies[].rules` | `string` | Да | HCL тело политики. Может содержать `{{ .AuthMountAccessor }}`. |
+| `policies[].rules` | `string` | Да, если нет `identityPaths` | HCL тело политики, не длиннее 16384 байт. Go-шаблон закрытого набора форм: `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}`, строковая константа; прочие конструкции шаблона отвергаются (`RenderFailed`). Шаблон Vault напрямую — только экранированным. См. [identity-templating.md](../concepts/identity-templating.md). |
+| `policies[].identityPaths[].path` | `string` | Да | Путь ACL с плейсхолдерами `{serviceAccountName}`, `{serviceAccountNamespace}` (хотя бы один): сегменты `[a-z0-9._-]`, без ведущего `/`, без `*` и `+`, без сегментов из одних точек. `{meta.<key>}` зарезервирован. |
+| `policies[].identityPaths[].capabilities[]` | `[]enum` | Да | `create`, `read`, `update`, `patch`, `delete`, `list`; `sudo` и `deny` недоступны. |
 | `roles[].name` | `string` | Да | Имя роли под `auth/{mountPath}/role/`. |
-| `roles[].boundServiceAccounts.name` | `string` | Да | SA в infra-кластере. |
-| `roles[].boundServiceAccounts.namespace` | `string` | Да | Namespace SA в infra-кластере. |
+| `roles[].boundServiceAccounts.name` | `string` | Ровно одно из `name`, `names` | SA в infra-кластере. Без `*`, `?`, `[` (ratcheting: сохранённое значение не перепроверяется, пока не меняется). |
+| `roles[].boundServiceAccounts.names[]` | `[]string` | Ровно одно из `name`, `names` | До 32 SA одного namespace, DNS-1123, без глобов. Пишутся в Vault отсортированными: порядок — не дрейф. |
+| `roles[].boundServiceAccounts.namespace` | `string` | Да | Namespace SA в infra-кластере. Без `*`, `?`, `[` (ratcheting). |
+| `roles[].aliasNameSource` | `serviceaccount_uid`\|`serviceaccount_name` | Нет | Имя alias сущности Vault. Пусто — ничего не отправляется: новая роль получает умолчание Vault (`serviceaccount_uid`), существующая сохраняет своё. |
 | `roles[].policies[]` | `[]string` | Да | Имена политик из `policies[]` или существующих в Vault. |
 | `roles[].tokenTTL` | `duration` | Нет | TTL client_token, выпущенного через эту роль. Пусто → system default. |
 | `roles[].tokenMaxTTL` | `duration` | Нет | Max-TTL при renew. |
@@ -50,13 +54,15 @@ API group: `vault.in-cloud.io/v1alpha1`
 
 | Поле | Тип | Описание |
 |---|---|---|
-| `observedGeneration` | `int64` | Последнее обработанное `metadata.generation`. |
+| `observedGeneration` | `int64` | `metadata.generation`, которое последний завершённый проход привёл в Vault. После неудачного, ожидающего или отклонённого прохода не меняется. |
 | `phase` | `enum` | `Pending`, `Configuring`, `Ready`, `Failed`, `Deleting`. |
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
+| `vault.issuer` | `string` | Issuer service account, последним найденный в целевом кластере. Проход, в котором discovery не ответил, пишет в config mount его — пока kubeconfig указывает на тот же API server (`vault.issuerHost`). |
+| `vault.issuerHost` | `string` | API server целевого кластера, на котором найден `vault.issuer`. Если kubeconfig указывает на другой сервер и discovery не ответил, оба поля очищаются и mount пишется с `disable_iss_validation=true`. |
 | `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
-| `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |
+| `vault.authMountAccessor` | `string` | Accessor, с которым отрендерены шаблонные политики. Другой accessor в `sys/auth` (mount пересоздан) — дрейф, событие `AuthMountAccessorChanged` и перерендер. |
 | `vault.appliedPolicies[]` | `[]string` | Журнал политик: имя попадает до записи в Vault и уходит после удаления. |
 | `vault.appliedRoles[]` | `[]string` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления. |
 | `vault.authMountOwned` | `bool` | Факт владения mount: 2xx на создание этой заявкой, её описание в `sys/auth` или запись `vault.authMountPath` прежнего прохода. |
@@ -74,11 +80,12 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `ConfigResolved` | VaultConfig найден, `Reachable=True`, `SharedMountFound=True` | Не найден / VaultConfig недоступен / mount отсутствует |
 | `VaultReachable` | Login в Vault прошёл успешно | Login failed (sealed Vault, network, неверный role) |
 | `KubeconfigAvailable` | Secret kubeconfig'а существует и содержит ключ `value` | Secret отсутствует или malformed |
-| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, или последняя попытка ротации провалилась |
+| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, последняя попытка ротации провалилась, или `ForeignReviewer`: SA/CRB ревьюера чужие |
 | `AuthMountReady` | Auth-mount существует и `auth/{mount}/config` записан | `POST sys/auth` failed (не 400) или `POST .../config` failed |
 | `PoliciesApplied` | Все `spec.policies[]` записаны | Хотя бы один `PUT sys/policies/acl` failed |
 | `RolesApplied` | Все `spec.roles[]` записаны + soft-purge выполнен | Хотя бы один `POST role` failed или `LIST` failed |
 | `Ready` | Все шаги прошли | Любой шаг провалился или claim в `Deleting` |
+| `Degraded` | Последний проход упал на ошибке шага; reason — причина из закрытого набора (`Timeout`, `Unreachable`, `TLS`, `CircuitOpen`, `Forbidden`, …) | Последний проход завершился (`reason: Reconciled`). Ожидание и отказ состояние не меняют; `Ready` хранит исход последнего завершённого прохода |
 
 ### Финализатор
 
@@ -282,6 +289,8 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `ReviewerJWTRotated` | Normal | Reviewer JWT обновлён |
 | `RolesPurged` | Normal | Soft-purge удалил роли, которых нет в spec |
 | `DriftDetected` | Warning | Drift найден на Ready claim'е |
+| `AuthMountAccessorChanged` | Warning | Accessor auth-mount сменился (mount пересоздан); шаблонные политики отрендерены заново |
+| `ForeignReviewer` | Warning | SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки; объекты не тронуты, заявка `Failed` |
 | `DeletionStuck` | Warning | Reverse pipeline застрял на Vault |
 | `TargetCleanupBestEffort` | Warning | Cleanup в infra-кластере не удался (finalizer всё равно снимется) |
 | `VaultClaimDeleted` | Normal | Reverse pipeline завершён, finalizer снят |
@@ -311,11 +320,18 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `vault_reviewer_jwt_renewal_total` | `result=rotated\|skipped\|failed` | Лайфцикл reviewer JWT |
 | `vault_api_responses_total` | `verb`, `path`, `code` | HTTP-ответы Vault (path bucketed: `auth_login`, `auth_role`, `sys_mounts`, ...) |
 | `vault_api_calls_total` | `verb`, `path`, `result=success\|client_error\|server_error\|transport_error` | Каждый вызов оператора в Vault |
-| `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed` | Лайфцикл собственного `client_token` оператора |
+| `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed\|revoke_success\|revoke_failed` | Лайфцикл собственного `client_token` оператора |
+| `vault_api_request_duration_seconds` | `verb`, `path`, `result` | Задержка вызовов Vault |
+| `vault_circuit_state` | `vault_config` | Circuit breaker: 0 closed, 1 half-open, 2 open |
+| `vault_operator_pipeline_step_total` | `step`, `outcome` | Исходы шагов pipeline VaultClaim |
+| `vault_operator_claims` | `kind`, `phase` | Заявки по фазам |
+| `vault_operator_managed_objects` | `kind`, `type` | Объекты Vault в журналах заявок |
+| `vault_operator_inventory_errors` | `kind` | Scrape не прочитал заявки вида |
+| `vault_operator_cloudmanager_request_duration_seconds` | `method`, `code` | Задержка вызовов cloud-manager (bucket-operator) |
 
 Подробнее — [user-guide/monitoring.md](../user-guide/monitoring.md).
 
-> **vault-secret-operator** собственных controller-метрик (`vaultsecretclaim_*`) не экспонирует. Доступны общие `vault_api_*` и `vault_client_token_renewal_total` (через тот же `internal/vault` клиент), а также `phase`/`conditions` через kube-state-metrics.
+> **vault-secret-operator** собственных метрик pipeline (`vaultsecretclaim_*`) не экспонирует. Доступны общие `vault_api_*`, `vault_circuit_state` и `vault_client_token_renewal_total` (через тот же `internal/vault` клиент), а также `vault_operator_claims{kind="VaultSecretClaim"}` и `vault_operator_managed_objects`.
 
 ## Связанные документы
 

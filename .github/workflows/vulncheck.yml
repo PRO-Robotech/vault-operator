@@ -6,7 +6,7 @@ on:
 
 jobs:
   govulncheck:
-    name: Run on Ubuntu
+    name: Vulnerability check
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code

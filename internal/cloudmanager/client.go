@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -135,11 +136,22 @@ type Options struct {
 	FindByBucket bool
 	// FindRetries is the number of extra findAll attempts on UNAVAILABLE.
 	FindRetries int
+	// QPS caps calls per second: 0 means DefaultQPS, a negative value
+	// disables the limit. Burst 0 means DefaultBurst.
+	QPS   float64
+	Burst int
 }
 
 const (
 	defaultCallTimeout = 15 * time.Second
 	findRetryDelay     = 200 * time.Millisecond
+)
+
+// The default limit sits well above what the default two workers issue (a
+// handful of calls per pass), so a default deployment is never throttled.
+const (
+	DefaultQPS   = 20
+	DefaultBurst = 40
 )
 
 // DefaultOptions returns the production defaults.
@@ -149,10 +161,11 @@ func DefaultOptions() Options {
 
 // Client talks to cloud-manager over gRPC.
 type Client struct {
-	conn  *grpc.ClientConn
-	cloud pb.CloudServiceClient
-	s3    pb.CloudS3ServiceClient
-	opts  Options
+	conn    *grpc.ClientConn
+	cloud   pb.CloudServiceClient
+	s3      pb.CloudS3ServiceClient
+	opts    Options
+	limiter *rate.Limiter
 }
 
 var _ BucketAPI = (*Client)(nil)
@@ -182,11 +195,38 @@ func NewWithOptions(addr string, opts Options) (*Client, error) {
 // NewFromConn wraps an existing connection.
 func NewFromConn(conn *grpc.ClientConn, opts Options) *Client {
 	return &Client{
-		conn:  conn,
-		cloud: pb.NewCloudServiceClient(conn),
-		s3:    pb.NewCloudS3ServiceClient(conn),
-		opts:  opts,
+		conn:    conn,
+		cloud:   pb.NewCloudServiceClient(conn),
+		s3:      pb.NewCloudS3ServiceClient(conn),
+		opts:    opts,
+		limiter: opts.limiter(),
 	}
+}
+
+// limiter is nil (no limit) for a negative QPS.
+func (o Options) limiter() *rate.Limiter {
+	if o.QPS < 0 {
+		return nil
+	}
+	qps, burst := o.QPS, o.Burst
+	if qps == 0 {
+		qps = DefaultQPS
+	}
+	if burst <= 0 {
+		burst = DefaultBurst
+	}
+	return rate.NewLimiter(rate.Limit(qps), burst)
+}
+
+// wait takes a call slot from the limiter.
+func (c *Client) wait(ctx context.Context) error {
+	if c.limiter == nil {
+		return nil
+	}
+	if err := c.limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("cloud-manager rate limit: %w", err)
+	}
+	return nil
 }
 
 func (o Options) callTimeout() time.Duration {
@@ -205,8 +245,12 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Create(ctx context.Context, in CreateInput) (string, error) {
+	if err := c.wait(ctx); err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.opts.callTimeout())
 	defer cancel()
+	start := time.Now()
 	resp, err := c.cloud.Create(ctx, &pb.CreateRequest{
 		CustomerIdentifier: in.CustomerLogin,
 		ConfigurationId:    in.ConfigurationID,
@@ -218,6 +262,7 @@ func (c *Client) Create(ctx context.Context, in CreateInput) (string, error) {
 			ManagedBy:  managedByEnum(in.ManagedBy),
 		}},
 	})
+	observe("Create", start, err)
 	if err != nil {
 		return "", fmt.Errorf("cloud-manager create: %w", err)
 	}
@@ -331,8 +376,13 @@ func (c *Client) findAll(ctx context.Context, scopes []*pb.FindAllRequest_Search
 			case <-time.After(findRetryDelay):
 			}
 		}
+		if err := c.wait(ctx); err != nil {
+			return nil, err
+		}
 		callCtx, cancel := context.WithTimeout(ctx, c.opts.callTimeout())
+		start := time.Now()
 		resp, err := c.s3.FindAll(callCtx, &pb.FindAllRequest{Scope: scopes})
+		observe("FindAll", start, err)
 		cancel()
 		if err == nil {
 			return resp, nil
@@ -346,9 +396,14 @@ func (c *Client) findAll(ctx context.Context, scopes []*pb.FindAllRequest_Search
 }
 
 func (c *Client) Remove(ctx context.Context, bucketName string) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.opts.callTimeout())
 	defer cancel()
+	start := time.Now()
 	resp, err := c.s3.RemoveBucket(ctx, &pb.RemoveBucketRequest{BucketName: bucketName})
+	observe("RemoveBucket", start, err)
 	if err != nil {
 		return fmt.Errorf("cloud-manager removeBucket: %w", err)
 	}

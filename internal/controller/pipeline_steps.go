@@ -71,7 +71,7 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	}
 	state.Vault = vc
 
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
@@ -163,6 +163,11 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 
 	if claim.Spec.Auth.TokenReviewer.ServiceAccount.AutoCreate {
 		if err := target.EnsureTokenReviewerSA(ctx, cs, claim); err != nil {
+			if target.IsForeignReviewer(err) {
+				ref := claim.Spec.Auth.TokenReviewer.ServiceAccount
+				return r.refuse(claim, state, vaultv1alpha1.ConditionTokenReviewerJWTFresh, ReasonForeignReviewer,
+					fmt.Sprintf("token reviewer %s/%s or its binding exists without this claim's labels; it is left as it is", ref.Namespace, ref.Name))
+			}
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionFalse, claim.Generation,
 				"TargetSAFailed", "ensuring the token reviewer ServiceAccount failed: "+failureText(err))
 			return Proceed, fmt.Errorf("ensure target SA: %w", err)
