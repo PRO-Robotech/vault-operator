@@ -41,10 +41,14 @@ var userExists = &pb.CreateError{Code: pb.CreateError_CODE_RESERVED, Message: "f
 // cloud-manager with blind re-creates.
 var _ = Describe("S3BucketClaim create recovery", func() {
 	var (
-		srv   *cmfake.Server
-		recon *S3BucketClaimReconciler
-		clk   time.Time
+		srv      *cmfake.Server
+		recon    *S3BucketClaimReconciler
+		newRecon func() *S3BucketClaimReconciler
+		clk      time.Time
 	)
+	// createTimeout is the create deadline of the client the reconciler talks
+	// through (the tests leave Options.CreateTimeout at its default).
+	createTimeout := cloudmanager.DefaultOptions().CreateTimeout
 
 	reconcileOnce := func(name string) reconcile.Result {
 		res, err := reconcileBucketOnce(recon, name)
@@ -66,16 +70,70 @@ var _ = Describe("S3BucketClaim create recovery", func() {
 		DeferCleanup(l.Stop)
 		conn, err := l.Dial()
 		Expect(err).NotTo(HaveOccurred())
-		recon = &S3BucketClaimReconciler{
-			Client:                 k8sClient,
-			Scheme:                 k8sClient.Scheme(),
-			Recorder:               record.NewFakeRecorder(200),
-			VaultFactory:           &fakeSecretVaultFactory{Client: newFakeSecretVault()},
-			Buckets:                cloudmanager.NewFromConn(conn, cloudmanager.Options{CallTimeout: 5 * time.Second, FindByBucket: true}),
-			DefaultConfigurationID: "s3_v1",
-			Now:                    func() time.Time { return clk },
+		buckets := cloudmanager.NewFromConn(conn, cloudmanager.Options{CallTimeout: 5 * time.Second, FindByBucket: true})
+		vaults := &fakeSecretVaultFactory{Client: newFakeSecretVault()}
+		// A new reconciler is what a restarted (or newly elected) operator
+		// runs: the same cluster state, nothing kept in memory, a fresh backoff.
+		newRecon = func() *S3BucketClaimReconciler {
+			return &S3BucketClaimReconciler{
+				Client:                 k8sClient,
+				Scheme:                 k8sClient.Scheme(),
+				Recorder:               record.NewFakeRecorder(200),
+				VaultFactory:           vaults,
+				Buckets:                buckets,
+				DefaultConfigurationID: "s3_v1",
+				Now:                    func() time.Time { return clk },
+			}
 		}
+		recon = newRecon()
 	})
+
+	// echoing is a client whose status patches go through while trim edits the
+	// pendingCreate of the answer, as a structural schema without a field
+	// prunes it.
+	echoing := func(trim func(*vaultv1alpha1.PendingBucketCreate)) client.Client {
+		ww, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		return interceptor.NewClient(ww, interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+				if err := c.Status().Patch(ctx, obj, p); err != nil {
+					return err
+				}
+				if s3, ok := obj.(*vaultv1alpha1.S3BucketClaim); ok && s3.Status.PendingCreate != nil {
+					trim(s3.Status.PendingCreate)
+				}
+				return nil
+			},
+		})
+	}
+
+	// cutByRestart runs one pass whose create the operator's shutdown cuts:
+	// the pass context is cancelled while the create is on the server, the
+	// server finishes it anyway, and the pass's final status write goes with
+	// the cancelled context. It returns the decision time as persisted.
+	cutByRestart := func(name string) time.Time {
+		pass, stop := context.WithCancel(ctx)
+		defer stop()
+		srv.CreateOutlivesCaller = true
+		srv.OnCreate = func() {
+			clk = clk.Add(5 * time.Second) // SIGTERM 5s into the call
+			stop()
+		}
+		decided := clk
+		_, err := recon.Reconcile(pass, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: name}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(creates()).To(Equal(1))
+		// The server commits the bucket after the caller has gone.
+		Eventually(srv.Buckets).Should(HaveLen(1))
+		srv.CreateOutlivesCaller, srv.OnCreate = false, nil
+
+		pending := getS3(name).Status.PendingCreate
+		Expect(pending).NotTo(BeNil())
+		// Fixture check: what survived is the marker written before the call;
+		// nothing the pass decided after the call reached the API server.
+		Expect(pending.Since.Time).To(BeTemporally("~", decided, time.Second))
+		return pending.Since.Time
+	}
 
 	It("records the bucket its first create made, even when it became visible only during a later attempt", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-late")
@@ -142,6 +200,88 @@ var _ = Describe("S3BucketClaim create recovery", func() {
 		reconcileOnce("s3slowcall")
 		Expect(creates()).To(Equal(1))
 		Expect(condReason(getS3("s3slowcall").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Locating"))
+	})
+
+	It("does not repeat a create cut by a restart before its deadline and the grace have passed since its decision", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-restart")
+		makeS3BucketClaim(ctx, "s3restart", "s3-cfg-restart")
+		// The bucket the cut create made is listed only from the third findAll
+		// after it is committed on.
+		srv.HideNewFindAlls = 2
+		since := cutByRestart("s3restart")
+
+		// The new leader: lease taken, the claim reconciled after the grace,
+		// while the server may still be finishing the first create.
+		recon = newRecon()
+		clk = since.Add(bucketCreateGrace + time.Second)
+		reconcileOnce("s3restart")
+		Expect(creates()).To(Equal(1))
+		Expect(condReason(getS3("s3restart").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Locating"))
+
+		clk = since.Add(createTimeout + bucketCreateGrace - time.Second)
+		reconcileOnce("s3restart")
+		Expect(creates()).To(Equal(1))
+		Expect(condReason(getS3("s3restart").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Locating"))
+
+		// Twin: past the wait the bucket is listed and recorded as this
+		// claim's, made by its only create.
+		clk = since.Add(createTimeout + bucketCreateGrace + time.Second)
+		reconcileOnce("s3restart")
+		got := getS3("s3restart")
+		Expect(creates()).To(Equal(1))
+		Expect(got.Status.BucketName).To(Equal(serverName("s3restart")))
+		Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+		Expect(got.Status.PendingCreate).To(BeNil())
+		Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Created"))
+	})
+
+	It("creates again once the deadline and the grace have passed since the decision of a create cut by a restart", func() {
+		// Twin of the probe above, one fact apart: the clock. The bucket is
+		// still not listed, and past the wait a create is issued.
+		makeHealthyVaultConfig(ctx, "s3-cfg-restart2")
+		makeS3BucketClaim(ctx, "s3restart2", "s3-cfg-restart2")
+		srv.HideNewFindAlls = 2
+		since := cutByRestart("s3restart2")
+
+		recon = newRecon()
+		clk = since.Add(createTimeout + bucketCreateGrace + time.Second)
+		reconcileOnce("s3restart2")
+		Expect(creates()).To(Equal(2))
+	})
+
+	It("does not create when the API server drops status.pendingCreate.existingNames", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-prunednames")
+		// An earlier bucket of this cluster is REMOVED: the snapshot of names
+		// taken before the create is not empty.
+		srv.Seed(&pb.Bucket{Name: serverName("s3prunednames"), CustLogin: s3Cust, Status: pb.Status_REMOVED})
+		makeS3BucketClaim(ctx, "s3prunednames", "s3-cfg-prunednames")
+		recon.Client = echoing(func(p *vaultv1alpha1.PendingBucketCreate) { p.ExistingNames = nil })
+		reconcileOnce("s3prunednames")
+
+		Expect(creates()).To(Equal(0))
+		Expect(condReason(getS3("s3prunednames").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("StatusSchemaOutdated"))
+	})
+
+	It("does not create when the API server drops status.pendingCreate.requestedName", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-prunedreq")
+		makeS3BucketClaim(ctx, "s3prunedreq", "s3-cfg-prunedreq")
+		recon.Client = echoing(func(p *vaultv1alpha1.PendingBucketCreate) { p.RequestedName = "" })
+		reconcileOnce("s3prunedreq")
+
+		Expect(creates()).To(Equal(0))
+		Expect(condReason(getS3("s3prunedreq").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("StatusSchemaOutdated"))
+	})
+
+	It("creates when the API server keeps the whole pendingCreate", func() {
+		// Twin of the two probes above, one fact apart: nothing is pruned.
+		makeHealthyVaultConfig(ctx, "s3-cfg-keptnames")
+		srv.Seed(&pb.Bucket{Name: serverName("s3keptnames"), CustLogin: s3Cust, Status: pb.Status_REMOVED})
+		makeS3BucketClaim(ctx, "s3keptnames", "s3-cfg-keptnames")
+		recon.Client = echoing(func(*vaultv1alpha1.PendingBucketCreate) {})
+		reconcileOnce("s3keptnames")
+
+		Expect(creates()).To(Equal(1))
+		Expect(condReason(getS3("s3keptnames").Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Created"))
 	})
 
 	It("does not create when the API server drops status.pendingCreate (CRD older than the image)", func() {

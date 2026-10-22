@@ -80,6 +80,11 @@ type Server struct {
 	// OnCreate, when set, runs inside every create before it answers (a test
 	// moves its clock there: the call took that long).
 	OnCreate func()
+	// CreateOutlivesCaller makes a create go on after its caller has gone, as
+	// cloud-manager does: past OnCreate it waits for the caller's context to
+	// end (a cancel, a deadline) and only then commits the bucket; the answer
+	// reaches no one.
+	CreateOutlivesCaller bool
 	// HideNewFindAlls hides a bucket a create makes from that many following
 	// findAll calls: the row is committed, the listing does not show it yet.
 	HideNewFindAlls int
@@ -185,7 +190,7 @@ func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateR
 	if len(s.CreateErrs) > 0 {
 		injected, s.CreateErrs = s.CreateErrs[0], s.CreateErrs[1:]
 	}
-	delay, onCreate := s.CreateDelay, s.OnCreate
+	delay, onCreate, outlive := s.CreateDelay, s.OnCreate, s.CreateOutlivesCaller
 	s.mu.Unlock()
 	if hang {
 		<-ctx.Done()
@@ -200,6 +205,9 @@ func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateR
 	}
 	if onCreate != nil {
 		onCreate()
+	}
+	if outlive {
+		<-ctx.Done()
 	}
 	if injected != nil {
 		return nil, injected
