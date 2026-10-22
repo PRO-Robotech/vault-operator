@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -54,6 +55,15 @@ type VaultConfigReconciler struct {
 	// vault.in-cloud.io/owner label. Empty (or "vault-operator") owns label-less
 	// + vault-operator configs; "vault-secret" owns the secret operator's config.
 	VaultConfigOwner string
+
+	// WatchCABundleSecrets probes a VaultConfig as soon as the Secret its CA
+	// bundle lives in changes. It watches Secret metadata, which only a
+	// process that may list Secrets can do; without it a rotated bundle is
+	// picked up by the next periodic probe (RequeueHealthy).
+	WatchCABundleSecrets bool
+
+	// Runtime carries the process-wide reconcile settings.
+	Runtime Runtime
 }
 
 // RBAC markers: internal/rbac/vaultoperator.
@@ -100,13 +110,30 @@ func (r *VaultConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	result := r.probeHealth(ctx, cfg)
 	cfg.Status.ObservedGeneration = cfg.Generation
-	cfg.Status.LastHealthCheckAt = ptrTime(time.Now())
+	cfg.Status.LastHealthCheckAt = healthCheckStamp(oldStatus, &cfg.Status, time.Now())
 
 	if err := r.updateStatusIfChanged(ctx, cfg, oldStatus); err != nil {
 		logger.V(1).Info("status update conflict (will retry)", "err", err.Error())
 	}
 
 	return result, nil
+}
+
+// healthCheckStamp is the lastHealthCheckAt to write. A probe that changed
+// nothing else keeps the recorded stamp until it is RequeueHealthy old: the
+// stamp alone would otherwise patch the VaultConfig on every reconcile, and a
+// patch is a watch event for every process that watches VaultConfigs.
+func healthCheckStamp(old, cur *vaultv1alpha1.VaultConfigStatus, now time.Time) *metav1.Time {
+	prev := old.LastHealthCheckAt
+	if prev == nil || now.Sub(prev.Time) >= RequeueHealthy {
+		return ptrTime(now)
+	}
+	a, b := old.DeepCopy(), cur.DeepCopy()
+	a.LastHealthCheckAt, b.LastHealthCheckAt = nil, nil
+	if !apiequality.Semantic.DeepEqual(a, b) {
+		return ptrTime(now)
+	}
+	return prev
 }
 
 func (r *VaultConfigReconciler) handleDeletion(ctx context.Context, cfg *vaultv1alpha1.VaultConfig) (ctrl.Result, error) {
@@ -153,6 +180,11 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 		return ctrl.Result{RequeueAfter: RequeueUnreachable}
 	}
 
+	// Every probe re-reads the CA bundle: a rotated CA reaches the cached
+	// client without a restart.
+	if rv, ok := r.VaultFactory.(caRevalidator); ok {
+		rv.Revalidate(cfg.Name)
+	}
 	vc, err := r.VaultFactory.For(ctx, r.Client, cfg)
 	if err != nil {
 		logger.Error(err, "build vault client")
@@ -216,7 +248,13 @@ func (r *VaultConfigReconciler) probeHealth(ctx context.Context, cfg *vaultv1alp
 	setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionVaultUnsealed, metav1.ConditionTrue, cfg.Generation,
 		"Unsealed", "Vault is unsealed")
 
-	if err := vc.Login(ctx); err != nil {
+	// The probe checks the token the process holds; it logs in only when
+	// there is none or Vault dropped it.
+	err = vc.EnsureLoggedIn(ctx)
+	if err == nil {
+		err = vc.LookupSelf(ctx)
+	}
+	if err != nil {
 		logger.Error(err, "vault login failed")
 		reason, requeue := classifyVaultErr(err, ReasonLoginFailed)
 		setCondition(&cfg.Status.Conditions, vaultv1alpha1.ConditionManagerLoggedIn, metav1.ConditionFalse, cfg.Generation,
@@ -302,29 +340,67 @@ func (r *VaultConfigReconciler) updateStatusIfChanged(ctx context.Context, cfg *
 	return r.Status().Patch(ctx, cfg, client.MergeFrom(base))
 }
 
+// SetupWithManager watches the claims only for what changes the count of
+// references: a claim created, deleted, or pointed at another VaultConfig. A
+// claim's status write is not one, so it never re-probes Vault.
 func (r *VaultConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The probe's own status write is not a reason to probe again: the
+	// requeue paces it.
 	b := ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.VaultConfig{}, builder.WithPredicates(vaultConfigOwnerPredicate(r.VaultConfigOwner)))
+		For(&vaultv1alpha1.VaultConfig{}, builder.WithPredicates(
+			vaultConfigOwnerPredicate(r.VaultConfigOwner),
+			predicate.Or(predicate.GenerationChangedPredicate{}, predicate.LabelChangedPredicate{}, predicate.AnnotationChangedPredicate{}),
+		))
 
 	switch r.VaultConfigOwner {
 	case vaultv1alpha1.OwnerVaultSecretOperator:
 		b = b.Watches(
 			&vaultv1alpha1.VaultSecretClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForSecretClaim),
+			builder.WithPredicates(configRefPredicate(secretClaimConfigRef)),
 		)
 	case vaultv1alpha1.OwnerBucketOperator:
 		b = b.Watches(
 			&vaultv1alpha1.S3BucketClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForBucketClaim),
+			builder.WithPredicates(configRefPredicate(bucketClaimConfigRef)),
 		)
 	default:
 		b = b.Watches(
 			&vaultv1alpha1.VaultClaim{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigForClaim),
+			builder.WithPredicates(configRefPredicate(vaultClaimConfigRef)),
+		)
+	}
+	if r.WatchCABundleSecrets {
+		b = b.WatchesMetadata(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigsForCABundle),
 		)
 	}
 
-	return b.Named("vaultconfig").Complete(r)
+	return b.Named("vaultconfig").WithOptions(r.Runtime.controllerOptions(1)).Complete(r.Runtime.wrap(r))
+}
+
+// findVaultConfigsForCABundle maps a Secret to the VaultConfigs this
+// reconciler owns whose CA bundle it holds.
+func (r *VaultConfigReconciler) findVaultConfigsForCABundle(ctx context.Context, obj client.Object) []reconcile.Request {
+	var cfgs vaultv1alpha1.VaultConfigList
+	if err := r.List(ctx, &cfgs); err != nil {
+		log.FromContext(ctx).Error(err, "list VaultConfigs for a CA bundle Secret", "secret", obj.GetName())
+		return nil
+	}
+	var out []reconcile.Request
+	for i := range cfgs.Items {
+		c := &cfgs.Items[i]
+		if !ownerMatches(c.Labels[vaultv1alpha1.LabelVaultConfigOwner], r.VaultConfigOwner) || c.Spec.TLS == nil {
+			continue
+		}
+		if ref := c.Spec.TLS.CABundleSecretRef; ref != nil && ref.Namespace == obj.GetNamespace() && ref.Name == obj.GetName() {
+			out = append(out, reconcile.Request{NamespacedName: client.ObjectKey{Name: c.Name}})
+		}
+	}
+	return out
 }
 
 func (r *VaultConfigReconciler) findVaultConfigForClaim(_ context.Context, obj client.Object) []reconcile.Request {

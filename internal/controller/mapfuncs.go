@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -34,33 +35,38 @@ func (r *VaultClaimReconciler) findClaimsForVaultConfig(ctx context.Context, obj
 		return nil
 	}
 	var claims vaultv1alpha1.VaultClaimList
-	if err := r.List(ctx, &claims); err != nil {
+	if err := r.List(ctx, &claims, client.MatchingFields{IndexVaultConfigRef: cfg.Name}); err != nil {
 		log.FromContext(ctx).Error(err, "list VaultClaims for VaultConfig fan-out", "config", cfg.Name)
 		return nil
 	}
 	out := make([]reconcile.Request, 0, len(claims.Items))
 	for i := range claims.Items {
-		if claims.Items[i].Spec.VaultConfigRef.Name != cfg.Name {
-			continue
-		}
 		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&claims.Items[i])})
 	}
 	return out
 }
 
+// findClaimsForSecret maps a kubeconfig Secret to the claims of its namespace
+// that read it. The watch holds Secret metadata only, so obj is a
+// PartialObjectMetadata there; a typed Secret is accepted as well.
 func (r *VaultClaimReconciler) findClaimsForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
+	switch o := obj.(type) {
+	case *corev1.Secret:
+	case *metav1.PartialObjectMetadata:
+		if o.Kind != "" && o.Kind != "Secret" {
+			return nil
+		}
+	default:
 		return nil
 	}
 	var claims vaultv1alpha1.VaultClaimList
-	if err := r.List(ctx, &claims, client.InNamespace(secret.Namespace)); err != nil {
-		log.FromContext(ctx).Error(err, "list VaultClaims for Secret fan-out", "secret", secret.Name)
+	if err := r.List(ctx, &claims, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "list VaultClaims for Secret fan-out", "secret", obj.GetName())
 		return nil
 	}
 	out := make([]reconcile.Request, 0)
 	for i := range claims.Items {
-		if kubeconfigSecretName(&claims.Items[i]) != secret.Name {
+		if kubeconfigSecretName(&claims.Items[i]) != obj.GetName() {
 			continue
 		}
 		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&claims.Items[i])})

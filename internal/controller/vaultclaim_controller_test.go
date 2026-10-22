@@ -266,7 +266,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(got.Status.Vault.TokenReviewerJWT.LastRotated).NotTo(BeNil())
 		Expect(got.Status.Vault.LastReconcileAt).NotTo(BeNil())
 
-		// Vault.Login was called (Step 1 verifies token).
+		// Step 1 made sure the client holds a token.
 		Expect(fakeVC.LoginCalls).To(Equal(1))
 
 		// Target SA + CRB were created in the (fake) target cluster.
@@ -822,8 +822,9 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		fakeVC.mu.Lock()
 		beforeWriteConfig := fakeVC.WriteConfigCalls
 		beforePutRole := fakeVC.PutRoleCalls
-		// Step 5 reads sys/auth before it writes; the drift pass adds exactly one read.
+		// The drift pass reads the claim's own mount once and lists nothing.
 		beforeListAuth := fakeVC.ListAuthMountsCalls
+		beforeReadAuth := fakeVC.ReadAuthMountCalls
 		fakeVC.mu.Unlock()
 
 		// Prime Vault to report "no drift".
@@ -846,7 +847,8 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		// Steps 5-7 were skipped → write counters unchanged.
 		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWriteConfig), "Step 5 must be skipped on no-drift")
 		Expect(fakeVC.PutRoleCalls).To(Equal(beforePutRole), "Step 7 must be skipped on no-drift")
-		Expect(fakeVC.ListAuthMountsCalls).To(Equal(beforeListAuth + 1))
+		Expect(fakeVC.ListAuthMountsCalls).To(Equal(beforeListAuth), "the drift check does not list sys/auth")
+		Expect(fakeVC.ReadAuthMountCalls).To(Equal(beforeReadAuth+1), "the drift check reads the claim's mount once")
 		Expect(fakeVC.ReadAuthCfgCalls).To(Equal(1), "drift check must read auth config")
 	})
 

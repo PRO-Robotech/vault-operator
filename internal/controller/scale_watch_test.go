@@ -275,3 +275,65 @@ var _ = Describe("Load shape", func() {
 		Eventually(logins, 10*time.Second, 100*time.Millisecond).Should(BeNumerically(">", settledLogins))
 	})
 })
+
+var _ = Describe("CA bundle watch", func() {
+	It("a change of the CA bundle Secret probes its VaultConfig at once; another Secret does not", func() {
+		const selectorKey = "vault-operator-test/ca-watch"
+		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+			Scheme:                 k8sClient.Scheme(),
+			Metrics:                metricsserver.Options{BindAddress: "0"},
+			HealthProbeBindAddress: "0",
+			Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+				&vaultv1alpha1.VaultConfig{}: {Label: labels.SelectorFromSet(labels.Set{selectorKey: "yes"})},
+				&vaultv1alpha1.VaultClaim{}:  {Label: labels.SelectorFromSet(labels.Set{selectorKey: "yes"})},
+			}},
+			Client:     client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}, &corev1.ConfigMap{}}}},
+			Controller: config.Controller{SkipNameValidation: ptr.To(true)},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect((&VaultConfigReconciler{
+			Client: mgr.GetClient(), Scheme: mgr.GetScheme(),
+			VaultFactory:         &fakeVaultFactory{Client: &fakeVaultClient{SharedMountResp: true}},
+			WatchCABundleSecrets: true,
+		}).SetupWithManager(mgr)).To(Succeed())
+
+		name := "ca-watch-" + nextClaimName()
+		caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: vcNS}, Data: map[string][]byte{"ca.crt": []byte("one")}}
+		other := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-other", Namespace: vcNS}, Data: map[string][]byte{"x": []byte("one")}}
+		for _, s := range []*corev1.Secret{caSecret, other} {
+			Expect(k8sClient.Create(context.Background(), s)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), s) })
+		}
+		vcfg := &vaultv1alpha1.VaultConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{selectorKey: "yes"}},
+			Spec: vaultv1alpha1.VaultConfigSpec{
+				Address:     "https://vault.example",
+				ManagerAuth: vaultv1alpha1.ManagerAuthSpec{Method: vaultv1alpha1.AuthMethodKubernetes, MountPath: "kubernetes-mgmt", Role: "vault-operator"},
+				Storage:     vaultv1alpha1.StorageSpec{KvMountPath: "secret"},
+				TLS:         &vaultv1alpha1.TLSSpec{CABundleSecretRef: &vaultv1alpha1.SecretKeySelector{Name: name, Namespace: vcNS, Key: "ca.crt"}},
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), vcfg)).To(Succeed())
+		DeferCleanup(func() { removeVaultConfig(name) })
+		startManager(mgr)
+
+		Eventually(func() float64 { return reconcileTotal("vaultconfig") }, 30*time.Second, 200*time.Millisecond).
+			Should(BeNumerically(">", 0))
+		baseline := settled("vaultconfig")
+
+		By("another Secret changes")
+		fresh := &corev1.Secret{}
+		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(other), fresh)).To(Succeed())
+		fresh.Data["x"] = []byte("two")
+		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		Consistently(func() float64 { return reconcileTotal("vaultconfig") }, 2*time.Second, 200*time.Millisecond).
+			Should(Equal(baseline))
+
+		By("the CA bundle Secret changes")
+		Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(caSecret), fresh)).To(Succeed())
+		fresh.Data["ca.crt"] = []byte("two")
+		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
+		Eventually(func() float64 { return reconcileTotal("vaultconfig") }, 10*time.Second, 100*time.Millisecond).
+			Should(BeNumerically(">", baseline))
+	})
+})

@@ -23,8 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,6 +53,9 @@ type VaultSecretClaimReconciler struct {
 
 	// MaxConcurrentReconciles bounds parallel claims (0 → 1).
 	MaxConcurrentReconciles int
+
+	// Runtime carries the process-wide reconcile settings.
+	Runtime Runtime
 }
 
 func (r *VaultSecretClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -169,7 +172,7 @@ func (r *VaultSecretClaimReconciler) resolveAndLogin(ctx context.Context, claim 
 		return nil, nil, ctrl.Result{RequeueAfter: secretRequeueLoginTransient}, false
 	}
 
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
@@ -468,7 +471,7 @@ func (r *VaultSecretClaimReconciler) clientForDeletion(ctx context.Context, clai
 	if err != nil {
 		return nil, nil, false
 	}
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		return nil, nil, false
 	}
 	return vc, cfg, true
@@ -563,13 +566,17 @@ func (r *VaultSecretClaimReconciler) now() time.Time {
 }
 
 func (r *VaultSecretClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := indexConfigRef(mgr, &vaultv1alpha1.VaultSecretClaim{}, secretClaimConfigRef); err != nil {
+		return fmt.Errorf("index VaultSecretClaims by VaultConfig: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vaultv1alpha1.VaultSecretClaim{}).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findSecretClaimsForVaultConfig),
+			builder.WithPredicates(vaultConfigFanOutPredicate()),
 		).
-		WithOptions(controller.Options{MaxConcurrentReconciles: max(1, r.MaxConcurrentReconciles)}).
+		WithOptions(r.Runtime.controllerOptions(max(1, r.MaxConcurrentReconciles))).
 		Named("vaultsecretclaim").
-		Complete(r)
+		Complete(r.Runtime.wrap(r))
 }

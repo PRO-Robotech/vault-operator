@@ -78,20 +78,29 @@ func (d DriftReport) Summary() string {
 	return strings.Join(parts, "; ")
 }
 
+// liveObjects holds the bodies the drift check already read, so the content
+// comparison does not read them a second time.
+type liveObjects struct {
+	policies map[string]string
+	roles    map[string]*vault.KubernetesRole
+}
+
 // detectDrift is read-only: errors propagate so the caller can fall through
-// to the full pipeline (safer than silently leaving drift). The drift metric
-// is incremented once per category, not once per object, to keep cardinality
+// to the full pipeline (safer than silently leaving drift). It reads the
+// claim's own objects one by one — its mount, its policies, its roles — so
+// its cost follows the claim, not the size of Vault. The drift metric is
+// incremented once per category, not once per object, to keep cardinality
 // bounded.
 func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim) (DriftReport, error) {
 	var report DriftReport
 	mount := claim.Spec.Auth.MountPath
+	live := liveObjects{policies: map[string]string{}, roles: map[string]*vault.KubernetesRole{}}
 
-	// Mount missing → listing policies/roles under it is meaningless.
-	mounts, err := vc.ListAuthMounts(ctx)
+	// Mount missing → reading its config is meaningless.
+	info, mountExists, err := vc.ReadAuthMount(ctx, mount)
 	if err != nil {
-		return report, fmt.Errorf("list auth mounts: %w", err)
+		return report, fmt.Errorf("read auth mount: %w", err)
 	}
-	info, mountExists := mounts[mountKey(mount)]
 	if !mountExists {
 		report.MountMissing = true
 		driftDetectedCounter.WithLabelValues(DriftTypeMount).Inc()
@@ -108,25 +117,21 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 	}
 
-	// Only check policies we own — user-managed policies are not our drift.
-	if len(claim.Spec.Policies) > 0 {
-		existing, err := vc.ListPolicies(ctx)
-		if err != nil {
-			return report, fmt.Errorf("list policies: %w", err)
+	// Only policies we own are read — user-managed policies are not our drift.
+	for i := range claim.Spec.Policies {
+		name := claim.Spec.Policies[i].Name
+		body, err := vc.ReadPolicy(ctx, name)
+		switch {
+		case err == nil:
+			live.policies[name] = body
+		case vault.IsNotFound(err):
+			report.MissingPolicies = append(report.MissingPolicies, name)
+		default:
+			return report, fmt.Errorf("read policy %q: %w", name, err)
 		}
-		present := make(map[string]struct{}, len(existing))
-		for _, name := range existing {
-			present[nameKey(name)] = struct{}{}
-		}
-		for i := range claim.Spec.Policies {
-			name := claim.Spec.Policies[i].Name
-			if _, ok := present[nameKey(name)]; !ok {
-				report.MissingPolicies = append(report.MissingPolicies, name)
-			}
-		}
-		if len(report.MissingPolicies) > 0 {
-			driftDetectedCounter.WithLabelValues(DriftTypePolicy).Inc()
-		}
+	}
+	if len(report.MissingPolicies) > 0 {
+		driftDetectedCounter.WithLabelValues(DriftTypePolicy).Inc()
 	}
 
 	var recorded string
@@ -134,11 +139,11 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		recorded = claim.Status.Vault.AuthMountPath
 	}
 	owned := mountExists && mountAccepted(info, claim, recorded)
-	if err := r.detectRoleDrift(ctx, vc, claim, owned, &report); err != nil {
+	if err := r.detectRoleDrift(ctx, vc, claim, owned, &report, live); err != nil {
 		return report, err
 	}
 
-	if err := r.detectTransitDrift(ctx, vc, claim, &report); err != nil {
+	if err := r.detectTransitDrift(ctx, vc, claim, &report, live); err != nil {
 		return report, err
 	}
 
@@ -146,17 +151,17 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 }
 
 // detectRoleDrift reports missing roles and extra ones. Exclusive judges
-// every role on a mount the claim owns; otherwise only roles the ledger says
-// the claim wrote can be extra.
-func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, owned bool, report *DriftReport) error {
+// every role on a mount the claim owns, so it lists the mount; otherwise
+// only the claim's roles are read, and only a role the ledger says the claim
+// wrote can be extra.
+func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim,
+	owned bool, report *DriftReport, live liveObjects) error {
 	mount := claim.Spec.Auth.MountPath
-	existingRoles, err := vc.ListKubernetesRoles(ctx, mount)
-	if err != nil {
-		return fmt.Errorf("list roles: %w", err)
-	}
 	desired := make(map[string]string, len(claim.Spec.Roles))
+	names := make([]string, 0, len(claim.Spec.Roles))
 	for i := range claim.Spec.Roles {
 		desired[nameKey(claim.Spec.Roles[i].Name)] = claim.Spec.Roles[i].Name
+		names = append(names, claim.Spec.Roles[i].Name)
 	}
 	exclusive := owned && claim.Spec.Auth.ManagesConfig() && claim.Spec.Auth.RolePruningMode() == vaultv1alpha1.RolePruningExclusive
 	var ledger []string
@@ -167,19 +172,48 @@ func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClie
 	if err != nil {
 		return err
 	}
-	present := make(map[string]struct{}, len(existingRoles))
-	for _, name := range existingRoles {
-		present[nameKey(name)] = struct{}{}
-		if _, ok := desired[nameKey(name)]; ok {
-			continue
+
+	if exclusive {
+		existingRoles, err := vc.ListKubernetesRoles(ctx, mount)
+		if err != nil {
+			return fmt.Errorf("list roles: %w", err)
 		}
-		if (exclusive || containsName(ledger, name)) && !keep(name) {
-			report.ExtraRoles = append(report.ExtraRoles, name)
+		present := make(map[string]struct{}, len(existingRoles))
+		for _, name := range existingRoles {
+			present[nameKey(name)] = struct{}{}
+			if _, ok := desired[nameKey(name)]; !ok && !keep(name) {
+				report.ExtraRoles = append(report.ExtraRoles, name)
+			}
 		}
-	}
-	for key, name := range desired {
-		if _, ok := present[key]; !ok {
-			report.MissingRoles = append(report.MissingRoles, name)
+		for _, name := range names {
+			if _, ok := present[nameKey(name)]; !ok {
+				report.MissingRoles = append(report.MissingRoles, name)
+			}
+		}
+	} else {
+		for _, name := range names {
+			role, err := vc.ReadKubernetesRole(ctx, mount, name)
+			switch {
+			case err == nil:
+				live.roles[name] = role
+			case vault.IsNotFound(err):
+				report.MissingRoles = append(report.MissingRoles, name)
+			default:
+				return fmt.Errorf("read role %q: %w", name, err)
+			}
+		}
+		for _, name := range minus(ledger, names) {
+			if keep(name) {
+				continue
+			}
+			_, err := vc.ReadKubernetesRole(ctx, mount, name)
+			switch {
+			case err == nil:
+				report.ExtraRoles = append(report.ExtraRoles, name)
+			case vault.IsNotFound(err):
+			default:
+				return fmt.Errorf("read role %q: %w", name, err)
+			}
 		}
 	}
 	if len(report.MissingRoles) > 0 || len(report.ExtraRoles) > 0 {
@@ -212,7 +246,8 @@ func (r *VaultClaimReconciler) pruneFilter(ctx context.Context, claim *vaultv1al
 }
 
 // detectTransitDrift reports keys that vanished or changed version.
-func (r *VaultClaimReconciler) detectTransitDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport) error {
+func (r *VaultClaimReconciler) detectTransitDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim,
+	report *DriftReport, live liveObjects) error {
 	if claim.Spec.Transit == nil || len(claim.Spec.Transit.Keys) == 0 {
 		return nil
 	}
@@ -246,42 +281,52 @@ func (r *VaultClaimReconciler) detectTransitDrift(ctx context.Context, vc VaultC
 	if len(report.MissingKeys) > 0 || len(report.KeyVersionMoved) > 0 {
 		driftDetectedCounter.WithLabelValues(DriftTypeTransitKey).Inc()
 	}
-	return r.detectContentDrift(ctx, vc, claim, report)
+	return r.detectContentDrift(ctx, vc, claim, report, live)
 }
 
 // detectContentDrift compares live role and policy bodies against spec.
 // Scoped to claims declaring Transit keys; elsewhere the name check stands.
-func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim, report *DriftReport) error {
+// Bodies the presence check already read are not read again.
+func (r *VaultClaimReconciler) detectContentDrift(ctx context.Context, vc VaultClient, claim *vaultv1alpha1.VaultClaim,
+	report *DriftReport, live liveObjects) error {
 	mount := claim.Spec.Auth.MountPath
 
 	for i := range claim.Spec.Roles {
 		want := claim.Spec.Roles[i]
-		live, err := vc.ReadKubernetesRole(ctx, mount, want.Name)
-		if err != nil {
-			if vault.IsNotFound(err) {
-				continue
+		role, ok := live.roles[want.Name]
+		if !ok {
+			got, err := vc.ReadKubernetesRole(ctx, mount, want.Name)
+			if err != nil {
+				if vault.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("read role %q: %w", want.Name, err)
 			}
-			return fmt.Errorf("read role %q: %w", want.Name, err)
+			role = got
 		}
-		if diff := roleBodyDiff(want, live); diff != "" {
+		if diff := roleBodyDiff(want, role); diff != "" {
 			report.ChangedRoles = append(report.ChangedRoles, fmt.Sprintf("%s (%s)", want.Name, diff))
 		}
 	}
 
 	for i := range claim.Spec.Policies {
 		want := claim.Spec.Policies[i]
-		live, err := vc.ReadPolicy(ctx, want.Name)
-		if err != nil {
-			if vault.IsNotFound(err) {
-				continue
+		body, ok := live.policies[want.Name]
+		if !ok {
+			got, err := vc.ReadPolicy(ctx, want.Name)
+			if err != nil {
+				if vault.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("read policy %q: %w", want.Name, err)
 			}
-			return fmt.Errorf("read policy %q: %w", want.Name, err)
+			body = got
 		}
 		// Templated bodies are resolved at apply time and cannot be compared here.
 		if strings.Contains(want.Rules, templateAccessorVar) {
 			continue
 		}
-		if normalizeHCL(live) != normalizeHCL(want.Rules) {
+		if normalizeHCL(body) != normalizeHCL(want.Rules) {
 			report.ChangedPolicies = append(report.ChangedPolicies, want.Name)
 		}
 	}

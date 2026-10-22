@@ -29,7 +29,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -63,6 +62,9 @@ type VaultClaimReconciler struct {
 	// PolicyGuard selects what a policy outside the claim's classes does;
 	// empty means audit.
 	PolicyGuard policyguard.Mode
+
+	// Runtime carries the process-wide reconcile settings.
+	Runtime Runtime
 
 	backoff stepBackoff
 }
@@ -114,9 +116,14 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// executePipeline advances oldStatus each time it persists an intent, so
 	// the final patch is computed against what the API server already holds.
-	result := r.executePipeline(ctx, claim, oldStatus)
+	result, completed := r.executePipeline(ctx, claim, oldStatus)
 
-	claim.Status.ObservedGeneration = observed
+	// Only a pass that brought Vault to the spec observed it: after a failed,
+	// waiting or refused pass the generation stays unobserved, and the next
+	// pass does not take the drift-check shortcut.
+	if completed {
+		claim.Status.ObservedGeneration = observed
+	}
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
@@ -184,25 +191,32 @@ func (r *VaultClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if workers <= 0 {
 		workers = defaultMaxConcurrentReconciles
 	}
+	if err := indexConfigRef(mgr, &vaultv1alpha1.VaultClaim{}, vaultClaimConfigRef); err != nil {
+		return fmt.Errorf("index VaultClaims by VaultConfig: %w", err)
+	}
 	// Status patches (every pass writes one when anything changed) must not
 	// re-trigger the claim: the pipeline's own RequeueAfter paces it. Deletion
-	// bumps generation, so the reverse pipeline still starts at once.
+	// bumps generation, so the reverse pipeline still starts at once. A
+	// VaultConfig reaches its claims only when what they read of it changes.
+	// Secrets are watched by metadata: the kubeconfig is read live when a pass
+	// needs it, so no Secret body is held in memory.
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vaultv1alpha1.VaultClaim{}, builder.WithPredicates(predicate.Or(
 			predicate.GenerationChangedPredicate{},
 			predicate.LabelChangedPredicate{},
 			predicate.AnnotationChangedPredicate{},
 		))).
-		WithOptions(controller.Options{MaxConcurrentReconciles: workers}).
+		WithOptions(r.Runtime.controllerOptions(workers)).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findClaimsForVaultConfig),
+			builder.WithPredicates(vaultConfigFanOutPredicate()),
 		).
-		Watches(
+		WatchesMetadata(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findClaimsForSecret),
 			builder.WithPredicates(kubeconfigSecretPredicate()),
 		).
 		Named("vaultclaim").
-		Complete(r)
+		Complete(r.Runtime.wrap(r))
 }

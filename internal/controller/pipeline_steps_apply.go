@@ -167,15 +167,24 @@ func (r *VaultClaimReconciler) stepVerifyGuestMount(ctx context.Context, claim *
 	return Proceed, nil
 }
 
-// resolveIssuer: explicit spec, then OIDC discovery, then disable ISS validation.
+// resolveIssuer: explicit spec, then OIDC discovery, then the issuer an
+// earlier discovery recorded, then disable ISS validation. A discovery that
+// fails for a pass does not turn ISS validation off on a mount it once had.
 func (r *VaultClaimReconciler) resolveIssuer(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (string, bool) {
 	if claim.Spec.Auth.Issuer != "" {
 		return claim.Spec.Auth.Issuer, false
 	}
+	if claim.Status.Vault == nil {
+		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
+	}
 	if state.Target != nil {
 		if issuer, err := target.DiscoverIssuer(ctx, state.Target); err == nil && issuer != "" {
+			claim.Status.Vault.Issuer = issuer
 			return issuer, false
 		}
+	}
+	if recorded := claim.Status.Vault.Issuer; recorded != "" {
+		return recorded, false
 	}
 	return "", true
 }

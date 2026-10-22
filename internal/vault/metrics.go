@@ -27,7 +27,14 @@ const (
 	ResultLoginFailed  = "login_failed"
 	ResultRenewSuccess = "renew_success"
 	ResultRenewFailed  = "renew_failed"
+	// ResultRevokeSuccess and ResultRevokeFailed count revokes of a token the
+	// client replaced or gave up at shutdown.
+	ResultRevokeSuccess = "revoke_success"
+	ResultRevokeFailed  = "revoke_failed"
 )
+
+// defaultClientName labels a client built without a name.
+const defaultClientName = "default"
 
 // PathOther is the catch-all bucket so dashboards detect surprise endpoints
 // without losing cardinality control.
@@ -63,8 +70,42 @@ var ClientTokenRenewalTotal = prometheus.NewCounterVec(
 	[]string{"result"},
 )
 
+// APIRequestDuration is the latency of Vault calls by verb, path bucket and
+// outcome. Labels are the bounded sets of APICallsTotal: the series count does
+// not grow with the number of claims.
+var APIRequestDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "vault_api_request_duration_seconds",
+		Help:    "Latency of Vault HTTP calls from the operator, by verb, normalised path bucket, and outcome.",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	},
+	[]string{"verb", "path", "result"},
+)
+
+// Circuit state values of CircuitState.
+const (
+	circuitClosedValue   = 0
+	circuitHalfOpenValue = 1
+	circuitOpenValue     = 2
+)
+
+// CircuitState is the breaker state of each Vault client, labelled by the
+// client's name (one per VaultConfig): 0 closed, 1 half-open, 2 open.
+var CircuitState = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "vault_circuit_state",
+		Help: "Circuit breaker state of the operator's Vault client per VaultConfig: 0 closed, 1 half-open, 2 open.",
+	},
+	[]string{"vault_config"},
+)
+
+// ForgetClient drops the series of a client that is gone.
+func ForgetClient(name string) {
+	CircuitState.DeleteLabelValues(name)
+}
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(APIResponsesTotal, APICallsTotal, ClientTokenRenewalTotal)
+	ctrlmetrics.Registry.MustRegister(APIResponsesTotal, APICallsTotal, ClientTokenRenewalTotal, APIRequestDuration, CircuitState)
 }
 
 // normalizePath collapses a Vault HTTP path to a bounded label set: variable

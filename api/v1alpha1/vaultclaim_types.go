@@ -34,6 +34,10 @@ const (
 	ConditionRolesApplied          = "RolesApplied"
 	ConditionTokenReviewerJWTFresh = "TokenReviewerJWTFresh"
 	ConditionTransitKeysReady      = "TransitKeysReady"
+	// ConditionDegraded is True while the last pass failed on a step error;
+	// its reason is the failure cause. Ready keeps the outcome of the last
+	// completed pass.
+	ConditionDegraded = "Degraded"
 )
 
 // DeletionPolicy values are shared with VaultSecretClaim. Neither ever deletes a Transit key.
@@ -374,6 +378,11 @@ type TransitKeyStatus struct {
 type VaultStatusSummary struct {
 	// +optional
 	ConfigName string `json:"configName,omitempty"`
+
+	// Issuer is the service account issuer last discovered in the target
+	// cluster. A pass whose discovery fails configures the mount with it.
+	// +optional
+	Issuer string `json:"issuer,omitempty"`
 
 	// AuthMountPath is the auth mount this claim was accepted on. It is written
 	// only once the mount is accepted, never before, so a claim that waited

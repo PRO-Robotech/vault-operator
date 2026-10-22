@@ -71,7 +71,7 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	}
 	state.Vault = vc
 
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen

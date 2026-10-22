@@ -133,7 +133,9 @@ func (r *VaultClaimReconciler) pipelineSteps(claim *vaultv1alpha1.VaultClaim) []
 // short-circuit the remaining steps. base is the status as last persisted; the
 // pipeline advances it each time it writes an intent. Every step works on the
 // spec claim held when the pass began: an intent never refreshes it.
-func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vaultv1alpha1.VaultClaim, base *vaultv1alpha1.VaultClaimStatus) ctrl.Result {
+// completed reports a pass that ended Ready.
+func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vaultv1alpha1.VaultClaim,
+	base *vaultv1alpha1.VaultClaimStatus) (result ctrl.Result, completed bool) {
 	logger := log.FromContext(ctx)
 	state := &pipelineState{persist: func(ctx context.Context, c *vaultv1alpha1.VaultClaim) error {
 		return r.persistIntent(ctx, c, base)
@@ -158,9 +160,14 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 			logger.V(1).Info("spec changed during the pass; starting over", "step", s.name)
 			r.backoff.Reset(key)
 			setPhase(claim, startPhase)
-			return ctrl.Result{RequeueAfter: RequeueClaimSpecChanged}
+			return ctrl.Result{RequeueAfter: RequeueClaimSpecChanged}, false
 		}
+		countStep(s.name, res, err)
 		if err != nil {
+			// Degraded names the cause from the closed set; Ready is the
+			// outcome of the last completed pass and stays as it was.
+			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionDegraded, metav1.ConditionTrue, claim.Generation,
+				string(classifyFailure(err)), failureText(err))
 			var requeue time.Duration
 			var co *vault.CircuitOpenError
 			if errors.As(err, &co) {
@@ -176,25 +183,25 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "StepRetrying",
 					"Step %s failed (transient): %s", s.name, failureText(err))
 			}
-			return ctrl.Result{RequeueAfter: requeue}
+			return ctrl.Result{RequeueAfter: requeue}, false
 		}
 		switch res {
 		case Wait:
 			logger.V(1).Info("pipeline step waiting", "step", s.name)
 			r.backoff.Reset(key)
-			return ctrl.Result{RequeueAfter: s.waitInterval}
+			return ctrl.Result{RequeueAfter: s.waitInterval}, false
 		case Refuse:
 			r.backoff.Reset(key)
 			setPhase(claim, vaultv1alpha1.PhaseFailed)
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation,
 				state.RefusedReason, fmt.Sprintf("step %s refused the claim; see its condition", s.name))
-			return ctrl.Result{RequeueAfter: RequeueClaimRefused}
+			return ctrl.Result{RequeueAfter: RequeueClaimRefused}, false
 		}
 
 		if s.name == stepAdmission && wasReady && !specChanged && state.Vault != nil {
 			if early, res := r.driftCheckAndMaybeShortCircuit(ctx, claim, state); early {
 				r.backoff.Reset(key)
-				return res
+				return res, true
 			}
 		}
 	}
@@ -205,7 +212,7 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 		r.Recorder.Eventf(claim, corev1.EventTypeNormal, "VaultClaimReady",
 			"All pipeline steps completed; auth/%s configured", claim.Spec.Auth.MountPath)
 	}
-	return ctrl.Result{RequeueAfter: RequeueClaimDriftReady}
+	return ctrl.Result{RequeueAfter: RequeueClaimDriftReady}, true
 }
 
 // refuse records why the claim may not proceed. The message is built from
@@ -308,6 +315,8 @@ func setReady(claim *vaultv1alpha1.VaultClaim) {
 	setPhase(claim, vaultv1alpha1.PhaseReady)
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionTrue, claim.Generation,
 		"Ready", "All pipeline steps completed")
+	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionDegraded, metav1.ConditionFalse, claim.Generation,
+		ReasonReconciled, "the last pass completed")
 }
 
 func kubeconfigSecretName(claim *vaultv1alpha1.VaultClaim) string {

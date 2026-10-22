@@ -28,6 +28,9 @@ const OIDCDiscoveryPath = "/.well-known/openid-configuration"
 
 const oidcDiscoveryHTTPTimeout = 5 * time.Second
 
+// maxDiscoveryBody caps the discovery document; a real one is under 1 KiB.
+const maxDiscoveryBody = 1 << 20
+
 type oidcDiscoveryResponse struct {
 	Issuer string `json:"issuer"`
 }
@@ -43,21 +46,26 @@ func DiscoverIssuer(ctx context.Context, cs *ClientSet) (string, error) {
 		return "", fmt.Errorf("target ClientSet has no Host configured")
 	}
 
-	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if len(cs.CABundle) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(cs.CABundle) {
-			return "", fmt.Errorf("CABundle is not valid PEM")
+	// The target client's own transport, when there is one: its pool and
+	// its TLS settings come from the kubeconfig.
+	httpClient := cs.HTTPClient
+	if httpClient == nil {
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if len(cs.CABundle) > 0 {
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(cs.CABundle) {
+				return "", fmt.Errorf("CABundle is not valid PEM")
+			}
+			tlsCfg.RootCAs = pool
+		} else {
+			tlsCfg.InsecureSkipVerify = true //nolint:gosec // matches kubeconfig intent
 		}
-		tlsCfg.RootCAs = pool
-	} else {
-		tlsCfg.InsecureSkipVerify = true //nolint:gosec // matches kubeconfig intent
+		httpClient = &http.Client{
+			Transport: &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment},
+		}
 	}
-
-	httpClient := &http.Client{
-		Timeout:   oidcDiscoveryHTTPTimeout,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment},
-	}
+	ctx, cancel := context.WithTimeout(ctx, oidcDiscoveryHTTPTimeout)
+	defer cancel()
 
 	url := strings.TrimRight(cs.Host, "/") + OIDCDiscoveryPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -70,7 +78,7 @@ func DiscoverIssuer(ctx context.Context, cs *ClientSet) (string, error) {
 		return "", fmt.Errorf("GET %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryBody))
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}

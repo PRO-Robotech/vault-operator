@@ -148,13 +148,52 @@ func (c *Client) ListAuthMounts(ctx context.Context) (map[string]AuthMountInfo, 
 	return top, nil
 }
 
-func (c *Client) GetAuthMountAccessor(ctx context.Context, mount string) (string, error) {
+// ReadAuthMount returns the sys/auth entry of one mount; found is false when
+// no auth method is mounted there. It reads GET sys/auth/<mount>, which costs
+// the same whatever the number of mounts. That read needs sudo on sys/auth/*;
+// a policy without it gets 403 once, and from then on this client uses the
+// sys/auth listing. A 400 or 404 (no auth engine at the path, or a Vault
+// without the endpoint) is settled by the listing as well.
+func (c *Client) ReadAuthMount(ctx context.Context, mount string) (AuthMountInfo, bool, error) {
+	m := strings.Trim(mount, "/")
+	if m == "" {
+		return AuthMountInfo{}, false, fmt.Errorf("auth mount path is empty")
+	}
+	if !c.authMountReadDenied.Load() {
+		resp, err := c.Do(ctx, &Request{Method: http.MethodGet, Path: "sys/auth/" + m})
+		switch {
+		case err == nil:
+			var raw struct {
+				Data *AuthMountInfo `json:"data"`
+				AuthMountInfo
+			}
+			if err := resp.Decode(&raw); err != nil {
+				return AuthMountInfo{}, false, fmt.Errorf("decode sys/auth/%s: %w", m, err)
+			}
+			if raw.Data != nil {
+				return *raw.Data, true, nil
+			}
+			return raw.AuthMountInfo, true, nil
+		case IsForbidden(err):
+			c.authMountReadDenied.Store(true)
+		case IsBadRequest(err), IsNotFound(err):
+		default:
+			return AuthMountInfo{}, false, err
+		}
+	}
 	mounts, err := c.ListAuthMounts(ctx)
+	if err != nil {
+		return AuthMountInfo{}, false, err
+	}
+	info, ok := mounts[m+"/"]
+	return info, ok, nil
+}
+
+func (c *Client) GetAuthMountAccessor(ctx context.Context, mount string) (string, error) {
+	info, ok, err := c.ReadAuthMount(ctx, mount)
 	if err != nil {
 		return "", err
 	}
-	key := strings.TrimSuffix(strings.Trim(mount, "/"), "/") + "/"
-	info, ok := mounts[key]
 	if !ok {
 		return "", fmt.Errorf("auth mount %q not found", mount)
 	}

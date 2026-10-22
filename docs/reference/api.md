@@ -50,10 +50,11 @@ API group: `vault.in-cloud.io/v1alpha1`
 
 | Поле | Тип | Описание |
 |---|---|---|
-| `observedGeneration` | `int64` | Последнее обработанное `metadata.generation`. |
+| `observedGeneration` | `int64` | `metadata.generation`, которое последний завершённый проход привёл в Vault. После неудачного, ожидающего или отклонённого прохода не меняется. |
 | `phase` | `enum` | `Pending`, `Configuring`, `Ready`, `Failed`, `Deleting`. |
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
+| `vault.issuer` | `string` | Issuer service account, последним найденный в целевом кластере. Проход, в котором discovery не ответил, пишет в config mount его. |
 | `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
 | `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |
@@ -79,6 +80,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `PoliciesApplied` | Все `spec.policies[]` записаны | Хотя бы один `PUT sys/policies/acl` failed |
 | `RolesApplied` | Все `spec.roles[]` записаны + soft-purge выполнен | Хотя бы один `POST role` failed или `LIST` failed |
 | `Ready` | Все шаги прошли | Любой шаг провалился или claim в `Deleting` |
+| `Degraded` | Последний проход упал на ошибке шага; reason — причина из закрытого набора (`Timeout`, `Unreachable`, `TLS`, `CircuitOpen`, `Forbidden`, …) | Последний проход завершился (`reason: Reconciled`). Ожидание и отказ состояние не меняют; `Ready` хранит исход последнего завершённого прохода |
 
 ### Финализатор
 
@@ -311,11 +313,18 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `vault_reviewer_jwt_renewal_total` | `result=rotated\|skipped\|failed` | Лайфцикл reviewer JWT |
 | `vault_api_responses_total` | `verb`, `path`, `code` | HTTP-ответы Vault (path bucketed: `auth_login`, `auth_role`, `sys_mounts`, ...) |
 | `vault_api_calls_total` | `verb`, `path`, `result=success\|client_error\|server_error\|transport_error` | Каждый вызов оператора в Vault |
-| `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed` | Лайфцикл собственного `client_token` оператора |
+| `vault_client_token_renewal_total` | `result=login_success\|login_failed\|renew_success\|renew_failed\|revoke_success\|revoke_failed` | Лайфцикл собственного `client_token` оператора |
+| `vault_api_request_duration_seconds` | `verb`, `path`, `result` | Задержка вызовов Vault |
+| `vault_circuit_state` | `vault_config` | Circuit breaker: 0 closed, 1 half-open, 2 open |
+| `vault_operator_pipeline_step_total` | `step`, `outcome` | Исходы шагов pipeline VaultClaim |
+| `vault_operator_claims` | `kind`, `phase` | Заявки по фазам |
+| `vault_operator_managed_objects` | `kind`, `type` | Объекты Vault в журналах заявок |
+| `vault_operator_inventory_errors` | `kind` | Scrape не прочитал заявки вида |
+| `vault_operator_cloudmanager_request_duration_seconds` | `method`, `code` | Задержка вызовов cloud-manager (bucket-operator) |
 
 Подробнее — [user-guide/monitoring.md](../user-guide/monitoring.md).
 
-> **vault-secret-operator** собственных controller-метрик (`vaultsecretclaim_*`) не экспонирует. Доступны общие `vault_api_*` и `vault_client_token_renewal_total` (через тот же `internal/vault` клиент), а также `phase`/`conditions` через kube-state-metrics.
+> **vault-secret-operator** собственных метрик pipeline (`vaultsecretclaim_*`) не экспонирует. Доступны общие `vault_api_*`, `vault_circuit_state` и `vault_client_token_renewal_total` (через тот же `internal/vault` клиент), а также `vault_operator_claims{kind="VaultSecretClaim"}` и `vault_operator_managed_objects`.
 
 ## Связанные документы
 

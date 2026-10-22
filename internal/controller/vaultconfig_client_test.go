@@ -118,5 +118,6 @@ var _ = Describe("VaultConfig probe through the real client", func() {
 		Expect(k8sClient.Update(context.Background(), fresh)).To(Succeed())
 		Expect(isConditionTrue(probe(r, name).Status.Conditions, vaultv1alpha1.ConditionReachable)).
 			To(BeTrue(), "the cached client still trusts only the old CA")
+		Expect(v.logins.Load()).To(BeEquivalentTo(1), "the client rebuilt for the new CA kept the token")
 	})
 })

@@ -44,6 +44,30 @@ type CircuitBreaker struct {
 	openedAt    time.Time
 	probePinned bool
 	lastErr     error
+	// metricName labels CircuitState; empty publishes nothing.
+	metricName string
+}
+
+// setMetricName names the breaker in CircuitState and publishes its state.
+func (b *CircuitBreaker) setMetricName(name string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.metricName = name
+	b.publishLocked()
+}
+
+func (b *CircuitBreaker) publishLocked() {
+	if b.metricName == "" {
+		return
+	}
+	v := circuitClosedValue
+	switch b.state {
+	case stateOpen:
+		v = circuitOpenValue
+	case stateHalfOpen:
+		v = circuitHalfOpenValue
+	}
+	CircuitState.WithLabelValues(b.metricName).Set(float64(v))
 }
 
 // NewCircuitBreaker constructs a breaker. Zero values fall back to
@@ -73,6 +97,7 @@ func (b *CircuitBreaker) Allow() bool {
 		if b.now().Sub(b.openedAt) >= b.openWindow {
 			b.state = stateHalfOpen
 			b.probePinned = true
+			b.publishLocked()
 			return true
 		}
 		return false
@@ -94,6 +119,7 @@ func (b *CircuitBreaker) OnSuccess() {
 	b.state = stateClosed
 	b.probePinned = false
 	b.lastErr = nil
+	b.publishLocked()
 }
 
 func (b *CircuitBreaker) OnFailure(err error) {
@@ -114,6 +140,7 @@ func (b *CircuitBreaker) OnFailure(err error) {
 		b.openedAt = b.now()
 		b.probePinned = false
 	}
+	b.publishLocked()
 }
 
 // LastError returns the error that most recently tripped or hit the breaker.

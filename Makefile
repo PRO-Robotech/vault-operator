@@ -74,7 +74,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # no envtest, so the race detector runs on them on every change.
 .PHONY: test-race
 test-race: ## Run the race detector on the packages with state shared between goroutines.
-	go test -race -count=1 ./internal/vault/... ./internal/target/...
+	go test -race -count=1 ./internal/vault/... ./internal/target/... ./internal/health/...
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.

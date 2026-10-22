@@ -482,6 +482,11 @@ spec:
                     type: string
                   configName:
                     type: string
+                  issuer:
+                    description: |-
+                      Issuer is the service account issuer last discovered in the target
+                      cluster. A pass whose discovery fails configures the mount with it.
+                    type: string
                   lastDriftCheckAt:
                     description: |-
                       LastDriftCheckAt is the timestamp of the most recent drift detection

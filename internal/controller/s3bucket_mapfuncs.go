@@ -27,15 +27,13 @@ func (r *S3BucketClaimReconciler) findBucketClaimsForVaultConfig(ctx context.Con
 		return nil
 	}
 	var claims vaultv1alpha1.S3BucketClaimList
-	if err := r.List(ctx, &claims); err != nil {
+	if err := r.List(ctx, &claims, client.MatchingFields{IndexVaultConfigRef: cfg.Name}); err != nil {
 		log.FromContext(ctx).Error(err, "list S3BucketClaims for VaultConfig fan-out", "config", cfg.Name)
 		return nil
 	}
 	out := make([]reconcile.Request, 0, len(claims.Items))
 	for i := range claims.Items {
-		if claims.Items[i].Spec.VaultConfigRef.Name == cfg.Name {
-			out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&claims.Items[i])})
-		}
+		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&claims.Items[i])})
 	}
 	return out
 }

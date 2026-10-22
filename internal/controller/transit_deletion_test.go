@@ -140,7 +140,7 @@ func TestDetectTransitDriftFindsMissingKey(t *testing.T) {
 	fake := &fakeVaultClient{MountExistsResp: map[string]bool{"transit": true}}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !report.Found() {
@@ -163,7 +163,7 @@ func TestDetectTransitDriftFindsMovedVersion(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.KeyVersionMoved) != 1 {
@@ -179,7 +179,7 @@ func TestDetectTransitDriftSilentWithoutTransit(t *testing.T) {
 	fake := &fakeVaultClient{}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if report.Found() {
@@ -217,7 +217,7 @@ func TestContentDriftFindsTamperedRole(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedRoles) != 1 {
@@ -244,7 +244,7 @@ func TestContentDriftFindsRewrittenPolicy(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 1 {
@@ -268,7 +268,7 @@ func TestContentDriftIgnoresFormatting(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 0 {
@@ -287,7 +287,7 @@ func TestContentDriftSkippedWithoutTransit(t *testing.T) {
 	fake := &fakeVaultClient{}
 
 	var report DriftReport
-	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report); err != nil {
+	if err := transitReconciler().detectTransitDrift(context.Background(), fake, claim, &report, liveObjects{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fake.ReadRoleCalls != 0 || fake.ReadPolicyCalls != 0 {

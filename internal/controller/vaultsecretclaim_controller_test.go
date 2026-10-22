@@ -53,9 +53,12 @@ func (f *fakeSecretVaultClient) seed(mount, path string, data map[string]any) {
 	f.versions[mount+"|"+path]++
 }
 
-func (f *fakeSecretVaultClient) Login(context.Context) error { f.loginCalls++; return f.loginErr }
-func (f *fakeSecretVaultClient) Token() string               { return "tok" }
-func (f *fakeSecretVaultClient) ClearToken()                 {}
+func (f *fakeSecretVaultClient) EnsureLoggedIn(context.Context) error {
+	f.loginCalls++
+	return f.loginErr
+}
+func (f *fakeSecretVaultClient) Token() string { return "tok" }
+func (f *fakeSecretVaultClient) ClearToken()   {}
 
 func (f *fakeSecretVaultClient) ReadKV(_ context.Context, mount, path string) (map[string]any, bool, error) {
 	d, ok := f.store[mount+"|"+path]

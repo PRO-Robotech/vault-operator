@@ -12,6 +12,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,18 +80,18 @@ func (tv *tokenVault) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
 		return
 	}
-	switch {
-	case r.URL.Path == pathLookupSelf:
+	switch r.URL.Path {
+	case pathLookupSelf:
 		_, _ = w.Write([]byte(`{"data":{"ttl":3600}}`))
-	case r.URL.Path == pathRevokeSelf:
+	case pathRevokeSelf:
 		tv.mu.Lock()
 		tv.revoked = append(tv.revoked, tok)
 		tv.dead[tok] = true
 		tv.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
-	case r.URL.Path == tv.denied:
+	case tv.denied:
 		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
-	case r.URL.Path == pathPolicyP || r.URL.Path == pathHealth:
+	case pathPolicyP, pathHealth:
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, `{"errors":["not found"]}`, http.StatusNotFound)
@@ -278,5 +279,110 @@ func TestClient_RefusesAnOversizedResponse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("error = %v, want a size refusal", err)
+	}
+}
+
+// Repeated EnsureLoggedIn on a fresh token costs no request: 200 passes, one
+// login.
+func TestClient_EnsureLoggedInReusesTheToken(t *testing.T) {
+	tv := newTokenVault(t, nil)
+	c := tokenClient(t, tv.URL)
+	for range 200 {
+		if err := c.EnsureLoggedIn(context.Background()); err != nil {
+			t.Fatalf("EnsureLoggedIn: %v", err)
+		}
+	}
+	if n := tv.logins.Load(); n != 1 {
+		t.Fatalf("logins = %d for 200 passes, want 1", n)
+	}
+}
+
+// An open breaker answers EnsureLoggedIn without a request to Vault.
+func TestClient_EnsureLoggedInWithAnOpenBreakerSendsNothing(t *testing.T) {
+	c := tripBreaker(t)
+	c.ClearToken()
+	before := c.Breaker().State()
+	err := c.EnsureLoggedIn(context.Background())
+	var co *CircuitOpenError
+	if !errors.As(err, &co) {
+		t.Fatalf("EnsureLoggedIn = %v, want a CircuitOpenError", err)
+	}
+	if c.Token() != "" {
+		t.Fatal("a token was obtained through an open breaker")
+	}
+	if got := c.Breaker().State(); got != before {
+		t.Fatalf("breaker state %s → %s", before, got)
+	}
+}
+
+// Revoke gives the token back and forgets it.
+func TestClient_RevokeGivesTheTokenBack(t *testing.T) {
+	tv := newTokenVault(t, nil)
+	c := tokenClient(t, tv.URL)
+	if err := c.EnsureLoggedIn(context.Background()); err != nil {
+		t.Fatalf("EnsureLoggedIn: %v", err)
+	}
+	c.Revoke(context.Background())
+	if got := tv.revokedTokens(); len(got) != 1 || got[0] != "tok-1" {
+		t.Fatalf("revoked = %v, want [tok-1]", got)
+	}
+	if c.Token() != "" {
+		t.Fatal("the revoked token is still cached")
+	}
+}
+
+// The request limit spaces calls out: with 10 req/s and a burst of 1, 11
+// calls take at least a second.
+func TestClient_RateLimitSpacesCalls(t *testing.T) {
+	tv := newTokenVault(t, nil)
+	c, err := New(Config{Address: tv.URL, AuthPath: "kubernetes-mgmt", Role: "vault-operator",
+		JWTSource: StaticJWTSource("sa-jwt"), QPS: 10, Burst: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	start := time.Now()
+	for range 11 {
+		if _, err := c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"}); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+	}
+	if d := time.Since(start); d < 900*time.Millisecond {
+		t.Fatalf("11 calls at 10/s took %s, want about 1s", d)
+	}
+}
+
+// Twin: a negative QPS lifts the limit.
+func TestClient_NegativeQPSDisablesTheLimit(t *testing.T) {
+	tv := newTokenVault(t, nil)
+	c, err := New(Config{Address: tv.URL, AuthPath: "kubernetes-mgmt", Role: "vault-operator",
+		JWTSource: StaticJWTSource("sa-jwt"), QPS: -1, Burst: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	start := time.Now()
+	for range 11 {
+		if _, err := c.Do(context.Background(), &Request{Method: http.MethodGet, Path: "sys/health"}); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+	}
+	if d := time.Since(start); d > 800*time.Millisecond {
+		t.Fatalf("11 unlimited calls took %s", d)
+	}
+}
+
+// A replacement client keeps the token it adopts.
+func TestClient_AdoptTokenKeepsTheLogin(t *testing.T) {
+	tv := newTokenVault(t, nil)
+	old := tokenClient(t, tv.URL)
+	if err := old.EnsureLoggedIn(context.Background()); err != nil {
+		t.Fatalf("EnsureLoggedIn: %v", err)
+	}
+	fresh := tokenClient(t, tv.URL)
+	fresh.AdoptToken(old)
+	if err := fresh.EnsureLoggedIn(context.Background()); err != nil {
+		t.Fatalf("EnsureLoggedIn: %v", err)
+	}
+	if n := tv.logins.Load(); n != 1 {
+		t.Fatalf("logins = %d, want 1", n)
 	}
 }

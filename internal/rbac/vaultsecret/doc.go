@@ -18,5 +18,6 @@ package vaultsecret
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch
+// Secrets and ConfigMaps hold the VaultConfig CA bundle and are only read.
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch

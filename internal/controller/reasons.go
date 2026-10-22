@@ -54,6 +54,9 @@ const (
 // proceeds once the owner configures the mount.
 const ReasonMountNotConfigured = "MountNotConfigured"
 
+// ReasonReconciled: Degraded=False after a pass that completed.
+const ReasonReconciled = "Reconciled"
+
 // RefusalReasons is the closed set the rollback gate counts.
 var RefusalReasons = []string{
 	ReasonOwnershipConflict,
