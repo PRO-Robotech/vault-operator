@@ -47,7 +47,7 @@ kubectl get events -n dlputi1u --field-selector involvedObject.kind=VaultClaim
 | `vault_reviewer_jwt_renewal_total` | Reviewer JWT lifecycle | `result` ∈ {`rotated`, `skipped`, `failed`} |
 | `vault_api_responses_total` | HTTP-ответы Vault | `verb`, `path`, `code` |
 | `vault_api_calls_total` | Вызовы оператора в Vault | `verb`, `path`, `result` |
-| `vault_client_token_renewal_total` | Лайфцикл client_token оператора: вход, renew, revoke заменённого токена и токенов при останове | `result` ∈ {`login_success`, `login_failed`, `renew_success`, `renew_failed`, `revoke_success`, `revoke_failed`} |
+| `vault_client_token_renewal_total` | Лайфцикл client_token оператора: вход, renew, revoke заменённого токена, токена, сброшенного после 403 (для токена, который Vault уже не принимает, — `revoke_failed`), и токенов при останове | `result` ∈ {`login_success`, `login_failed`, `renew_success`, `renew_failed`, `revoke_success`, `revoke_failed`} |
 | `vault_api_request_duration_seconds` | Гистограмма задержки вызовов Vault | `verb`, `path`, `result` |
 | `vault_circuit_state` | Состояние circuit breaker клиента Vault: 0 closed, 1 half-open, 2 open | `vault_config` |
 | `vault_operator_pipeline_step_total` | Исходы шагов pipeline VaultClaim: `Proceed`, `Wait`, `Refused` или причина сбоя из закрытого набора (`Timeout`, `Unreachable`, `TLS`, `CircuitOpen`, …) | `step`, `outcome` |

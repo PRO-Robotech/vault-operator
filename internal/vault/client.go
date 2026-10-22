@@ -462,20 +462,46 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	}
 	if done != seen && lastErr != nil {
 		// Another caller refreshed while this one waited and failed: the same
-		// call now would fail the same way.
-		return "", lastErr
+		// call now would fail the same way. That caller has told the breaker.
+		return "", &sharedRefreshError{err: lastErr}
 	}
 
 	err := c.refreshLocked(ctx, s)
+	shared := err
+	if err != nil && ctx.Err() != nil {
+		// This caller's own cancellation says nothing about Vault: a caller
+		// that waited refreshes with its own context.
+		shared = nil
+	}
 	c.mu.Lock()
 	c.refreshes++
-	c.refreshErr = err
+	c.refreshErr = shared
 	tok := c.token
 	c.mu.Unlock()
 	if err != nil {
 		return "", err
 	}
 	return tok, nil
+}
+
+// sharedRefreshError is the outcome of a refresh another caller made and
+// already reported to the breaker.
+type sharedRefreshError struct{ err error }
+
+func (e *sharedRefreshError) Error() string { return e.err.Error() }
+func (e *sharedRefreshError) Unwrap() error { return e.err }
+
+// settleRefresh reports a failed token refresh to the breaker. A failure that
+// is not this call's own word about Vault (the caller's cancellation, or the
+// outcome of another caller's refresh) counts nothing and frees the
+// half-open probe this call may hold.
+func (c *Client) settleRefresh(ctx context.Context, err error) {
+	var shared *sharedRefreshError
+	if ctx.Err() != nil || errors.As(err, &shared) {
+		c.breaker.Release()
+		return
+	}
+	c.breaker.OnFailure(err)
 }
 
 // refreshLocked renews a live renewable token and replaces any other; it runs
@@ -505,6 +531,15 @@ func (c *Client) tokenDead(ctx context.Context, token string) bool {
 	return IsForbidden(err)
 }
 
+// drop revokes token and forgets it. A token whose policy lacks lookup-self
+// looks dead to tokenDead while Vault still holds it; the revoke gives it
+// back instead of leaving it until its TTL ends. For a token Vault already
+// dropped the revoke is refused and nothing else happens.
+func (c *Client) drop(ctx context.Context, token string) {
+	c.revoke(ctx, token)
+	c.forget(token)
+}
+
 // EnsureLoggedIn makes sure the client holds a token: a fresh cached token
 // costs no request, an open breaker short-circuits without one, and otherwise
 // one refresh is made for all callers.
@@ -522,7 +557,7 @@ func (c *Client) EnsureLoggedIn(ctx context.Context) error {
 		return c.circuitOpenError()
 	}
 	if _, err := c.ensureToken(ctx); err != nil {
-		c.breaker.OnFailure(err)
+		c.settleRefresh(ctx, err)
 		return err
 	}
 	c.breaker.OnSuccess()
@@ -615,23 +650,29 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Response, error) {
 
 	token, err := c.ensureToken(ctx)
 	if err != nil {
-		c.breaker.OnFailure(err)
+		c.settleRefresh(ctx, err)
 		return nil, err
 	}
 
 	resp, err := c.send(ctx, req, body, token)
 	if IsForbidden(err) && c.tokenDead(ctx, token) {
-		c.forget(token)
-		if token, err = c.ensureToken(ctx); err == nil {
-			resp, err = c.send(ctx, req, body, token)
+		c.drop(ctx, token)
+		if token, err = c.ensureToken(ctx); err != nil {
+			c.settleRefresh(ctx, err)
+			return nil, err
 		}
+		resp, err = c.send(ctx, req, body, token)
 	}
 	if err != nil {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.StatusCode < 500 {
+		switch {
+		case errors.As(err, &apiErr) && apiErr.StatusCode < 500:
 			// 4xx is success from the breaker's POV — Vault is reachable.
 			c.breaker.OnSuccess()
-		} else {
+		case ctx.Err() != nil:
+			// The caller gave up; Vault was not asked to the end.
+			c.breaker.Release()
+		default:
 			c.breaker.OnFailure(err)
 		}
 		return nil, err

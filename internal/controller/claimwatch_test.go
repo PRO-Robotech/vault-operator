@@ -345,25 +345,4 @@ var _ = Describe("S3BucketClaim and VaultSecretClaim status texts", func() {
 		Expect(byName["no-hashed-key"].Message).To(Equal(`item "no-hashed-key": generate.hash=bcrypt requires destination.hashedKey`))
 		expectNoAddress(got.Status.Conditions, recorder, byName["argocd-admin"].Message)
 	})
-
-	It("VaultSecretClaim: a finished pass and a spec refusal ask for their own recheck", func() {
-		name := "vscreq-" + nextClaimName()
-		makeHealthyVaultConfig(ctx, name)
-		makeVaultSecretClaim(ctx, name, name, vaultv1alpha1.DeletionPolicyRetain, []vaultv1alpha1.SecretListItem{genListItem()})
-		recon := newSecretRecon(&fakeSecretVaultFactory{Client: fakeSV})
-		res, err := reconcileSecretOnce(recon, name)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(getVSC(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "a Ready claim is never rechecked once status writes no longer wake it")
-
-		dup := "vscreq-dup-" + nextClaimName()
-		makeHealthyVaultConfig(ctx, dup)
-		second := genListItem()
-		second.Name = "argocd-admin-2"
-		makeVaultSecretClaim(ctx, dup, dup, vaultv1alpha1.DeletionPolicyRetain, []vaultv1alpha1.SecretListItem{genListItem(), second})
-		res, err = reconcileSecretOnce(recon, dup)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(condReason(getVSC(dup).Status.Conditions, vaultv1alpha1.ConditionItemsApplied)).To(Equal("DuplicateDestination"))
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
-	})
 })

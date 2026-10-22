@@ -186,6 +186,17 @@ func (r *VaultClaimReconciler) now() time.Time {
 	return time.Now()
 }
 
+// claimChangedPredicate passes the changes a claim acts on: its spec
+// (generation, which deletion bumps too), its labels and its annotations. A
+// status or finalizer write passes nothing.
+func claimChangedPredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.LabelChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+	)
+}
+
 func (r *VaultClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	workers := r.MaxConcurrentReconciles
 	if workers <= 0 {
@@ -201,11 +212,7 @@ func (r *VaultClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Secrets are watched by metadata: the kubeconfig is read live when a pass
 	// needs it, so no Secret body is held in memory.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.VaultClaim{}, builder.WithPredicates(predicate.Or(
-			predicate.GenerationChangedPredicate{},
-			predicate.LabelChangedPredicate{},
-			predicate.AnnotationChangedPredicate{},
-		))).
+		For(&vaultv1alpha1.VaultClaim{}, builder.WithPredicates(claimChangedPredicate())).
 		WithOptions(r.Runtime.controllerOptions(workers)).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},

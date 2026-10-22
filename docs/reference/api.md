@@ -54,7 +54,8 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `phase` | `enum` | `Pending`, `Configuring`, `Ready`, `Failed`, `Deleting`. |
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
-| `vault.issuer` | `string` | Issuer service account, последним найденный в целевом кластере. Проход, в котором discovery не ответил, пишет в config mount его. |
+| `vault.issuer` | `string` | Issuer service account, последним найденный в целевом кластере. Проход, в котором discovery не ответил, пишет в config mount его — пока kubeconfig указывает на тот же API server (`vault.issuerHost`). |
+| `vault.issuerHost` | `string` | API server целевого кластера, на котором найден `vault.issuer`. Если kubeconfig указывает на другой сервер и discovery не ответил, оба поля очищаются и mount пишется с `disable_iss_validation=true`. |
 | `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
 | `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |

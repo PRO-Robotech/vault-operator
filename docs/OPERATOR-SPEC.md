@@ -344,7 +344,8 @@ path "auth/token/lookup-self"         { capabilities = ["read"] }
 
 1. Если `spec.auth.issuer` задан явно — используем его.
 2. Иначе оператор делает запрос к `/.well-known/openid-configuration` на kube-apiserver infra-кластера (через kubeconfig).
-3. Извлекает поле `issuer` из ответа и записывает в Vault config.
+3. Извлекает поле `issuer` из ответа и записывает в Vault config, а в `status.vault.issuer` и `status.vault.issuerHost` — его и API server, на котором он найден.
+4. Если discovery не ответил — берёт `status.vault.issuer`, но только когда kubeconfig указывает на тот же `issuerHost`. Иначе (кластер за тем же kubeconfig пересоздан или заменён) сохранённый issuer сбрасывается и config пишется с `disable_iss_validation=true`.
 
 Это покрывает случаи, когда apiserver настроен с `--service-account-issuer` ≠ дефолтному `https://kubernetes.default.svc.cluster.local`.
 

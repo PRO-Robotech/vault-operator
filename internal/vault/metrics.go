@@ -28,7 +28,7 @@ const (
 	ResultRenewSuccess = "renew_success"
 	ResultRenewFailed  = "renew_failed"
 	// ResultRevokeSuccess and ResultRevokeFailed count revokes of a token the
-	// client replaced or gave up at shutdown.
+	// client replaced, dropped after a 403, or gave up at shutdown.
 	ResultRevokeSuccess = "revoke_success"
 	ResultRevokeFailed  = "revoke_failed"
 )

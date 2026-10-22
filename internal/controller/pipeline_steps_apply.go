@@ -168,8 +168,10 @@ func (r *VaultClaimReconciler) stepVerifyGuestMount(ctx context.Context, claim *
 }
 
 // resolveIssuer: explicit spec, then OIDC discovery, then the issuer an
-// earlier discovery recorded, then disable ISS validation. A discovery that
-// fails for a pass does not turn ISS validation off on a mount it once had.
+// earlier discovery recorded on the same API server, then disable ISS
+// validation. A discovery that fails for a pass does not turn ISS validation
+// off on a mount it once had; an issuer of another cluster (the kubeconfig
+// now points elsewhere) is never applied.
 func (r *VaultClaimReconciler) resolveIssuer(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (string, bool) {
 	if claim.Spec.Auth.Issuer != "" {
 		return claim.Spec.Auth.Issuer, false
@@ -177,15 +179,19 @@ func (r *VaultClaimReconciler) resolveIssuer(ctx context.Context, claim *vaultv1
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
+	st := claim.Status.Vault
+	host := ""
 	if state.Target != nil {
+		host = state.Target.Host
 		if issuer, err := target.DiscoverIssuer(ctx, state.Target); err == nil && issuer != "" {
-			claim.Status.Vault.Issuer = issuer
+			st.Issuer, st.IssuerHost = issuer, host
 			return issuer, false
 		}
 	}
-	if recorded := claim.Status.Vault.Issuer; recorded != "" {
-		return recorded, false
+	if st.Issuer != "" && st.IssuerHost == host {
+		return st.Issuer, false
 	}
+	st.Issuer, st.IssuerHost = "", ""
 	return "", true
 }
 

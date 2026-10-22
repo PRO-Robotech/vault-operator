@@ -122,6 +122,20 @@ func (b *CircuitBreaker) OnSuccess() {
 	b.publishLocked()
 }
 
+// Release ends a call that says nothing about Vault (the caller gave up, or
+// another call already reported the same outcome): the state and the failure
+// count stay. A half-open breaker frees its probe slot, so a probe whose call
+// was cancelled does not keep the breaker half-open; at worst a second probe
+// starts while an earlier one is still in flight, and each reports its own
+// outcome.
+func (b *CircuitBreaker) Release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == stateHalfOpen {
+		b.probePinned = false
+	}
+}
+
 func (b *CircuitBreaker) OnFailure(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

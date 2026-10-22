@@ -197,17 +197,19 @@ func (r *S3BucketClaimReconciler) resolveAndLogin(ctx context.Context, claim *va
 	}
 	vc, err := r.VaultFactory.For(ctx, r.Client, cfg)
 	if err != nil {
+		log.FromContext(ctx).V(1).Info("building the Vault client failed", "err", err.Error())
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			"FactoryError", err.Error())
+			"FactoryError", "building the Vault client failed: "+failureText(err))
 		return nil, nil, ctrl.Result{RequeueAfter: bucketRequeueLoginTransient}, false
 	}
 	if err := vc.EnsureLoggedIn(ctx); err != nil {
+		log.FromContext(ctx).V(1).Info("Vault login failed", "err", err.Error())
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
 		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			reason, err.Error())
+			reason, "Vault login failed: "+failureText(err))
 		return nil, nil, ctrl.Result{RequeueAfter: bucketRequeueLoginTransient}, false
 	}
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionTrue, claim.Generation,
@@ -596,8 +598,11 @@ func (r *S3BucketClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := indexConfigRef(mgr, &vaultv1alpha1.S3BucketClaim{}, bucketClaimConfigRef); err != nil {
 		return fmt.Errorf("index S3BucketClaims by VaultConfig: %w", err)
 	}
+	// Status and finalizer writes (a pass persists status mid-way and at the
+	// end) do not wake the claim: every pass ends with its own RequeueAfter.
+	// Deletion bumps generation, so Purge still starts at once.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.S3BucketClaim{}).
+		For(&vaultv1alpha1.S3BucketClaim{}, builder.WithPredicates(claimChangedPredicate())).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findBucketClaimsForVaultConfig),

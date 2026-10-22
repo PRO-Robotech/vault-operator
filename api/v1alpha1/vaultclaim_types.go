@@ -380,9 +380,15 @@ type VaultStatusSummary struct {
 	ConfigName string `json:"configName,omitempty"`
 
 	// Issuer is the service account issuer last discovered in the target
-	// cluster. A pass whose discovery fails configures the mount with it.
+	// cluster. A pass whose discovery fails configures the mount with it, but
+	// only while the kubeconfig still points at IssuerHost.
 	// +optional
 	Issuer string `json:"issuer,omitempty"`
+
+	// IssuerHost is the target API server Issuer was discovered on. A pass
+	// that finds another host and cannot discover drops Issuer.
+	// +optional
+	IssuerHost string `json:"issuerHost,omitempty"`
 
 	// AuthMountPath is the auth mount this claim was accepted on. It is written
 	// only once the mount is accepted, never before, so a claim that waited

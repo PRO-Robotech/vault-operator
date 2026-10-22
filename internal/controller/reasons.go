@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -190,4 +191,24 @@ func classifyTransport(err error) failureCause {
 // one cause, with no part of the raw error in it.
 func failureText(err error) string {
 	return causeText[classifyFailure(err)]
+}
+
+// statusError is an error whose text is built from the claim's spec and from
+// cause texts only, so status and events may carry it as it is.
+type statusError struct{ text string }
+
+func (e *statusError) Error() string { return e.text }
+
+func statusErrorf(format string, a ...any) error {
+	return &statusError{text: fmt.Sprintf(format, a...)}
+}
+
+// statusText is what status and events say about err: a statusError as it
+// is, any other error as its cause text.
+func statusText(err error) string {
+	var se *statusError
+	if errors.As(err, &se) {
+		return se.text
+	}
+	return failureText(err)
 }
