@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -148,12 +147,6 @@ func ownershipDocSet(t *testing.T) []string {
 		out = append(out, m[1])
 	}
 	return out
-}
-
-func sortedCopy(s []string) []string {
-	c := slices.Clone(s)
-	sort.Strings(c)
-	return c
 }
 
 // The two documents that spell out the refusal set say what RefusalReasons
