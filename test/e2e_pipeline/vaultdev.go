@@ -12,10 +12,11 @@ You may obtain a copy of the License at
 // VaultClaim / VaultSecretClaim pipelines against a real `vault server -dev`
 // instance plus envtest k8s. Build-gated with `e2e`.
 //
-// These tests fail when the `vault` binary is missing or is not the version
-// production runs (E2E_VAULT_VERSION, default 1.20.1): a skipped or
-// mismatched run proves nothing about production. `make test-e2e-pipeline`
-// installs the binary into bin/. `make test` does not run this package.
+// They are not part of `make test` (build tag), and they fail, not skip, when
+// the `vault` binary is missing or is not the version production runs
+// (E2E_VAULT_VERSION, default 1.20.1): a skipped or mismatched run executes
+// nothing about production and must not read as green. `make
+// test-e2e-pipeline` downloads the pinned binary into bin/.
 package e2e_pipeline
 
 import (
@@ -29,8 +30,22 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 )
+
+// StartVaultDev starts a dev Vault for t and stops it in t.Cleanup. It fails
+// t when NewVaultDevServer refuses: the binary is missing or is not the
+// wanted version.
+func StartVaultDev(ctx context.Context, t *testing.T) *VaultDevServer {
+	t.Helper()
+	srv, err := NewVaultDevServer(ctx)
+	if err != nil {
+		t.Fatalf("start vault dev: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv
+}
 
 // VaultDevServer is a process handle for an out-of-process `vault server -dev`
 // instance. Use NewVaultDevServer to spawn one and call Close to terminate.
@@ -109,7 +124,8 @@ func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 	return srv, nil
 }
 
-// ErrVaultBinaryMissing is wrapped by NewVaultDevServer when `vault` is not in PATH.
+// ErrVaultBinaryMissing is wrapped by NewVaultDevServer when `vault` is not in
+// PATH.
 var ErrVaultBinaryMissing = errors.New("vault binary not found in PATH")
 
 // ErrVaultVersionMismatch is wrapped when `vault version` is not the wanted one.

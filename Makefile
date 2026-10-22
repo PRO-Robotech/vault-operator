@@ -99,7 +99,7 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: test-e2e-pipeline
-test-e2e-pipeline: manifests generate fmt vet envtest vault ## Run pipeline e2e (envtest k8s + `vault server -dev` $(VAULT_VERSION)). Fails without vault; the upgrade test needs the legacy tag in git (fetch tags).
+test-e2e-pipeline: manifests generate fmt vet envtest vault ## Run pipeline e2e (envtest k8s + `vault server -dev` $(VAULT_VERSION)). Fails without the vault binary or on another version; the upgrade test needs the legacy tag in git (fetch tags).
 	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1 -timeout 15m
@@ -109,6 +109,18 @@ test-e2e-secret-pipeline: manifests generate fmt vet envtest vault ## Run VaultS
 	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -run TestSecretPipelineE2E -v -count=1
+
+.PHONY: vulncheck
+vulncheck: govulncheck ## Run govulncheck; fails on a vulnerability reachable from the code.
+	"$(GOVULNCHECK)" ./...
+
+.PHONY: verify-generated
+verify-generated: manifests generate fmt ## Fail if generated code, CRDs, RBAC or formatting differ from the tree.
+	@git diff --exit-code || { echo "verify-generated: run 'make manifests generate fmt' and commit the result"; exit 1; }
+
+.PHONY: verify-images
+verify-images: ## Fail if a Dockerfile stage is not pinned by digest or the Go image differs from go.mod.
+	./hack/check-images.sh
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -215,6 +227,8 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
+VAULT ?= $(LOCALBIN)/vault
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.7.1
@@ -231,6 +245,39 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.5.0
+GOVULNCHECK_VERSION ?= v1.8.0
+# VAULT_VERSION is the Vault the pipeline e2e runs against; it follows production.
+VAULT_VERSION ?= 1.20.1
+VAULT_SHA256_linux_amd64 ?= e3ce3e678421c0d56f726952ab100875168c2e1eb1db751ed5a2b25b6b2ea96f
+VAULT_SHA256_linux_arm64 ?= 470af64c86d76ce296ed394a10adb63b43e428491c83e0f7180e9903d41ff39d
+VAULT_SHA256_darwin_amd64 ?= 9e110059908377febc2cc4e723f8f6bc825030dbae563e6747db7d28c56f3296
+VAULT_SHA256_darwin_arm64 ?= 3e82186552264a3d15f9933d0a80319f595c6aecda9bbe6c3b48beee6f23d3a6
+.PHONY: govulncheck
+govulncheck: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
+$(GOVULNCHECK): $(LOCALBIN)
+	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
+
+.PHONY: vault
+vault: $(VAULT)-$(VAULT_VERSION) ## Download the pinned vault binary (checksum-verified) into bin/.
+	@ln -sf "$$(realpath "$(VAULT)-$(VAULT_VERSION)")" "$(VAULT)"
+$(VAULT)-$(VAULT_VERSION): $(LOCALBIN)
+	@set -e; os=$$(go env GOOS); arch=$$(go env GOARCH); \
+	case "$$os/$$arch" in \
+		linux/amd64) sum="$(VAULT_SHA256_linux_amd64)" ;; \
+		linux/arm64) sum="$(VAULT_SHA256_linux_arm64)" ;; \
+		darwin/amd64) sum="$(VAULT_SHA256_darwin_amd64)" ;; \
+		darwin/arm64) sum="$(VAULT_SHA256_darwin_arm64)" ;; \
+		*) echo "vault: no pinned checksum for $$os/$$arch"; exit 1 ;; \
+	esac; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	zip="vault_$(VAULT_VERSION)_$${os}_$${arch}.zip"; \
+	echo "Downloading $$zip"; \
+	curl -fsSLo "$$tmp/$$zip" "https://releases.hashicorp.com/vault/$(VAULT_VERSION)/$$zip"; \
+	if command -v sha256sum >/dev/null; then echo "$$sum  $$tmp/$$zip" | sha256sum -c - >/dev/null; \
+	else echo "$$sum  $$tmp/$$zip" | shasum -a 256 -c - >/dev/null; fi; \
+	unzip -q -o "$$tmp/$$zip" vault -d "$$tmp"; \
+	mv "$$tmp/vault" "$@"; chmod +x "$@"
+
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -253,23 +300,6 @@ setup-envtest: envtest ## Download the binaries required for ENVTEST in the loca
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
-
-# Vault the e2e pipeline runs against: the version production runs. The
-# checksum pins the release archive; other platforms pass VAULT_SHA256.
-VAULT_VERSION ?= 1.20.1
-VAULT_OS_ARCH ?= linux_amd64
-VAULT_SHA256 ?= e3ce3e678421c0d56f726952ab100875168c2e1eb1db751ed5a2b25b6b2ea96f
-VAULT ?= $(LOCALBIN)/vault
-
-.PHONY: vault
-vault: $(VAULT) ## Download the Vault binary for e2e into bin/ (checksum-verified).
-$(VAULT): | $(LOCALBIN)
-	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
-	curl -sSfL -o "$$tmp/vault.zip" "https://releases.hashicorp.com/vault/$(VAULT_VERSION)/vault_$(VAULT_VERSION)_$(VAULT_OS_ARCH).zip"; \
-	echo "$(VAULT_SHA256)  $$tmp/vault.zip" | sha256sum -c -; \
-	unzip -o -q "$$tmp/vault.zip" vault -d "$$tmp"; \
-	install -m 0755 "$$tmp/vault" "$(VAULT)"; \
-	"$(VAULT)" version
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.

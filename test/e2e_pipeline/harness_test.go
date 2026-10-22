@@ -70,11 +70,7 @@ func newHarness(t *testing.T, crdDir string) *harness {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	t.Cleanup(cancel)
 
-	srv, err := NewVaultDevServer(ctx)
-	if err != nil {
-		t.Fatalf("start vault dev: %v", err)
-	}
-	t.Cleanup(func() { _ = srv.Close() })
+	srv := StartVaultDev(ctx, t)
 	if err := EnsureKVMount(ctx, srv, sharedKVMount); err != nil {
 		t.Fatalf("ensure KV mount: %v", err)
 	}

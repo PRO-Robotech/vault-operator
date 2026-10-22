@@ -73,8 +73,22 @@ spec:
                     - SYSTEM
                     - CUSTOMER
                     type: string
+                  name:
+                    description: |-
+                      Name adopts an existing bucket by its full server name (with the
+                      server prefix) instead of creating one. An adopted bucket is removed on
+                      Purge only with purgeAdopted. Immutable.
+                    maxLength: 63
+                    minLength: 3
+                    pattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+                    type: string
                   public:
                     default: false
+                    type: boolean
+                  purgeAdopted:
+                    description: |-
+                      PurgeAdopted lets deletionPolicy=Purge remove a bucket this claim adopted
+                      (status.bucketOwnership=Adopted). Without it such a deletion is blocked.
                     type: boolean
                 type: object
               clusterRef:
@@ -108,7 +122,12 @@ spec:
                   destinationPath:
                     default: backup/s3
                     description: DestinationPath is relative to secretsPrefix.
+                    maxLength: 256
                     type: string
+                    x-kubernetes-validations:
+                    - message: spec.vault.destinationPath must be relative and must
+                        not contain '..'
+                      rule: '!self.startsWith(''/'') && !self.contains(''..'')'
                   secretsPrefix:
                     description: SecretsPrefix must equal VaultClaim.secretsPrefix.
                       Immutable.
@@ -140,12 +159,24 @@ spec:
               rule: self.customerLogin == oldSelf.customerLogin
             - message: spec.vault.secretsPrefix is immutable
               rule: self.vault.secretsPrefix == oldSelf.vault.secretsPrefix
+            - message: spec.bucket.name is immutable
+              rule: has(self.bucket.name) == has(oldSelf.bucket.name) && (!has(self.bucket.name)
+                || self.bucket.name == oldSelf.bucket.name)
           status:
             properties:
               bucketName:
                 description: |-
                   BucketName is the source of truth for idempotency, fixed on first
                   create or adopt.
+                type: string
+              bucketOwnership:
+                description: |-
+                  BucketOwnership records how status.bucketName was obtained. Empty on
+                  claims written before this field: it is then derived once from the
+                  BucketProvisioned reason ("Created" → Created, anything else → Adopted).
+                enum:
+                - Created
+                - Adopted
                 type: string
               bucketStatus:
                 type: string
@@ -211,17 +242,54 @@ spec:
               endpoint:
                 type: string
               keysWrittenHash:
-                description: KeysWrittenHash detects external key rotation.
+                description: |-
+                  KeysWrittenHash is deprecated: no longer written and cleared on the next
+                  reconcile (credentials are compared with Vault directly). Kept in the
+                  schema so an older operator can still read the object.
                 type: string
               observedGeneration:
                 format: int64
                 type: integer
+              pendingCreate:
+                description: |-
+                  PendingCreate is set, and persisted, before a create call and cleared
+                  once status.bucketName is recorded. A bucket found by name while it is set
+                  is the one this claim created; without it, a found bucket is Adopted.
+                properties:
+                  existingNames:
+                    description: |-
+                      ExistingNames are the server names of this login matching RequestedName
+                      (with or without a "-N" suffix, in any status) before the create: none of
+                      them is the bucket the create made.
+                    items:
+                      type: string
+                    type: array
+                  requestedName:
+                    description: RequestedName is the name sent to cloud-manager (before
+                      its prefix).
+                    type: string
+                  since:
+                    description: |-
+                      Since is when the create was decided; a create that cannot be located
+                      is retried only after a grace period.
+                    format: date-time
+                    type: string
+                required:
+                - requestedName
+                - since
+                type: object
               phase:
                 enum:
                 - Pending
                 - Ready
                 - Failed
                 - Deleting
+                type: string
+              writtenPath:
+                description: |-
+                  WrittenPath is the destinationPath (relative to spec.vault.secretsPrefix)
+                  the credentials were last written to; on a destinationPath change the
+                  keys this claim left there are removed.
                 type: string
             type: object
         required:

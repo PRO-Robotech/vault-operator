@@ -71,18 +71,20 @@ Kubeconfig'и target-кластеров **не требуются** — конт
 apiVersion: vault.in-cloud.io/v1alpha1
 kind: S3BucketClaim
 metadata:
-  name: ec8a00                       # = имя кластера (naming.S3BucketClaimName)
-  namespace: dlputi1u                # customer namespace (== custLogin)
+  name: cl1                       # = имя кластера (naming.S3BucketClaimName)
+  namespace: cust1                # customer namespace (== custLogin)
   ownerReferences: [...]             # ClusterClaim, controller=true (ставит cluster-claim-operator)
 spec:
   vaultConfigRef:
     name: vault-bucket               # отдельный VaultConfig с write-ролью bucket-operator
   clusterRef:
-    name: ec8a00                     # immutable
-  customerLogin: dlputi1u            # immutable; рендер из .ClusterClaim.spec.extraEnvs.begetClusterCustomerLogin
+    name: cl1                     # immutable
+  customerLogin: cust1            # immutable; рендер из .ClusterClaim.spec.extraEnvs.begetClusterCustomerLogin
   region: ru-1                       # из extraEnvs.begetClusterRegion
   bucket:
-    # имя НЕ задаётся в spec — конвенция + adopt-семантика; итог фиксируется в status.bucketName (§6)
+    # name: 4682dfe35dd7-shared      # необязательно, immutable: принять существующий бакет по полному
+                                     # имени сервера вместо создания (владение — Adopted, §5)
+    # purgeAdopted: false            # Purge удаляет Adopted-бакет только с этим флагом
     public: false
     managedBy: SYSTEM                # enum SYSTEM|CUSTOMER, дефолт SYSTEM, immutable
     configurationId: s3_v1           # имя записи S3-конфигурации в каталоге cloud-manager
@@ -90,15 +92,18 @@ spec:
                                      # рендерится mgmt-шаблоном; при пустом — дефолт оператора
                                      # --default-s3-configuration-id. Мульти-регион: производное от region
   vault:
-    secretsPrefix: clusters/ec8a00   # immutable, == secretsPrefix VaultClaim/VaultSecretClaim
-    destinationPath: backup/s3       # относительный; итог: secret/data/clusters/ec8a00/backup/s3
+    secretsPrefix: clusters/cl1   # immutable, == secretsPrefix VaultClaim/VaultSecretClaim
+    destinationPath: backup/s3       # относительный; итог: secret/data/clusters/cl1/backup/s3
   deletionPolicy: Purge              # Purge (дефолт) | Retain
 status:
   phase: Ready                       # Pending | Provisioning | Ready | Failed | Deleting
-  bucketName: k8s-dlputi1u-ec8a00
+  bucketName: 0123abcd4567-k8s-cust1-cl1   # имя сервера (префикс + запрошенное имя)
+  bucketOwnership: Created           # Created | Adopted — как получено имя (§5, §6)
+  # pendingCreate: {requestedName, since, existingNames}   # только между решением создать и записью bucketName (§6)
+  writtenPath: backup/s3             # куда ключи записаны последними (относительно secretsPrefix)
   bucketStatus: RUNNING              # зеркало s3.Status (CREATING/RUNNING/ERROR/...)
   endpoint: s3.ru1.storage.beget.cloud   # s3EndpointForRegion(spec.region), без схемы
-  keysWrittenHash: "9f2c…"           # hash(accessKey+secretKey+bucketName+endpoint) — детект ротации/дрифта
+  # keysWrittenHash — устарело: больше не пишется и стирается (ключи сверяются с Vault напрямую)
   observedGeneration: 2
   conditions:
     - { type: ConfigResolved,    status: "True" }   # VaultConfig разрешён
@@ -116,7 +121,8 @@ status:
 | `clusterRef.name`, `customerLogin`, `vault.secretsPrefix`, `bucket.managedBy` | immutable (`self == oldSelf`) |
 | `metadata.name` | `[a-z0-9-]+`, ≤ 40 символов (запас под префикс имени бакета, лимит S3 = 63) |
 | `deletionPolicy` | enum `Purge`/`Retain`, дефолт `Purge` |
-| `vault.destinationPath` | непустой, без ведущего `/`, дефолт `backup/s3` |
+| `vault.destinationPath` | без ведущего `/`, без `..`, ≤ 256 символов, дефолт `backup/s3` |
+| `bucket.name` | immutable: нельзя ни задать после создания, ни сменить, ни убрать |
 
 `vaultConfigRef` — mutable (переключение write-роли без пересоздания CR, как у VaultSecretClaim).
 
@@ -137,7 +143,7 @@ status:
 ```
 accessKey:       AKIA...
 secretKey:       ...
-bucketName:      k8s-dlputi1u-ec8a00        # = Bucket.name
+bucketName:      k8s-cust1-cl1        # = Bucket.name
 endpoint:        s3.ru1.storage.beget.cloud   # per-region ceph S3, path-style; схему дописывает чарт-потребитель
 region:          ru1
 s3ForcePathStyle: "true"                    # ceph требует path-style, не virtual-host
@@ -145,7 +151,7 @@ s3ForcePathStyle: "true"                    # ceph требует path-style, н
 
 > **Endpoint — фиксированный per-region ceph-хост** (`s3.<region>.storage.beget.cloud`), а не домен бакета: в PHP-референсе `Repository::getS3URL()` захардкожен `https://s3.ru1.storage.beget.cloud` — это его собственный литерал, к формату нашего ключа отношения не имеющий, регион кластера у cloud-manager для s3 пока тоже фиксирован `ru1` (TODO на их стороне — см. §10 П3). `Bucket.Fqdn`/`Cname` (домен самого бакета) для backup-потребителя не нужны — они для публичного доступа.
 
-Запись — read-modify-write merge (переиспользовать `internal/vault/kv.go`): соседние ключи листа не клобберятся; запись только при `hash(входа) != status.keysWrittenHash` — не жечь KV-версии.
+Запись — read-modify-write merge с `cas` (`internal/vault/kv.go`): соседние ключи листа не клобберятся, параллельный писатель того же листа не затирается; запись только при расхождении своих ключей с прочитанным листом — KV-версии не жгутся. Свои ключи — `accessKey`, `secretKey`, `bucketName`, `endpoint`, `region`, `s3ForcePathStyle`, `cname`; всё прочее в листе чужое и не трогается.
 
 ### 3.3. Policy `bucket-operator-admin` (bootstrap платформой, разово)
 
@@ -169,12 +175,12 @@ path "auth/token/lookup-self"               { capabilities = ["read"] }
 | # | Шаг | Действие | Ошибка / WAIT |
 |---|-----|----------|---------------|
 | 1 | ResolveConfig | resolve `VaultConfig` `vault-bucket` + login (роль `bucket-operator`) | `ConfigResolved`/`VaultReachable=False`, backoff 30s→5m |
-| 2 | EnsureBucket | имя из `status.bucketName`, иначе по конвенции (§6); `configurationId` из `spec.bucket.configurationId` (fallback — флаг `--default-s3-configuration-id`); если бакета ещё нет → `CloudService.Create{CustomerIdentifier: <custLogin>, ConfigurationId, DisplayName: "k8s cluster <name> backup", Region: "ru1" (хардкод cloud-manager, П3), S3Params{BucketName, Public: false, ManagedBy: SYSTEM}}`. **`status.bucketName` фиксируется сразу.** Идемпотентность/adopt: `s3_error`/`BUCKET_NAME_ALREADY_EXISTS(=8)` → перейти к Step 3 FindAll и проверить владельца; при коллизии имени — индекс-суффикс `-N` (§6) | `INVALID_BUCKET_NAME(=9)` → terminal `Failed`; `BUCKET_LIMIT_REACHED(=10)` → `BucketProvisioned=False` reason=`QuotaExceeded`, RequeueAfter 5m (см. П2 — carve-out квоты); `CONFIGURATION_NOT_FOUND(=2)` → terminal `Failed` reason=`ConfigurationMissing` (запись каталога не заведена, П1); `INSUFFICIENT_FUNDS(=1)`/`INVALID_DISPLAY_NAME(=4)` → `Failed` + event |
-| 3 | FetchCreds | `CloudS3Service.FindAll(ByCustomer=<custLogin> + ByBucket=<bucketName>)` → `bucketList[0]`. **Валидация владельца** `bucket.CustLogin == custLogin` (иначе terminal `Failed` — чужой бакет). `Status`: `RUNNING`+непустые ключи → дальше; `CREATING` → RequeueAfter 15s (backoff до 1m); `ERROR` → `Failed`; `REMOVING`/`REMOVED` → `Failed` (внешнее вмешательство). Пусто → RequeueAfter 5s (гонка после Create) | ключи пустые при `RUNNING` → `Failed` reason=`NoKeys` |
-| 4 | WriteVault | read-modify-write в `{kvMount}/data/{secretsPrefix}/{destinationPath}` (формат §3.2, endpoint = `s3.<region>.storage.beget.cloud`); запись только при смене hash | Vault-ошибки → `KeysWritten=False`, backoff; circuit-breaker `internal/vault` |
-| 5 | Ready | `phase=Ready`, RequeueAfter 10m: `FindAll` → сравнить ключи с `keysWrittenHash` — детект внешней ротации → перезапись Vault | — |
+| 2 | EnsureBucket | при пустом `status.bucketName`: если задан `spec.bucket.name` — `FindAll(ByBucket)`, владелец строго равен `customerLogin` → `bucketOwnership=Adopted`, создания нет. Иначе сначала поиск живого (не `REMOVING`/`REMOVED`) бакета этого логина с именем `^<hex>-<k8s-…>$` (с маркером — и с суффиксом `-N`), исключая бакеты, записанные другими заявками. Без маркера найден один — `Adopted`. С маркером в счёт идёт только бакет, который мог сделать потерянный Create: его имени нет в `pendingCreate.existingNames` (имена этого логина под запрошенным именем, с суффиксом и без, в любом статусе — снимок перед Create), его `managedBy` — тот, что ушёл в Create, а имя с суффиксом `-N` — лишь если запрошенное имя было занято до Create. Найден один такой: без суффикса — `Created`, с суффиксом — `Adopted` (это может быть и соседний кластер `<имя>-N`, созданный тем временем; Purge тогда требует `purgeAdopted`). Несколько — `Failed` reason=`AmbiguousBucket`. Не найден — `status.pendingCreate` (со снимком) **патчится до** `CloudService.Create{…}`, `status.bucketName` — **сразу после**. Перед всем этим — проверка единственности: другая, более старая заявка с тем же (`customerLogin`, `clusterRef.name`), тем же листом KV или тем же именем бакета → `Failed` reason=`Conflict` | `INVALID_BUCKET_NAME` → `Failed`; `CONFIGURATION_NOT_FOUND` → `Failed` reason=`ConfigurationMissing`; обе — ошибки spec, повтор через 30m; `BUCKET_LIMIT_REACHED`/`INSUFFICIENT_FUNDS` → `Pending`, повтор через 5m; неизвестный исход (таймаут, транспорт) → маркер сохраняется, повтор через 1m, следующий проход сначала ищет |
+| 3 | FetchCreds | `FindAll(ByBucket=<bucketName>)` (флаг `--cloud-manager-find-by-bucket=false` — прежний `ByCustomer`), результат фильтруется на клиенте по точному имени и владельцу: чужой владелец → `Failed` reason=`ForeignBucket`; пустой владелец — не отказ, а метрика `vault_operator_s3bucketclaim_owner_unverified_total`. `RUNNING`+ключи → дальше; `CREATING` → 15s; `STOPPED`/`ERROR`/`REMOVING`/`REMOVED` → `Failed` reason=`BadStatus`, пустые ключи → `NoKeys`, отсутствующий бакет → `BucketMissing`: ошибки состояния, повтор с экспонентой 1m…30m, выход в `Ready` сам | — |
+| 4 | WriteVault | чтение листа `{kvMount}/data/{secretsPrefix}/{destinationPath}` на каждом проходе; если хоть один свой ключ отличается или отсутствует — запись слиянием с `cas` = текущая версия листа (параллельный писатель того же листа не затирается: несовпадение → перечитать через 5s). Лист после `vault kv delete`/`kv destroy` отвечает 404, но версию сохраняет — она берётся из тела ответа (`data.metadata.version`), и следующий проход восстанавливает ключи; `cas=0` — только у листа без метаданных. При смене `destinationPath` свои ключи снимаются со старого листа (`status.writtenPath`), только если старый лист называет этот же бакет | Vault-ошибки → `KeysWritten=False`, повтор; circuit-breaker `internal/vault` |
+| 5 | Ready | `phase=Ready`, RequeueAfter 10m: шаги 3–4 повторяются, ротация ключей в cloud-manager и правка листа извне чинятся следующим проходом | — |
 
-Требования к реализации: интерфейс `internal/cloudmanager.BucketAPI{Create, FindByCustomerBucket, Remove}` поверх **уже существующего** вендоренного proto (копия из `capi-provider-beget/internal/grpc/cloud-manager/proto`; проверено — `CloudServiceClient.Create`, `CloudS3ServiceClient.FindAll` со scope'ами `ByCustomer`/`ByBucket`, `RemoveBucket`, `S3BucketManagedBy_SYSTEM`, `Bucket.AccessKey/SecretKey`, `CreateParams` — всё на месте; перепин на `s3Bucket=19` НЕ нужен для v1) + mock для envtest. Адрес cloud-manager — флаг/ENV `grpc-internal.svc-cloud-manager[-<env>].service.consul:50051` (**не** hardcode, урок `capi-csr-approver`). Физически бакет создаёт downstream `svc-s3-manager` — оператор его не зовёт напрямую.
+Требования к реализации: интерфейс `internal/cloudmanager.BucketAPI{Create, FindByBucket, FindByRequested, Remove}`; у каждого вызова свой дедлайн (`--cloud-manager-timeout`, 15s), повторяется только `findAll` и только на `UNAVAILABLE`; реализация работает поверх **уже существующего** вендоренного proto (копия из `capi-provider-beget/internal/grpc/cloud-manager/proto`; проверено — `CloudServiceClient.Create`, `CloudS3ServiceClient.FindAll` со scope'ами `ByCustomer`/`ByBucket`, `RemoveBucket`, `S3BucketManagedBy_SYSTEM`, `Bucket.AccessKey/SecretKey`, `CreateParams` — всё на месте; перепин на `s3Bucket=19` НЕ нужен для v1). Тестовый двойник — `internal/cloudmanager/cmfake`: gRPC-сервер с семантикой cloud-manager, через который unit-, envtest- и e2e-пробы гоняют настоящий клиент. Адрес cloud-manager — флаг/ENV `grpc-internal.svc-cloud-manager[-<env>].service.consul:50051` (**не** hardcode, урок `capi-csr-approver`). Физически бакет создаёт downstream `svc-s3-manager` — оператор его не зовёт напрямую.
 
 ---
 
@@ -184,12 +190,12 @@ Finalizer `vault.in-cloud.io/s3bucketclaim-finalizer`, ставится конт
 
 | deletionPolicy | Действия finalizer'а |
 |---|---|
-| `Purge` (дефолт) | `RemoveBucket(status.bucketName)` → поллинг до `REMOVED` (RequeueAfter 15s) → `DeleteKVMetadata({secretsPrefix}/{destinationPath})` → снять finalizer |
+| `Purge` (дефолт) | бакет — только по `status.bucketName` (поиска по имени нет): удаляется, если cloud-manager сообщает ровно `customerLogin` заявки (пустой владелец — чужой), её `managedBy`, и `status.bucketOwnership=Created` (`Adopted` — только с `spec.bucket.purgeAdopted`). Иначе финализер держится, `Ready=False` reason=`DeletionBlocked` (правка заявки — `Retain` или `purgeAdopted` — пересчитывает сразу). `RemoveBucket` → ожидание `REMOVED` (опрос каждые 15s, повторного `RemoveBucket` на `REMOVING` нет); ответы `Already removed` и `Not found` — успех, иной текст — сбой (метрика `vault_operator_cloudmanager_remove_unknown_response_total`); `ERROR` → reason=`DeletionStuck`, экспонента 1m…30m. После `REMOVED` в листе KV снимаются только свои ключи и только если лист называет этот бакет; метаданные удаляются, лишь когда лист опустел. Пустой `status.bucketName` — бакет не удаляется |
 | `Retain` | снять finalizer; бакет и ключи остаются (ручная очистка) |
 
-- Ошибки cloud-manager/Vault при Purge → retry с backoff и requeue; `phase=Deleting` + event; после N неудачных попыток — метрика/алерт (§9), finalizer **не снимается** (иначе осиротевший бакет). Reverse-pipeline ClusterClaim работает через `deleteAndWait` — ожидание встроено в существующий механизм; блок удаления S3BucketClaim ставится первым (рядом с VaultClaim/VaultSecretClaim), kubeconfig ему не нужен.
-- Бакет в `CREATING` на момент удаления — семантика `RemoveBucket` уточняется у cloud-manager (§10 П4); до ответа — дождаться `RUNNING`, затем удалить.
-- **Пересоздание кластера с тем же именем** после удаления: бакет создаётся заново с тем же детерминированным именем (старый удалён Purge'ем); бекапы прошлой инкарнации не восстанавливаются — осознанное решение продукта (эпик §2.3).
+- Заявки, записанные прежним выпуском (без `bucketOwnership`), получают владение из reason условия `BucketProvisioned`: `Created` → `Created`, иное → `Adopted`.
+- Застрявшее удаление (`DeletionBlocked`, `DeletionStuck`) держит финализер: reverse-pipeline ClusterClaim ждёт его через `deleteAndWait`.
+- **Пересоздание кластера с тем же именем** после Purge: cloud-manager держит строку `REMOVED` и даёт новому бакету суффикс `-N`; новая заявка создаёт новый бакет. После `Retain` новая заявка с тем же (`customerLogin`, `clusterRef.name`) находит живой бакет и принимает его как `Adopted`.
 
 ---
 
@@ -197,14 +203,14 @@ Finalizer `vault.in-cloud.io/s3bucketclaim-finalizer`, ставится конт
 
 Правила cloud-manager (`CreateParams.BucketName`): латиница/цифры/`-`, `-` не в начале/конце и не дважды подряд; лимит длины — 63 (S3-стандарт).
 
-**Конвенция:** `k8s-<custLogin>-<clusterName>` (например `k8s-dlputi1u-ec8a00`), санитизация custLogin: lowercase, `_`→`-`, схлопнуть повторные `-`. Включение custLogin даёт глобальную уникальность (имена ClusterClaim namespaced — глобальная уникальность не гарантирована) и мгновенную атрибуцию бакета для саппорта.
+**Конвенция:** `k8s-<custLogin>-<clusterName>` (например `k8s-cust1-cl1`), санитизация custLogin: lowercase, `_`→`-`, схлопнуть повторные `-`. Включение custLogin даёт глобальную уникальность (имена ClusterClaim namespaced — глобальная уникальность не гарантирована) и мгновенную атрибуцию бакета для саппорта.
 
 Инварианты:
 
-1. `status.bucketName` — источник правды после первого успешного Create/adopt (в т.ч. если применён fallback-суффикс).
-2. `BUCKET_NAME_ALREADY_EXISTS` → `FindAll(ByBucket)`: свой SYSTEM-бакет этого кастомера → adopt (повторный reconcile после краша между Create и записью status); чужой → детерминированный fallback-суффикс `-2` + event, итог в status *(альтернатива — terminal Failed; зафиксировать на ревью, PLAN «Решения по ходу»)*.
-3. Повторный reconcile при `RUNNING`-бакете — только сравнение hash ключей; Vault пишется лишь при изменении.
-4. Краш между Create и WriteVault — восстановление через `status.bucketName`/adopt, дублей не возникает.
+1. `status.bucketName` — источник правды после первого успешного Create/adopt; поиск по имени идёт только при пустом `status.bucketName` и никогда при удалении.
+2. cloud-manager при занятом имени (в любом статусе, `REMOVED` тоже) не отказывает, а добавляет `-N`; `BUCKET_NAME_ALREADY_EXISTS` возможен лишь в гонке. Поэтому идемпотентность держит маркер: `status.pendingCreate` пишется до `Create`, имя — сразу после; при стоящем маркере своим (`Created`) считается только бакет с запрошенным именем, которого не было в снимке `existingNames` перед Create; без маркера — принятый (`Adopted`). Бакет, существовавший до Create (в том числе соседнего кластера `<имя>-N` без заявки), не записывается никогда.
+3. Маркер без найденного бакета: повторный `Create` — не раньше чем через 1m (запрос мог быть ещё в обработке).
+4. Повторный reconcile при `RUNNING`-бакете — сверка ключей с Vault; запись только при расхождении, с `cas`.
 
 ---
 
@@ -251,13 +257,14 @@ svc-k8s-manager, cp-2-0, api0, Hub-события — готовность ба�
 
 ## 9. Error handling & observability
 
-- **Events** на CR: `BucketCreated`, `BucketAdopted`, `KeysWritten`, `KeysRotatedExternally`, `BucketRemoveFailed`, `QuotaExceeded`.
+- **Events** на CR: `KeysWritten`, `BucketRemoving`, `DeletionBlocked`, `DeletionStuck`, `BucketNotRecorded`, `QuotaExceeded`, `InsufficientFunds`, `CreateFailed` и reason терминальных ошибок (`ForeignBucket`, `AmbiguousBucket`, `Conflict`, `ConfigurationMissing`, …). Тексты условий и событий — без сырого текста ошибок cloud-manager и Vault (он только в журнале на V(1)).
+- **Реализованные метрики**: `vault_operator_s3bucketclaim_owner_unverified_total`, `vault_operator_cloudmanager_remove_unknown_response_total`. Ниже — план.
 - **Метрики** (Prometheus, стиль vault-operator):
   - `s3bucketclaim_provisioning_duration_seconds` (histogram, Create→Ready);
   - `s3bucketclaim_cloudmanager_calls_total{method,result}`;
   - `s3bucketclaim_deletion_stuck` (gauge: CR в `Deleting` дольше порога) — **алерт**: застрявший finalizer блокирует удаление кластера.
-- **Backoff**: cloud-manager недоступен → экспоненциальный 30s→5m; Vault — существующий circuit-breaker `internal/vault` (5 fail → 2 min open).
-- Терминальные ошибки (`INVALID_BUCKET_NAME`, чужой бакет без fallback) — `phase=Failed`, без requeue-шторма (terminal error по паттерну cluster-claim-operator).
+- **Повторы**: ошибки spec (`INVALID_BUCKET_NAME`, `ConfigurationMissing`, `ForeignBucket`, `AmbiguousBucket`, `BucketNotFound`) — `phase=Failed`, повтор через 30m (правка заявки — сразу); ошибки состояния — экспонента 1m…30m на заявку; Vault — circuit-breaker `internal/vault`.
+- **Флаги** `bucket-operator`: `--cloud-manager-timeout` (15s), `--cloud-manager-keepalive` (0 — пинги выключены: политика пингов сервера неизвестна, частые пинги закрывают соединение GOAWAY), `--cloud-manager-find-by-bucket` (true), `--cloud-manager-find-retries` (1), `--s3bucketclaim-concurrent-reconciles` (2), `--kube-api-qps`, `--kube-api-burst` (0 — умолчание библиотеки).
 
 ---
 
