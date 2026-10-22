@@ -68,7 +68,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 | reason | причина | действие |
 |---|---|---|
 | `AccessorLookupFailed` | не удалось получить accessor для `{{ .AuthMountAccessor }}` шаблона | сначала должен быть `AuthMountReady=True` — если auth method не создан, шаг 5 неуспешен |
-| `RenderFailed` | template error в HCL | проверить `spec.policies[].rules` — синтаксис Go template, доступная переменная: `.AuthMountAccessor` |
+| `RenderFailed` | template error в HCL либо форма шаблона вне закрытого набора | проверить `spec.policies[].rules`: допустимы текст, `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` и строковые константы; сообщение называет отвергнутую конструкцию и её позицию |
 | `PutPolicyFailed` | Vault отверг policy (часто 400 — invalid HCL) | смотреть message — обычно невалидный HCL |
 
 ### RolesApplied=False

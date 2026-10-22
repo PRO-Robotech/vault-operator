@@ -38,7 +38,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `auth.tokenReviewer.serviceAccount.autoCreate` | `bool` | Нет (default `true`) | Создавать ли SA + CRB `system:auth-delegator` в infra-кластере. |
 | `auth.tokenReviewer.ttl` | `duration` | Нет (default `24h`) | TTL JWT, выпускаемого TokenRequest API. Оператор ротирует при остатке <30%. |
 | `policies[].name` | `string` | Да | Имя ACL-policy. Префиксуйте именем claim'а — Vault OSS политики в глобальном NS. |
-| `policies[].rules` | `string` | Да, если нет `identityPaths` | HCL тело политики, Go-шаблон: `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}`. Шаблон Vault напрямую — только экранированным. См. [identity-templating.md](../concepts/identity-templating.md). |
+| `policies[].rules` | `string` | Да, если нет `identityPaths` | HCL тело политики, не длиннее 16384 байт. Go-шаблон закрытого набора форм: `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}`, строковая константа; прочие конструкции шаблона отвергаются (`RenderFailed`). Шаблон Vault напрямую — только экранированным. См. [identity-templating.md](../concepts/identity-templating.md). |
 | `policies[].identityPaths[].path` | `string` | Да | Путь ACL с плейсхолдерами `{serviceAccountName}`, `{serviceAccountNamespace}` (хотя бы один): сегменты `[a-z0-9._-]`, без ведущего `/`, без `*` и `+`, без сегментов из одних точек. `{meta.<key>}` зарезервирован. |
 | `policies[].identityPaths[].capabilities[]` | `[]enum` | Да | `create`, `read`, `update`, `patch`, `delete`, `list`; `sudo` и `deny` недоступны. |
 | `roles[].name` | `string` | Да | Имя роли под `auth/{mountPath}/role/`. |

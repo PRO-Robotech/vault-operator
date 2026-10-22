@@ -85,7 +85,7 @@ func existing(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClai
 // exists without this claim's labels is a ForeignReviewerError and is left as
 // it is. A missing object is created — a create fails on a name someone took
 // meanwhile, where an apply would merge into it; an own object is applied
-// without forcing ownership. The namespace is created when missing and never
+// without forcing ownership and only as it was read. The namespace is created when missing and never
 // written when it exists: it may host anything.
 func EnsureTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alpha1.VaultClaim) error {
 	ref := claim.Spec.Auth.TokenReviewer.ServiceAccount
@@ -95,11 +95,12 @@ func EnsureTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alp
 	labels := claimLabels(claim)
 	crbName := ref.Name + CRBSuffix
 
-	saFound, err := existing(ctx, cs, claim, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &corev1.ServiceAccount{}, "ServiceAccount")
+	readSA, readCRB := &corev1.ServiceAccount{}, &rbacv1.ClusterRoleBinding{}
+	saFound, err := existing(ctx, cs, claim, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, readSA, "ServiceAccount")
 	if err != nil {
 		return err
 	}
-	crbFound, err := existing(ctx, cs, claim, client.ObjectKey{Name: crbName}, &rbacv1.ClusterRoleBinding{}, "ClusterRoleBinding")
+	crbFound, err := existing(ctx, cs, claim, client.ObjectKey{Name: crbName}, readCRB, "ClusterRoleBinding")
 	if err != nil {
 		return err
 	}
@@ -122,7 +123,7 @@ func EnsureTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alp
 			Labels:    labels,
 		},
 	}
-	if err := put(ctx, cs, sa, saFound); err != nil {
+	if err := put(ctx, cs, sa, readSA, saFound); err != nil {
 		return fmt.Errorf("apply ServiceAccount %s/%s: %w", ref.Namespace, ref.Name, err)
 	}
 
@@ -143,18 +144,23 @@ func EnsureTokenReviewerSA(ctx context.Context, cs *ClientSet, claim *vaultv1alp
 			Name:      ref.Name,
 		}},
 	}
-	if err := put(ctx, cs, crb, crbFound); err != nil {
+	if err := put(ctx, cs, crb, readCRB, crbFound); err != nil {
 		return fmt.Errorf("apply ClusterRoleBinding %s: %w", crbName, err)
 	}
 	return nil
 }
 
-// put creates obj, or applies it over the claim's own object without forcing
-// ownership: a field another manager holds is a conflict, not a takeover.
-func put(ctx context.Context, cs *ClientSet, obj client.Object, found bool) error {
+// put creates obj, or applies it over read, the claim's own object, without
+// forcing ownership: a field another manager holds is a conflict, not a
+// takeover. The apply carries the UID and resource version of read, so an
+// object changed or made anew since it was judged the claim's is refused by
+// the apiserver instead of written; the next pass judges it again.
+func put(ctx context.Context, cs *ClientSet, obj, read client.Object, found bool) error {
 	if !found {
 		return cs.Client.Create(ctx, obj, client.FieldOwner(FieldManager))
 	}
+	obj.SetUID(read.GetUID())
+	obj.SetResourceVersion(read.GetResourceVersion())
 	return cs.Client.Patch(ctx, obj, client.Apply, client.FieldOwner(FieldManager))
 }
 

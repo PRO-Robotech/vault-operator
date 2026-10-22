@@ -160,6 +160,86 @@ func (u *templateUse) walkBranch(b *parse.BranchNode) {
 	u.walk(b.ElseList)
 }
 
+// admitTemplate refuses every construct of the template language but the
+// closed set rules are written in: text, and actions of one operand that is a
+// string constant, the accessor field or a ServiceAccount function. Without
+// loops, branches, variables, pipelines, built-in functions or further
+// templates, a render is one pass over the parse tree, and its output grows
+// with the rules alone.
+func admitTemplate(t *template.Template) error {
+	for _, tt := range t.Templates() {
+		if tt.Name() != t.Name() {
+			return fmt.Errorf("%w: the template %q is defined", errTemplateForm, tt.Name())
+		}
+	}
+	if t.Tree == nil || t.Root == nil {
+		return nil
+	}
+	for _, n := range t.Root.Nodes {
+		if err := admitNode(t.Tree, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func admitNode(tree *parse.Tree, n parse.Node) error {
+	refuse := func(what string) error {
+		loc, _ := tree.ErrorContext(n)
+		return fmt.Errorf("%w: %s at %s", errTemplateForm, what, loc)
+	}
+	switch x := n.(type) {
+	case *parse.TextNode:
+		return nil
+	case *parse.ActionNode:
+		pipe := x.Pipe
+		if pipe == nil || len(pipe.Decl) > 0 || len(pipe.Cmds) != 1 || len(pipe.Cmds[0].Args) != 1 {
+			return refuse("an action of more than one operand")
+		}
+		switch a := pipe.Cmds[0].Args[0].(type) {
+		case *parse.StringNode:
+			return nil
+		case *parse.FieldNode:
+			if len(a.Ident) == 1 && a.Ident[0] == "AuthMountAccessor" {
+				return nil
+			}
+			return refuse("the field ." + strings.Join(a.Ident, "."))
+		case *parse.IdentifierNode:
+			switch a.Ident {
+			case funcSAName, funcSANamespace, funcBareVault:
+				return nil
+			}
+			return refuse("the function " + a.Ident)
+		default:
+			return refuse("the operand " + a.String())
+		}
+	case *parse.RangeNode:
+		return refuse("range")
+	case *parse.IfNode:
+		return refuse("if")
+	case *parse.WithNode:
+		return refuse("with")
+	case *parse.TemplateNode:
+		return refuse("template")
+	default:
+		return refuse(n.String())
+	}
+}
+
+// boundedBuffer is a render target that fails the write which would take it
+// past max bytes, which ends the template execution with that error.
+type boundedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len()+len(p) > b.max {
+		return 0, errRenderTooLarge
+	}
+	return b.buf.Write(p)
+}
+
 // policyNeedsAccessor reports whether rendering p reads the auth mount
 // accessor: identity paths always do, rules when their parse tree refers to
 // the template data or to a ServiceAccount function. Rules that do not parse
@@ -192,6 +272,9 @@ func claimNeedsAccessor(claim *vaultv1alpha1.VaultClaim) bool {
 // as a Go template, then one stanza per identity path. A policy without
 // identity paths renders exactly as its rules always have.
 func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, error) {
+	if len(p.Rules) > vaultv1alpha1.MaxRulesLength {
+		return "", errRulesTooLong
+	}
 	var body string
 	if p.Rules != "" {
 		t, err := parsePolicyRules(p.Rules, accessor)
@@ -204,11 +287,14 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
 		if inspectTemplate(t).bareIdentity {
 			return "", errBareIdentity
 		}
-		var buf bytes.Buffer
-		if err := t.Execute(&buf, map[string]string{"AuthMountAccessor": accessor}); err != nil {
+		if err := admitTemplate(t); err != nil {
 			return "", err
 		}
-		body = buf.String()
+		out := &boundedBuffer{max: maxRenderedPolicy}
+		if err := t.Execute(out, map[string]string{"AuthMountAccessor": accessor}); err != nil {
+			return "", err
+		}
+		body = out.buf.String()
 	}
 	if len(p.IdentityPaths) == 0 {
 		return body, nil
@@ -230,6 +316,9 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
 			b.WriteString("\n")
 		}
 		b.WriteString(stanza)
+		if b.Len() > maxRenderedPolicy {
+			return "", errRenderTooLarge
+		}
 	}
 	return b.String(), nil
 }

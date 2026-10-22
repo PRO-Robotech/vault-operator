@@ -373,8 +373,10 @@ type PolicySpec struct {
 	// is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
 	// {{ vaultSANamespace }} write the Vault templates naming the logged-in
 	// ServiceAccount. A Vault template written directly must be escaped:
-	// {{`{{`}} … {{`}}`}}.
+	// {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+	// 16384 bytes (MaxRulesLength).
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=16384
 	// +optional
 	Rules string `json:"rules,omitempty"`
 

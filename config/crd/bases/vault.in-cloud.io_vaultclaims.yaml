@@ -231,7 +231,9 @@ spec:
                         is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
                         {{ vaultSANamespace }} write the Vault templates naming the logged-in
                         ServiceAccount. A Vault template written directly must be escaped:
-                        {{`{{`}} … {{`}}`}}.
+                        {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+                        16384 bytes (MaxRulesLength).
+                      maxLength: 16384
                       minLength: 1
                       type: string
                   required:
