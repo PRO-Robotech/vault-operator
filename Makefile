@@ -69,6 +69,13 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+# make test runs without -race. These packages hold state shared between
+# reconcile workers (the Vault token, the target-cluster client cache) and need
+# no envtest, so the race detector runs on them on every change.
+.PHONY: test-race
+test-race: ## Run the race detector on the packages with state shared between goroutines.
+	go test -race -count=1 ./internal/vault/... ./internal/target/...
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:
