@@ -272,7 +272,7 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `Pending` | Только что создан, ещё не начался pipeline |
 | `Configuring` | Pipeline в процессе |
 | `Ready` | Все шаги прошли, `Ready=True` |
-| `Failed` | Терминальная ошибка (зарезервировано) |
+| `Failed` | Шаг отверг заявку: причина — в `Ready` и в условии шага; повтор — при правке spec или перепроверкой |
 | `Deleting` | Идёт reverse pipeline |
 
 ## События
@@ -289,6 +289,7 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `ReviewerJWTRotated` | Normal | Reviewer JWT обновлён |
 | `RolesPurged` | Normal | Soft-purge удалил роли, которых нет в spec |
 | `DriftDetected` | Warning | Drift найден на Ready claim'е |
+| `RenderFailed` | Warning | `rules` политики не рендерятся; заявка `Failed`, сообщение называет причину |
 | `AuthMountAccessorChanged` | Warning | Accessor auth-mount сменился (mount пересоздан); шаблонные политики отрендерены заново |
 | `ForeignReviewer` | Warning | SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки; объекты не тронуты, заявка `Failed` |
 | `DeletionStuck` | Warning | Reverse pipeline застрял на Vault |

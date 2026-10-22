@@ -64,6 +64,14 @@ const ReasonAuthMountAccessorChanged = "AuthMountAccessorChanged"
 // proceeds once the owner configures the mount.
 const ReasonMountNotConfigured = "MountNotConfigured"
 
+// ReasonRenderFailed: a policy's rules do not render — a template form
+// outside the closed set, rules past the length limit, a body past the size
+// limit, a Vault template written unescaped, a parse error. The outcome is
+// decided by spec and the auth mount accessor, so the claim is refused, not
+// retried: it is rendered again when spec changes or when
+// RequeueClaimRenderRefused has passed (renderRefusals).
+const ReasonRenderFailed = "RenderFailed"
+
 // ReasonReconciled: Degraded=False after a pass that completed.
 const ReasonReconciled = "Reconciled"
 

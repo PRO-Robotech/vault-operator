@@ -18,6 +18,7 @@ import (
 	"strings"
 	"text/template"
 	"text/template/parse"
+	"unicode/utf8"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 )
@@ -50,8 +51,8 @@ var (
 	errAccessorForm = errors.New("the auth mount accessor has an unexpected form")
 	errTemplateForm = errors.New("the rules use a template form outside the admitted ones " +
 		"(text, {{ .AuthMountAccessor }}, {{ vaultSAName }}, {{ vaultSANamespace }}, a string constant such as {{`{{`}})")
-	errRulesTooLong   = fmt.Errorf("the rules are longer than %d bytes", vaultv1alpha1.MaxRulesLength)
-	errRenderTooLarge = fmt.Errorf("the rendered policy is larger than %d bytes", maxRenderedPolicy)
+	errRulesTooLong   = errors.New("the rules are longer than the limit")
+	errRenderTooLarge = errors.New("the rendered policy is larger than the limit")
 
 	// accessorForm is what an accessor may hold to be embedded in a Vault
 	// template; Vault's own are auth_<type>_<hex>.
@@ -169,7 +170,7 @@ func (u *templateUse) walkBranch(b *parse.BranchNode) {
 func admitTemplate(t *template.Template) error {
 	for _, tt := range t.Templates() {
 		if tt.Name() != t.Name() {
-			return fmt.Errorf("%w: the template %q is defined", errTemplateForm, tt.Name())
+			return fmt.Errorf("%w: the template %q is defined", errTemplateForm, clipConstruct(tt.Name()))
 		}
 	}
 	if t.Tree == nil || t.Root == nil {
@@ -186,7 +187,7 @@ func admitTemplate(t *template.Template) error {
 func admitNode(tree *parse.Tree, n parse.Node) error {
 	refuse := func(what string) error {
 		loc, _ := tree.ErrorContext(n)
-		return fmt.Errorf("%w: %s at %s", errTemplateForm, what, loc)
+		return fmt.Errorf("%w: %s at %s", errTemplateForm, clipConstruct(what), loc)
 	}
 	switch x := n.(type) {
 	case *parse.TextNode:
@@ -226,6 +227,33 @@ func admitNode(tree *parse.Tree, n parse.Node) error {
 	}
 }
 
+// maxConstructText bounds how much of a refused construct a refusal quotes:
+// the construct is the writer's own text, but an operand may be as long as
+// the rules, and the refusal ends up in a status condition.
+const maxConstructText = 64
+
+func clipConstruct(s string) string {
+	if len(s) <= maxConstructText {
+		return s
+	}
+	cut := maxConstructText
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// rulesTooLong and renderTooLarge are the refusals of the two bounds. Their
+// text names the measured size and the limit and is shown to the writer as
+// it is; errors.Is still matches the sentinels.
+func rulesTooLong(n int) error {
+	return fmt.Errorf("%w: %d bytes, the limit is %d", errRulesTooLong, n, vaultv1alpha1.MaxRulesLength)
+}
+
+func renderTooLarge(atLeast int) error {
+	return fmt.Errorf("%w: at least %d bytes, the limit is %d", errRenderTooLarge, atLeast, maxRenderedPolicy)
+}
+
 // boundedBuffer is a render target that fails the write which would take it
 // past max bytes, which ends the template execution with that error.
 type boundedBuffer struct {
@@ -234,8 +262,8 @@ type boundedBuffer struct {
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
-	if b.buf.Len()+len(p) > b.max {
-		return 0, errRenderTooLarge
+	if n := b.buf.Len() + len(p); n > b.max {
+		return 0, renderTooLarge(n)
 	}
 	return b.buf.Write(p)
 }
@@ -271,9 +299,14 @@ func claimNeedsAccessor(claim *vaultv1alpha1.VaultClaim) bool {
 // renderClaimPolicy is the HCL the operator writes for p: the rules rendered
 // as a Go template, then one stanza per identity path. A policy without
 // identity paths renders exactly as its rules always have.
+//
+// Its error is shown to the writer as it is (stepApplyPolicies): rendering
+// reads nothing but p and the accessor, and no error text carries the
+// accessor or the rendered body — only the writer's own spec, a construct of
+// it clipped to maxConstructText, and the operator's limits.
 func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, error) {
 	if len(p.Rules) > vaultv1alpha1.MaxRulesLength {
-		return "", errRulesTooLong
+		return "", rulesTooLong(len(p.Rules))
 	}
 	var body string
 	if p.Rules != "" {
@@ -317,7 +350,7 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
 		}
 		b.WriteString(stanza)
 		if b.Len() > maxRenderedPolicy {
-			return "", errRenderTooLarge
+			return "", renderTooLarge(b.Len())
 		}
 	}
 	return b.String(), nil

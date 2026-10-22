@@ -66,7 +66,8 @@ type VaultClaimReconciler struct {
 	// Runtime carries the process-wide reconcile settings.
 	Runtime Runtime
 
-	backoff stepBackoff
+	backoff        stepBackoff
+	renderRefusals renderRefusals
 }
 
 const defaultMaxConcurrentReconciles = 4
@@ -86,6 +87,7 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.backoff.Reset(req.NamespacedName)
+			r.renderRefusals.forget(req.NamespacedName)
 			reviewerJWTExpirySeconds.DeleteLabelValues(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
@@ -107,6 +109,13 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.Update(ctx, claim); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
 		}
+	}
+
+	// Rules this generation was refused for do not render on a second pass:
+	// the claim waits for an edit of spec or for the recheck to come due.
+	if wait, ok := r.renderRefusals.pending(req.NamespacedName, claim, r.now()); ok {
+		logger.V(1).Info("rules of this generation do not render; pass skipped until the recheck", "requeueAfter", wait.String())
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
 	oldStatus := claim.Status.DeepCopy()
