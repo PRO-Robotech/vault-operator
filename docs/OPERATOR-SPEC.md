@@ -334,6 +334,7 @@ path "sys/policies/acl/*"             { capabilities = ["create", "read", "updat
 # Token-self для ротации собственного токена
 path "auth/token/renew-self"          { capabilities = ["update"] }
 path "auth/token/lookup-self"         { capabilities = ["read"] }
+path "auth/token/revoke-self"         { capabilities = ["update"] }
 ```
 
 **Намеренно НЕ выдаём:** `sys/mounts/secret*` (mount уже настроен платформой, оператор не должен иметь возможность его пересоздать), `secret/data/*`, `secret/metadata/*` — оператор не должен иметь возможности читать/писать сами секреты.
