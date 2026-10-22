@@ -301,3 +301,43 @@ func TestClient_CreateReturnsTheServerName(t *testing.T) {
 func removeUnknownResponses() float64 {
 	return testutil.ToFloat64(removeUnknownResponseCounter)
 }
+
+// Create is not idempotent on the server side: a create cut by the client
+// deadline still runs there, and its retry answers "user already exists"
+// (system-test 2026-10-22: DeadlineExceeded ×7 at 15s, creates finishing
+// within ~75s). The read deadline therefore does not bound a create.
+func TestClient_CreateIsNotCutByTheReadDeadline(t *testing.T) {
+	srv := cmfake.New()
+	srv.CreateDelay = 400 * time.Millisecond
+	c := newTestClient(t, srv, Options{CallTimeout: 100 * time.Millisecond})
+
+	name, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-slow"})
+	if err != nil {
+		t.Fatalf("create slower than the read deadline: err = %v, want the server name", err)
+	}
+	if name != cmfake.Prefix("c1")+"-k8s-c1-slow" {
+		t.Fatalf("name = %q", name)
+	}
+
+	// Twin: a read slower than the read deadline is still cut by it.
+	hung := cmfake.New()
+	hung.HangFindAll = true
+	hc := newTestClient(t, hung, Options{CallTimeout: 100 * time.Millisecond})
+	if _, err := hc.FindByBucket(context.Background(), "c1", name); status.Code(errors.Unwrap(err)) != codes.DeadlineExceeded {
+		t.Fatalf("findAll past the read deadline: err = %v, want DeadlineExceeded", err)
+	}
+}
+
+// cloud-manager answers a create it cannot classify with CODE_RESERVED and a
+// free text ("failed to create user: user already exists"): the client names
+// it as a rejected create, not as an unknown transport outcome.
+func TestClient_CreateRejectedWithoutACodeIsNamed(t *testing.T) {
+	srv := cmfake.New()
+	srv.CreateError = &pb.CreateError{Code: pb.CreateError_CODE_RESERVED, Message: "failed to create user: user already exists"}
+	c := newTestClient(t, srv, Options{})
+
+	_, err := c.Create(context.Background(), CreateInput{CustomerLogin: "c1", BucketName: "k8s-c1-rej"})
+	if err == nil || !strings.Contains(err.Error(), "create rejected [CODE_RESERVED]") {
+		t.Fatalf("err = %v, want a rejected create naming CODE_RESERVED", err)
+	}
+}
