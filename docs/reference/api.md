@@ -24,14 +24,16 @@ API group: `vault.in-cloud.io/v1alpha1`
 | Поле | Тип | Обязательно | Описание |
 |---|---|:---:|---|
 | `vaultConfigRef.name` | `string` | Да | Имя VaultConfig (cluster-scoped). Мутируемо. |
-| `clusterRef.name` | `string` | Да | Имя ClusterClaim в том же namespace. **Immutable.** |
+| `clusterRef.name` | `string` | Да, кроме `auth.manageConfig: false` | Имя ClusterClaim в том же namespace. **Immutable.** |
 | `clusterRef.kubeconfigSecret` | `string` | Нет | Имя Secret с kubeconfig. По умолчанию `{clusterRef.name}-infra-kubeconfig`. |
 | `secretsPrefix` | `string` | Да | Путь под общим KV-mount, e.g. `clusters/ec8a00`. **Immutable.** |
 | `auth.mountPath` | `string` | Да | Путь auth-mount в Vault, e.g. `kubernetes-ec8a00`. **Immutable.** |
-| `auth.autoCreate` | `bool` | Нет (default `true`) | Создавать ли auth-mount через `POST sys/auth`. Если `false`, mount должен существовать. |
+| `auth.autoCreate` | `bool` | Нет (default `true`) | Создавать ли auth-mount через `POST sys/auth`. Если `false`, mount должен существовать и нести описание этой заявки. |
+| `auth.manageConfig` | `bool` | Нет (default `true`) | `false` — гостевая заявка: только свои роли и политики на mount оператора или из `--guest-auth-mounts`. Требует `autoCreate: false` и `rolePruning: Owned`. **Immutable.** См. [ownership.md](../concepts/ownership.md). |
+| `auth.rolePruning` | `Exclusive`\|`Owned` | Нет | Какие роли удаляются, уйдя из `roles[]`. Пусто — `Exclusive` у владельца, `Owned` у гостя. |
 | `auth.issuer` | `string` | Нет | OIDC issuer infra-кластера. Пусто → автоопределение через `/.well-known/openid-configuration`. |
-| `auth.tokenReviewer.serviceAccount.namespace` | `string` | Да | Namespace SA для TokenReview. |
-| `auth.tokenReviewer.serviceAccount.name` | `string` | Да | Имя SA для TokenReview. |
+| `auth.tokenReviewer.serviceAccount.namespace` | `string` | Да, кроме `auth.manageConfig: false` | Namespace SA для TokenReview. |
+| `auth.tokenReviewer.serviceAccount.name` | `string` | Да, кроме `auth.manageConfig: false` | Имя SA для TokenReview. |
 | `auth.tokenReviewer.serviceAccount.autoCreate` | `bool` | Нет (default `true`) | Создавать ли SA + CRB `system:auth-delegator` в infra-кластере. |
 | `auth.tokenReviewer.ttl` | `duration` | Нет (default `24h`) | TTL JWT, выпускаемого TokenRequest API. Оператор ротирует при остатке <30%. |
 | `policies[].name` | `string` | Да | Имя ACL-policy. Префиксуйте именем claim'а — Vault OSS политики в глобальном NS. |
@@ -51,11 +53,12 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `phase` | `enum` | `Pending`, `Configuring`, `Ready`, `Failed`, `Deleting`. |
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
-| `vault.authMountPath` | `string` | Зеркало `spec.auth.mountPath`. |
+| `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
 | `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |
-| `vault.appliedPolicies[]` | `[]string` | Имена политик, фактически записанных в Vault. |
-| `vault.appliedRoles[]` | `[]string` | Имена ролей, фактически созданных в Vault. |
+| `vault.appliedPolicies[]` | `[]string` | Журнал политик: имя попадает до записи в Vault и уходит после удаления. |
+| `vault.appliedRoles[]` | `[]string` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления. |
+| `vault.authMountOwned` | `bool` | Факт владения mount: 2xx на создание этой заявкой, её описание в `sys/auth` или запись `vault.authMountPath` прежнего прохода. |
 | `vault.tokenReviewerJWT.issuedAt` | `time` | Когда выпущен текущий reviewer JWT. |
 | `vault.tokenReviewerJWT.expiresAt` | `time` | Когда истекает. |
 | `vault.tokenReviewerJWT.lastRotated` | `time` | Время последней ротации (`= issuedAt` при ротации). |

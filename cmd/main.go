@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -29,6 +30,7 @@ import (
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/controller"
+	"github.com/PRO-Robotech/vault-operator/internal/policyguard"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 	// +kubebuilder:scaffold:imports
 )
@@ -55,6 +57,8 @@ func main() {
 	var enableHTTP2 bool
 	var pprofAddr string
 	var vaultClaimConcurrency int
+	var reservedPolicies, externalPolicies, reservedRoles, guestMounts string
+	var policyGuard string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +83,21 @@ func main() {
 			"`kubectl port-forward` (access gated by pods/portforward RBAC).")
 	flag.IntVar(&vaultClaimConcurrency, "vaultclaim-concurrent-reconciles", 4,
 		"Maximum number of VaultClaim reconciles running in parallel.")
+	flag.StringVar(&reservedPolicies, "reserved-policy-names", "",
+		"Comma-separated Vault policies no VaultClaim may write, delete or reference "+
+			"(the operators' own policies). Vault's built-in policies are always reserved.")
+	flag.StringVar(&externalPolicies, "external-policy-names", "",
+		"Comma-separated Vault policies written outside VaultClaims: roles may reference them, "+
+			"claims never write or delete them.")
+	flag.StringVar(&reservedRoles, "reserved-role-names", "",
+		"Comma-separated roles on operator auth mounts that no VaultClaim may write or delete, "+
+			"in addition to the roles VaultConfigs log in with.")
+	flag.StringVar(&guestMounts, "guest-auth-mounts", "",
+		"Comma-separated auth mounts, besides the VaultConfig mounts, where claims with "+
+			"spec.auth.manageConfig=false may add roles.")
+	flag.StringVar(&policyGuard, "policy-guard", string(policyguard.ModeAudit),
+		"What a VaultClaim policy outside the claim's scope does: audit (write it, emit an event and a metric) "+
+			"or enforce (refuse it). Guest claims are always enforced.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -86,6 +105,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	guardMode, err := policyguard.ParseMode(policyGuard)
+	if err != nil {
+		setupLog.Error(err, "invalid --policy-guard")
+		os.Exit(1)
+	}
+	ownership := controller.OwnershipPolicy{
+		ReservedPolicyNames: splitList(reservedPolicies),
+		ExternalPolicyNames: splitList(externalPolicies),
+		ReservedRoleNames:   splitList(reservedRoles),
+		GuestMounts:         splitList(guestMounts),
+	}
 
 	// Disable HTTP/2 by default to avoid the Stream Cancellation and Rapid
 	// Reset CVEs (GHSA-qppj-fm5r-hxr3, GHSA-4374-p667-p6c8).
@@ -167,6 +198,8 @@ func main() {
 		VaultFactory:            vaultFactory,
 		TargetManager:           targetManager,
 		MaxConcurrentReconciles: vaultClaimConcurrency,
+		Ownership:               ownership,
+		PolicyGuard:             guardMode,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultClaim")
 		os.Exit(1)
@@ -197,4 +230,15 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// splitList parses a comma-separated flag; blanks are dropped.
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

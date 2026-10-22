@@ -12,8 +12,10 @@ You may obtain a copy of the License at
 // VaultClaim / VaultSecretClaim pipelines against a real `vault server -dev`
 // instance plus envtest k8s. Build-gated with `e2e`.
 //
-// These tests skip cleanly when the `vault` binary is not in PATH, so the
-// local dev workflow (`make test`) is unaffected.
+// These tests fail when the `vault` binary is missing or is not the version
+// production runs (E2E_VAULT_VERSION, default 1.20.1): a skipped or
+// mismatched run proves nothing about production. `make test-e2e-pipeline`
+// installs the binary into bin/. `make test` does not run this package.
 package e2e_pipeline
 
 import (
@@ -23,7 +25,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -48,10 +52,22 @@ const devRootToken = "root-e2e"
 // NewVaultDevServer spawns `vault server -dev` on a self-allocated port (Vault's
 // `-dev-listen-address=:0` reports a literal ":0" we can't parse back) with a
 // known root token, then waits until the API answers. A missing `vault` binary
-// returns an error wrapping ErrVaultBinaryMissing — callers should Skip.
+// returns an error wrapping ErrVaultBinaryMissing, a different version
+// ErrVaultVersionMismatch; callers fail on both.
 func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 	if _, err := exec.LookPath("vault"); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrVaultBinaryMissing, err)
+	}
+	want := os.Getenv("E2E_VAULT_VERSION")
+	if want == "" {
+		want = DefaultVaultVersion
+	}
+	out, err := exec.CommandContext(ctx, "vault", "version").Output()
+	if err != nil {
+		return nil, fmt.Errorf("vault version: %w", err)
+	}
+	if !strings.HasPrefix(string(out), "Vault v"+want+" ") {
+		return nil, fmt.Errorf("%w: want v%s, got %q", ErrVaultVersionMismatch, want, strings.TrimSpace(string(out)))
 	}
 
 	port, err := freePort()
@@ -93,9 +109,14 @@ func NewVaultDevServer(ctx context.Context) (*VaultDevServer, error) {
 	return srv, nil
 }
 
-// ErrVaultBinaryMissing is wrapped by NewVaultDevServer when `vault` is not in
-// PATH. Test fixtures should `errors.Is` this and Skip rather than Fail.
+// ErrVaultBinaryMissing is wrapped by NewVaultDevServer when `vault` is not in PATH.
 var ErrVaultBinaryMissing = errors.New("vault binary not found in PATH")
+
+// ErrVaultVersionMismatch is wrapped when `vault version` is not the wanted one.
+var ErrVaultVersionMismatch = errors.New("vault binary is not the wanted version")
+
+// DefaultVaultVersion is the Vault production runs.
+const DefaultVaultVersion = "1.20.1"
 
 // freePort asks the OS for an unused TCP port on loopback. There is a small
 // race between closing the probe listener and Vault binding it; acceptable for

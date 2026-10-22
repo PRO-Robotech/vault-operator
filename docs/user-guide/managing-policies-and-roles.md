@@ -42,13 +42,7 @@ kubectl get vaultclaim ec8a00 -n dlputi1u -o jsonpath='{.status.vault.appliedPol
 
 Уберите запись из `spec.policies[]` и `kubectl apply`.
 
-> ⚠ **Soft-purge для policies оператор НЕ делает** — политика останется в Vault. Это намеренно: Vault OSS не различает «моя» от «чужой» политики, а префикс — это только конвенция. Удалите вручную:
->
-> ```bash
-> vault policy delete ec8a00-old-policy
-> ```
->
-> Или предусмотрите её удаление в reverse-pipeline при полном удалении VaultClaim'а — оператор удаляет все политики, перечисленные в `status.vault.appliedPolicies` объединённые с `spec.policies[]`.
+Оператор удалит политику на следующем полном проходе — после того, как роли перестанут на неё ссылаться: удаляются только имена из журнала `status.vault.appliedPolicies`. Зарезервированные имена и имена другой заявки не удаляются никогда. Событие — `PoliciesPurged`.
 
 ## Добавление role
 
@@ -72,14 +66,14 @@ spec:
 
 Любое поле — `boundServiceAccounts`, `policies`, `tokenTTL`, `tokenMaxTTL` — обновляется через `kubectl apply`. Vault `POST auth/{mount}/role/{name}` идемпотентен.
 
-## Удаление role: soft-purge
+## Удаление role
 
-Уберите запись из `spec.roles[]` и `kubectl apply`. Оператор выполнит **soft-purge**:
+Уберите запись из `spec.roles[]` и `kubectl apply`. Что удалится, задаёт `spec.auth.rolePruning`:
 
-1. Перечислит существующие роли через `LIST auth/{mount}/role/`.
-2. Сравнит с `spec.roles[]`.
-3. Удалит все, которых нет в spec.
-4. Эмитит событие `RolesPurged` с числом удалённых.
+1. `Exclusive` (по умолчанию у владельца mount) — все роли из `LIST auth/{mount}/role/`, которых нет в spec, пока mount доказанно принадлежит заявке.
+2. `Owned` (обязателен у гостя) — только роли из журнала `status.vault.appliedRoles`.
+3. Зарезервированные роли и роли другой заявки не удаляются никогда.
+4. Эмитится событие `RolesPurged` с числом удалённых.
 
 Проверка:
 
@@ -89,7 +83,7 @@ kubectl get events -n dlputi1u --field-selector reason=RolesPurged
 # 10s         Normal   RolesPurged    vaultclaim/ec8a00     removed 1 roles in auth/kubernetes-ec8a00 no longer present in spec.roles[]
 ```
 
-> Soft-purge для ролей **безопасен** — он работает только в пределах `auth/{spec.auth.mountPath}/role/`, который привязан к этому конкретному claim'у. Ролей чужих claim'ов оператор не видит.
+> `Exclusive` действует только на mount, который `sys/auth` показывает с описанием этой заявки. На чужом mount заявка ведёт себя как `Owned`. См. [concepts/ownership.md](../concepts/ownership.md).
 
 ## Identity templating
 
