@@ -61,7 +61,7 @@ path "secret/data/clusters/ec8a00/monitoring/vmauth/*" {
 }
 ```
 
-**Soft-purge оператор НЕ делает для политик** — если убрать запись из `spec.policies[]`, политика остаётся в Vault. (Причина: политика может быть переиспользована другим claim'ом, а различить «моя» от «чужой» без явного префикса нельзя.) Удаление вручную или через reverse-pipeline при удалении claim'а.
+**Политика, убранная из `spec.policies[]`, удаляется** — по журналу `status.vault.appliedPolicies`: заявка удаляет только то, что сама записала, и никогда — зарезервированные имена и имена другой заявки. Имя, которое уже есть в Vault и не записано этой заявкой, не перезаписывается (`OwnershipConflict`). См. [ownership.md](ownership.md).
 
 ## Уровень 3: Roles
 
@@ -77,7 +77,7 @@ path "secret/data/clusters/ec8a00/monitoring/vmauth/*" {
 
 Если одну политику нужно раздать N SA — создаются N ролей с одинаковыми `policies: [...]`.
 
-**Soft-purge для ролей** — да: при reconcile оператор `LIST auth/{mount}/role` и удаляет имена, которых нет в `spec.roles[]`. Срабатывает только в пределах конкретного auth-mount этого claim'а, так что чужие роли (других claim'ов) не задеваются.
+**Удаление ролей** — по `spec.auth.rolePruning`: `Exclusive` (по умолчанию у владельца) удаляет с mount все имена, которых нет в `spec.roles[]`, но только пока mount доказанно принадлежит заявке; `Owned` — только роли из журнала. См. [ownership.md](ownership.md).
 
 ## TTL и Max-TTL
 

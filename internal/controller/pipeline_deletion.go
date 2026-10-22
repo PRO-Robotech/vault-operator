@@ -30,10 +30,11 @@ import (
 
 const RequeueDeletionStuck = 1 * time.Minute
 
-// handleDeletion drives the reverse pipeline: Roles →
-// Policies → AuthMethod → Target SA → finalizer. Vault-side failures keep
-// the finalizer + requeue (premature removal would orphan Vault objects).
-// Target cleanup is best-effort.
+// handleDeletion drives the reverse pipeline: Roles → Policies → AuthMethod →
+// Target SA → finalizer. Only names in the claim's ledger are deleted, never
+// spec names: spec says what the claim wants, the ledger what it may have
+// written. Vault-side failures keep the finalizer + requeue (premature removal
+// would orphan Vault objects). Target cleanup is best-effort.
 func (r *VaultClaimReconciler) handleDeletion(ctx context.Context, claim *vaultv1alpha1.VaultClaim) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("vaultclaim", client.ObjectKeyFromObject(claim))
 
@@ -45,21 +46,24 @@ func (r *VaultClaimReconciler) handleDeletion(ctx context.Context, claim *vaultv
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation,
 		"Deleting", "reverse pipeline in progress")
 
-	// Skip Vault cleanup if the auth mount was never created — target SA
-	// cleanup may still apply.
-	everCreatedAuth := claim.Status.Vault != nil && claim.Status.Vault.AuthMountPath != ""
-	if everCreatedAuth {
+	// A claim that never got past Step 1 wrote nothing to Vault: Step 1 records
+	// the mount path before any Vault write, and every write is preceded by
+	// its ledger entry.
+	if v := claim.Status.Vault; v != nil && (v.AuthMountPath != "" || len(v.AppliedRoles) > 0 || len(v.AppliedPolicies) > 0) {
 		if err := r.deleteVaultObjects(ctx, claim); err != nil {
-			logger.Info("Vault cleanup failed, keeping finalizer for retry", "error", err.Error())
+			logger.V(1).Info("Vault cleanup error", "error", err.Error())
+			logger.Info("Vault cleanup failed, keeping finalizer for retry", "cause", failureText(err))
 			if r.Recorder != nil {
 				r.Recorder.Eventf(claim, corev1.EventTypeWarning, "DeletionStuck",
-					"Vault cleanup failed (will retry): %v", err)
+					"Vault cleanup failed (will retry): %s", failureText(err))
 			}
 			return ctrl.Result{RequeueAfter: RequeueDeletionStuck}, nil
 		}
 	}
 
-	r.deleteTargetObjects(ctx, claim)
+	if claim.Spec.Auth.ManagesConfig() {
+		r.deleteTargetObjects(ctx, claim)
+	}
 
 	controllerutil.RemoveFinalizer(claim, vaultv1alpha1.VaultClaimFinalizer)
 	if err := r.Update(ctx, claim); err != nil {
@@ -92,81 +96,63 @@ func (r *VaultClaimReconciler) deleteVaultObjects(ctx context.Context, claim *va
 		return fmt.Errorf("vault login: %w", err)
 	}
 
-	mount := claim.Spec.Auth.MountPath
+	mount := normMount(claim.Spec.Auth.MountPath)
 	if mount == "" {
 		return errors.New("spec.auth.mountPath is empty")
 	}
 
-	for _, name := range roleNamesForDeletion(claim) {
+	view, err := r.buildOwnershipView(ctx, claim)
+	if err != nil {
+		return err
+	}
+	others, err := r.everyOtherClaim(ctx, claim)
+	if err != nil {
+		return err
+	}
+	held := collectHeld(others)
+
+	var journalRoles, journalPolicies []string
+	if claim.Status.Vault != nil {
+		journalRoles = claim.Status.Vault.AppliedRoles
+		journalPolicies = claim.Status.Vault.AppliedPolicies
+	}
+	for _, name := range deletableRoles(view, mount, journalRoles, held) {
 		if err := vc.DeleteKubernetesRole(ctx, mount, name); err != nil {
 			return fmt.Errorf("delete role %q: %w", name, err)
 		}
 	}
-	for _, name := range policyNamesForDeletion(claim) {
+	for _, name := range r.deletablePolicies(journalPolicies, held) {
 		if err := vc.DeletePolicy(ctx, name); err != nil {
 			return fmt.Errorf("delete policy %q: %w", name, err)
 		}
 	}
 	// Transit keys are never deleted, under any policy.
-	if claim.Spec.DeletionPolicy == vaultv1alpha1.DeletionPolicyRetain {
+	if claim.Spec.DeletionPolicy == vaultv1alpha1.DeletionPolicyRetain ||
+		!claim.Spec.Auth.ManagesConfig() || !claim.Spec.Auth.AutoCreateEnabled() {
 		return nil
 	}
-	if !claim.Spec.Auth.AutoCreate {
+
+	// The mount goes only when Vault itself shows it as this claim's: status
+	// cannot tell a created mount from an adopted or foreign one.
+	mounts, err := vc.ListAuthMounts(ctx)
+	if err != nil {
+		return fmt.Errorf("list auth mounts: %w", err)
+	}
+	info, exists := mounts[mountKey(mount)]
+	if !exists {
+		return nil
+	}
+	if view.isOperatorMount(mount) || !mountIsOurs(info, claim) {
+		if r.Recorder != nil {
+			r.Recorder.Eventf(claim, corev1.EventTypeWarning, ReasonMountNotOwned,
+				"auth mount %q was left in place: sys/auth does not show it as this claim's", mount)
+		}
 		return nil
 	}
 	if err := vc.DisableAuthMethod(ctx, mount); err != nil {
 		return fmt.Errorf("disable auth method %q: %w", mount, err)
 	}
 	return nil
-}
-
-// roleNamesForDeletion returns the union of names recorded on status and
-// declared in spec, deduplicated, so we clean up whatever we either created
-// or had in spec at deletion time.
-func roleNamesForDeletion(claim *vaultv1alpha1.VaultClaim) []string {
-	seen := make(map[string]struct{})
-	out := make([]string, 0)
-	if claim.Status.Vault != nil {
-		for _, name := range claim.Status.Vault.AppliedRoles {
-			if _, dup := seen[name]; dup {
-				continue
-			}
-			seen[name] = struct{}{}
-			out = append(out, name)
-		}
-	}
-	for i := range claim.Spec.Roles {
-		name := claim.Spec.Roles[i].Name
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
-	}
-	return out
-}
-
-func policyNamesForDeletion(claim *vaultv1alpha1.VaultClaim) []string {
-	seen := make(map[string]struct{})
-	out := make([]string, 0)
-	if claim.Status.Vault != nil {
-		for _, name := range claim.Status.Vault.AppliedPolicies {
-			if _, dup := seen[name]; dup {
-				continue
-			}
-			seen[name] = struct{}{}
-			out = append(out, name)
-		}
-	}
-	for i := range claim.Spec.Policies {
-		name := claim.Spec.Policies[i].Name
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
-	}
-	return out
 }
 
 // deleteTargetObjects best-effort cleans up the token-reviewer SA + CRB.
@@ -186,28 +172,37 @@ func (r *VaultClaimReconciler) deleteTargetObjects(ctx context.Context, claim *v
 			logger.V(1).Info("kubeconfig Secret already gone; skipping target SA cleanup", "secret", name)
 			return
 		}
-		r.warnTargetCleanup(claim, "get kubeconfig Secret %s/%s: %v", claim.Namespace, name, err)
+		r.warnTargetCleanup(ctx, claim, err, "get kubeconfig Secret %s/%s", claim.Namespace, name)
 		return
 	}
 
 	if r.TargetManager == nil {
-		r.warnTargetCleanup(claim, "TargetManager not configured; skipping target SA cleanup")
+		r.warnTargetCleanup(ctx, claim, nil, "TargetManager not configured; skipping target SA cleanup")
 		return
 	}
 	cs, err := r.TargetManager.Get(ctx, secret)
 	if err != nil {
-		r.warnTargetCleanup(claim, "build target client: %v", err)
+		r.warnTargetCleanup(ctx, claim, err, "build target client")
 		return
 	}
 	if err := target.DeleteTokenReviewerSA(ctx, cs, claim); err != nil {
-		r.warnTargetCleanup(claim, "delete target SA: %v", err)
+		r.warnTargetCleanup(ctx, claim, err, "delete target SA")
 		return
 	}
 }
 
-func (r *VaultClaimReconciler) warnTargetCleanup(claim *vaultv1alpha1.VaultClaim, format string, args ...interface{}) {
-	if r.Recorder != nil {
-		r.Recorder.Eventf(claim, corev1.EventTypeWarning, "TargetCleanupBestEffort", format, args...)
+// warnTargetCleanup reports a skipped target cleanup. The event carries the
+// table text for err; the raw error, which names the target cluster, goes to
+// the debug log.
+func (r *VaultClaimReconciler) warnTargetCleanup(ctx context.Context, claim *vaultv1alpha1.VaultClaim, err error, format string, args ...interface{}) {
+	what := fmt.Sprintf(format, args...)
+	msg := what
+	if err != nil {
+		msg = what + ": " + failureText(err)
+		log.FromContext(ctx).V(1).Info("target cleanup error", "what", what, "error", err.Error())
 	}
-	log.FromContext(context.Background()).V(1).Info("target cleanup skipped", "reason", fmt.Sprintf(format, args...))
+	if r.Recorder != nil {
+		r.Recorder.Event(claim, corev1.EventTypeWarning, "TargetCleanupBestEffort", msg)
+	}
+	log.FromContext(ctx).V(1).Info("target cleanup skipped", "reason", msg)
 }

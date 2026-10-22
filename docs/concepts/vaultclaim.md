@@ -51,8 +51,9 @@ spec:
 | `vault.configName` | Имя резолвнутого VaultConfig |
 | `vault.authMountPath` | Путь auth-mount в Vault |
 | `vault.authMountAccessor` | Accessor (кэшируется лениво при первом использовании в templating) |
-| `vault.appliedPolicies[]` | Имена политик, фактически записанных в Vault |
-| `vault.appliedRoles[]` | Имена ролей, фактически созданных в Vault |
+| `vault.authMountOwned` | Факт владения mount: 2xx на создание этой заявкой или описание этой заявки в `sys/auth` |
+| `vault.appliedPolicies[]` | Журнал политик: имя попадает до записи в Vault и уходит после удаления |
+| `vault.appliedRoles[]` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления |
 | `vault.tokenReviewerJWT.*` | Timestamps жизненного цикла reviewer JWT (без самого JWT) |
 | `vault.lastReconcileAt` | Время последнего reconcile (heartbeat, лаг до 10 мин) |
 | `vault.lastDriftCheckAt` | Время последней проверки drift (heartbeat, лаг до 10 мин) |

@@ -413,13 +413,13 @@ path "auth/token/lookup-self"         { capabilities = ["read"] }
 |------|----------|-----------------|
 | 3 | Create SA / CRB через SSA с fieldOwner `vault-operator` | Native idempotent (server-side apply) |
 | 4 | TokenRequest — выпускает новый JWT на каждом полном проходе: Step 5 заменяет `auth/{mount}/config` целиком. В `status` записывается только плановая ротация (остаток < 30% TTL) | Conditional |
-| 5 | `POST sys/auth/{path}` — если 400 (already exists), переходим к `POST auth/{path}/config` | Vault возвращает 204 на повторное config |
+| 5 | `GET sys/auth`: mount с описанием этой заявки — свой; нет mount — `POST sys/auth/{path}` (на 400 — повторный `GET sys/auth`); mount с чужим описанием или типом — `MountConflict`. Затем `POST auth/{path}/config` | Vault возвращает 204 на повторное config |
 | 6 | (опц.) `GET sys/auth/{mountPath}/tune` — только если хоть одна `spec.policies[].rules` содержит `{{ .AuthMountAccessor }}`. Затем `PUT sys/policies/acl/{name}` — overwrites. | Native idempotent; accessor-fetch lazy |
-| 7 | `POST auth/{path}/role/{role}` — overwrites; удаляем roles, которых нет в spec (soft-purge через enumeration `LIST auth/{path}/role`) | Soft-purge старых |
+| 7 | `POST auth/{path}/role/{role}` — overwrites; затем удаляются роли и политики, ушедшие из spec, по журналу (`Exclusive` на своём mount — ещё и `LIST auth/{path}/role − spec`) | Удаление по журналу |
 
 **Защитные решения в pipeline:**
 
-- Step 7 soft-purge удаляет роли, отсутствующие в spec, но только в пределах `auth/{mountPath}/role/`, никогда не трогая другие auth mounts. Чужие mounts защищены тем, что `mountPath` включает `{metadata.name}`, и оператор работает только с тем, что matches его spec.
+- Имя пишется, только если оно уже в журнале заявки или его нет в Vault; удаляются только имена из журнала, кроме зарезервированных и тех, что держит другая заявка. Mount считается своим, только если `sys/auth` показывает его с описанием этой заявки: `mountPath` в CRD ничем не ограничен, кроме неизменяемости, и сам по себе чужие mount не защищает. Подробно — [concepts/ownership.md](concepts/ownership.md).
 - TokenRequest API (k8s ≥ 1.34) — audience-scoped, short-lived JWT, выпускаемый kube-apiserver на лету. Даёт ротацию по умолчанию и избавляет от долгоживущего credential'а в etcd, который пришлось бы охранять отдельно.
 
 ---
@@ -485,10 +485,10 @@ Finalizer: `vault.in-cloud.io/finalizer`.
 ```
 Phase = Deleting
   1. (Опц.) Snapshot истории — дамп ролей/полиси для аудита
-  2. Delete roles                     — DELETE auth/{mountPath}/role/*
-  3. Delete policies                  — DELETE sys/policies/acl/*
-  4. Delete auth method               — DELETE sys/auth/{mountPath}
-  5. Delete token-reviewer SA + CRB в target (best-effort, если autoCreate=true)
+  2. Delete roles                     — DELETE auth/{mountPath}/role/<имя из журнала>
+  3. Delete policies                  — DELETE sys/policies/acl/<имя из журнала>
+  4. Delete auth method               — DELETE sys/auth/{mountPath}, только если sys/auth показывает его как mount этой заявки
+  5. Delete token-reviewer SA + CRB в target (best-effort, если autoCreate=true; у гостя шага нет)
   6. Remove finalizer
 ```
 

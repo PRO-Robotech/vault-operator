@@ -161,7 +161,7 @@ func TestClient_ListAuthMounts_DataKey(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{
 					"kubernetes-mgmt/":   map[string]any{"type": "kubernetes", "accessor": "auth_k8s_mgmt"},
-					"kubernetes-ec8a00/": map[string]any{"type": "kubernetes", "accessor": "auth_k8s_ec8a00"},
+					"kubernetes-ec8a00/": map[string]any{"type": "kubernetes", "accessor": "auth_k8s_ec8a00", "description": "vault-operator: per-cluster auth for ns/ec8a00"},
 				},
 			})
 			return true
@@ -178,6 +178,11 @@ func TestClient_ListAuthMounts_DataKey(t *testing.T) {
 	}
 	if mounts["kubernetes-ec8a00/"].Accessor != "auth_k8s_ec8a00" {
 		t.Fatalf("unexpected accessor %q", mounts["kubernetes-ec8a00/"].Accessor)
+	}
+	// Ownership of a mount is judged by its description; dropping it would make
+	// every mount look foreign.
+	if got := mounts["kubernetes-ec8a00/"].Description; got != "vault-operator: per-cluster auth for ns/ec8a00" {
+		t.Fatalf("description = %q", got)
 	}
 }
 

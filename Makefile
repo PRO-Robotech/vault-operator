@@ -99,12 +99,14 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: test-e2e-pipeline
-test-e2e-pipeline: manifests generate fmt vet envtest ## Run pipeline e2e (envtest k8s + `vault server -dev`). Skips if `vault` is not in PATH.
+test-e2e-pipeline: manifests generate fmt vet envtest vault ## Run pipeline e2e (envtest k8s + `vault server -dev` $(VAULT_VERSION)). Fails without vault; the upgrade test needs the legacy tag in git (fetch tags).
+	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
-		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1
+		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1 -timeout 15m
 
 .PHONY: test-e2e-secret-pipeline
-test-e2e-secret-pipeline: manifests generate fmt vet envtest ## Run VaultSecretClaim e2e only (envtest k8s + `vault server -dev`). Skips if `vault` is not in PATH.
+test-e2e-secret-pipeline: manifests generate fmt vet envtest vault ## Run VaultSecretClaim e2e only (envtest k8s + `vault server -dev` $(VAULT_VERSION)).
+	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -run TestSecretPipelineE2E -v -count=1
 
@@ -251,6 +253,23 @@ setup-envtest: envtest ## Download the binaries required for ENVTEST in the loca
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+
+# Vault the e2e pipeline runs against: the version production runs. The
+# checksum pins the release archive; other platforms pass VAULT_SHA256.
+VAULT_VERSION ?= 1.20.1
+VAULT_OS_ARCH ?= linux_amd64
+VAULT_SHA256 ?= e3ce3e678421c0d56f726952ab100875168c2e1eb1db751ed5a2b25b6b2ea96f
+VAULT ?= $(LOCALBIN)/vault
+
+.PHONY: vault
+vault: $(VAULT) ## Download the Vault binary for e2e into bin/ (checksum-verified).
+$(VAULT): | $(LOCALBIN)
+	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	curl -sSfL -o "$$tmp/vault.zip" "https://releases.hashicorp.com/vault/$(VAULT_VERSION)/vault_$(VAULT_VERSION)_$(VAULT_OS_ARCH).zip"; \
+	echo "$(VAULT_SHA256)  $$tmp/vault.zip" | sha256sum -c -; \
+	unzip -o -q "$$tmp/vault.zip" vault -d "$$tmp"; \
+	install -m 0755 "$$tmp/vault" "$(VAULT)"; \
+	"$(VAULT)" version
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.

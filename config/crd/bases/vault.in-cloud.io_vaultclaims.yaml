@@ -66,22 +66,42 @@ spec:
                     default: true
                     description: |-
                       AutoCreate enables the operator to POST sys/auth; when false only
-                      auth/{path}/config is written, assuming the mount already exists.
+                      auth/{path}/config is written, assuming the mount already exists and
+                      carries this claim's description.
                     type: boolean
                   issuer:
                     description: |-
                       Issuer is the OIDC issuer URL of the infra cluster; empty triggers
                       auto-discovery via /.well-known/openid-configuration.
                     type: string
+                  manageConfig:
+                    default: true
+                    description: |-
+                      ManageConfig makes the claim the owner of the mount: it writes
+                      auth/{path}/config, rotates the reviewer JWT and manages the reviewer SA.
+                      False makes the claim a guest that only adds its own roles and policies
+                      to a mount configured by someone else (an operator mount from a
+                      VaultConfig or an allow-listed one). Immutable.
+                    type: boolean
                   mountPath:
                     description: |-
                       MountPath of the per-cluster auth method (convention:
                       "kubernetes-{metadata.name}"). Immutable.
                     minLength: 1
                     type: string
+                  rolePruning:
+                    description: |-
+                      RolePruning selects which roles on the mount the claim deletes when they
+                      leave spec.roles. Empty means Exclusive for an owner claim and Owned for
+                      a guest. Exclusive applies only while the claim provably owns the mount.
+                    enum:
+                    - Exclusive
+                    - Owned
+                    type: string
                   tokenReviewer:
-                    description: TokenReviewer identifies the SA whose JWT Vault uses
-                      for TokenReview.
+                    description: |-
+                      TokenReviewer identifies the SA whose JWT Vault uses for TokenReview.
+                      Required unless manageConfig is false.
                     properties:
                       serviceAccount:
                         description: |-
@@ -115,13 +135,20 @@ spec:
                     type: object
                 required:
                 - mountPath
-                - tokenReviewer
                 type: object
+                x-kubernetes-validations:
+                - message: spec.auth.manageConfig=false requires autoCreate=false
+                    and rolePruning=Owned
+                  rule: '!has(self.manageConfig) || self.manageConfig || (has(self.autoCreate)
+                    && !self.autoCreate && has(self.rolePruning) && self.rolePruning
+                    == ''Owned'')'
+                - message: spec.auth.tokenReviewer is required unless spec.auth.manageConfig=false
+                  rule: (has(self.manageConfig) && !self.manageConfig) || has(self.tokenReviewer)
               clusterRef:
                 description: |-
-                  ClusterRef references the ClusterClaim and its kubeconfig Secret. Both
-                  fields are immutable — changing them would re-target this VaultClaim to a
-                  different cluster.
+                  ClusterRef references the ClusterClaim and its kubeconfig Secret; its
+                  name is immutable. Required unless spec.auth.manageConfig is false: a
+                  guest claim has no cluster of its own.
                 properties:
                   kubeconfigSecret:
                     description: KubeconfigSecret is the Secret name; defaults to
@@ -322,7 +349,6 @@ spec:
                 type: object
             required:
             - auth
-            - clusterRef
             - secretsPrefix
             - vaultConfigRef
             type: object
@@ -330,7 +356,13 @@ spec:
             - message: spec.secretsPrefix is immutable
               rule: self.secretsPrefix == oldSelf.secretsPrefix
             - message: spec.clusterRef.name is immutable
-              rule: self.clusterRef.name == oldSelf.clusterRef.name
+              rule: has(self.clusterRef) == has(oldSelf.clusterRef) && (!has(self.clusterRef)
+                || self.clusterRef.name == oldSelf.clusterRef.name)
+            - message: spec.clusterRef is required unless spec.auth.manageConfig=false
+              rule: (has(self.auth.manageConfig) && !self.auth.manageConfig) || has(self.clusterRef)
+            - message: spec.auth.manageConfig is immutable
+              rule: (!has(self.auth.manageConfig) || self.auth.manageConfig) == (!has(oldSelf.auth.manageConfig)
+                || oldSelf.auth.manageConfig)
             - message: spec.auth.mountPath is immutable
               rule: self.auth.mountPath == oldSelf.auth.mountPath
             - message: spec.transit.mountPath is immutable
@@ -414,10 +446,17 @@ spec:
                   state.
                 properties:
                   appliedPolicies:
+                    description: |-
+                      AppliedPolicies is the ledger of policies this claim may have written:
+                      a name enters it before the write and leaves it after the policy is
+                      deleted.
                     items:
                       type: string
                     type: array
                   appliedRoles:
+                    description: |-
+                      AppliedRoles is the ledger of roles this claim may have written: a name
+                      enters it before the write and leaves it after the role is deleted.
                     items:
                       type: string
                     type: array
@@ -426,6 +465,12 @@ spec:
                       AuthMountAccessor is cached from Vault, populated lazily on first
                       render of a policy that uses {{ .AuthMountAccessor }}.
                     type: string
+                  authMountOwned:
+                    description: |-
+                      AuthMountOwned records a fact, never an intent: the mount answered 2xx
+                      to this claim's POST sys/auth, or sys/auth reports it as a kubernetes
+                      mount carrying this claim's description.
+                    type: boolean
                   authMountPath:
                     type: string
                   configName:
@@ -468,8 +513,11 @@ spec:
                         key, read back from Vault.
                       properties:
                         createdByClaim:
-                          description: CreatedByClaim distinguishes a key this operator
-                            created from an adopted one.
+                          description: |-
+                            CreatedByClaim distinguishes a key this operator created from an adopted
+                            one. An entry with CreatedByClaim and LatestVersion 0 is an intent: it is
+                            recorded before the key is created, so a crash between the create and the
+                            status write cannot turn the claim's own key into an adopted one.
                           type: boolean
                         latestVersion:
                           type: integer

@@ -15,7 +15,6 @@ package e2e_pipeline
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,7 +41,7 @@ const (
 )
 
 // TestSecretPipelineE2E exercises the VaultSecretClaim pipeline (generate +
-// copy + Purge) against a real `vault server -dev` and envtest. Skips if the
+// copy + Purge) against a real `vault server -dev` and envtest. Fails if the
 // vault binary or envtest assets are unavailable.
 func TestSecretPipelineE2E(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -50,9 +49,6 @@ func TestSecretPipelineE2E(t *testing.T) {
 
 	vaultSrv, err := NewVaultDevServer(ctx)
 	if err != nil {
-		if errors.Is(err, ErrVaultBinaryMissing) {
-			t.Skipf("vault binary not in PATH; skipping secret pipeline e2e: %v", err)
-		}
 		t.Fatalf("start vault dev: %v", err)
 	}
 	defer func() { _ = vaultSrv.Close() }()

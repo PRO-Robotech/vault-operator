@@ -17,6 +17,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -25,6 +26,12 @@ import (
 
 // deletionDecision drives the real deleteVaultObjects and reports what it did.
 func deletionDecision(t *testing.T, policy string, autoCreate bool) *fakeVaultClient {
+	return deletionDecisionWith(t, policy, autoCreate, "vault-operator: per-cluster auth for dlputi1u/a8f60d")
+}
+
+// deletionDecisionWith seeds sys/auth with the mount carrying description:
+// deletion judges ownership by what Vault reports, not by status.
+func deletionDecisionWith(t *testing.T, policy string, autoCreate bool, description string) *fakeVaultClient {
 	t.Helper()
 
 	sch := runtime.NewScheme()
@@ -44,7 +51,7 @@ func deletionDecision(t *testing.T, policy string, autoCreate bool) *fakeVaultCl
 			DeletionPolicy: policy,
 			Auth: vaultv1alpha1.AuthSpec{
 				MountPath:  "dlputi1u-a8f60d",
-				AutoCreate: autoCreate,
+				AutoCreate: ptr.To(autoCreate),
 			},
 			Transit: &vaultv1alpha1.TransitSpec{
 				MountPath: "transit",
@@ -52,7 +59,10 @@ func deletionDecision(t *testing.T, policy string, autoCreate bool) *fakeVaultCl
 			},
 		},
 	}
-	fakeVC := &fakeVaultClient{}
+	claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{AuthMountPath: "dlputi1u-a8f60d"}
+	fakeVC := &fakeVaultClient{ListAuthMountsResp: map[string]vault.AuthMountInfo{
+		"dlputi1u-a8f60d/": {Type: "kubernetes", Description: description},
+	}}
 	r := &VaultClaimReconciler{
 		Client:       ctrlfake.NewClientBuilder().WithScheme(sch).WithObjects(cfg).Build(),
 		VaultFactory: &fakeVaultFactory{Client: fakeVC},
@@ -97,6 +107,15 @@ func TestDeletionAuthMountDecision(t *testing.T) {
 				t.Errorf("auth mount %v was disabled; %s", got.DisabledAuthPaths, tc.why)
 			}
 		})
+	}
+}
+
+// A mount sys/auth does not show as the claim's is left alone even under
+// Purge with autoCreate: status alone cannot tell creation from adoption.
+func TestDeletionLeavesAForeignMount(t *testing.T) {
+	got := deletionDecisionWith(t, vaultv1alpha1.DeletionPolicyPurge, true, "created by hand")
+	if len(got.DisabledAuthPaths) != 0 {
+		t.Errorf("foreign mount %v was disabled", got.DisabledAuthPaths)
 	}
 }
 

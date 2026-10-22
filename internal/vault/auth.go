@@ -112,9 +112,13 @@ func (c *Client) ReadKubernetesAuthConfig(ctx context.Context, mount string) (*K
 	return &raw.Data, nil
 }
 
+// AuthMountInfo is one sys/auth entry. Description is what ownership of a
+// mount is judged by: the operator writes a per-claim description when it
+// creates a mount and never changes it.
 type AuthMountInfo struct {
-	Type     string `json:"type"`
-	Accessor string `json:"accessor"`
+	Type        string `json:"type"`
+	Accessor    string `json:"accessor"`
+	Description string `json:"description"`
 }
 
 // ListAuthMounts returns the sys/auth map. Each key is the mount path with a
