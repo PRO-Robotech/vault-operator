@@ -18,15 +18,14 @@ You may obtain a copy of the License at
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"text/template"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/controller"
 	"github.com/PRO-Robotech/vault-operator/internal/policyguard"
 )
 
@@ -39,7 +38,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("policyguard-census", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	kvMount := fs.String("kv-mount", "secret", "VaultConfig.spec.storage.kvMountPath the claims share")
-	accessor := fs.String("accessor", "auth_kubernetes_00000000", "accessor substituted for {{ .AuthMountAccessor }}")
+	accessor := fs.String("accessor", "auth_kubernetes_00000000", "auth mount accessor templated policies and identity paths are rendered with")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -64,10 +63,12 @@ func run(args []string, in io.Reader, out, errOut io.Writer) int {
 		}
 		for _, p := range c.Spec.Policies {
 			policies++
-			rendered, err := render(p.Rules, *accessor)
+			// The operator's own render: the closed set of template forms,
+			// the bounds on rules and on the rendered body, identity paths.
+			rendered, err := controller.RenderClaimPolicy(p, *accessor)
 			if err != nil {
 				violations++
-				fmt.Fprintf(out, "%s/%s policy %q: does not render\n", c.Namespace, c.Name, p.Name)
+				fmt.Fprintf(out, "%s/%s policy %q: does not render: %v\n", c.Namespace, c.Name, p.Name, err)
 				continue
 			}
 			for _, v := range policyguard.Check(rendered, scope) {
@@ -84,16 +85,4 @@ func run(args []string, in io.Reader, out, errOut io.Writer) int {
 		return 1
 	}
 	return 0
-}
-
-func render(rules, accessor string) (string, error) {
-	tmpl, err := template.New("policy").Option("missingkey=error").Parse(rules)
-	if err != nil {
-		return "", err
-	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, map[string]string{"AuthMountAccessor": accessor}); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
 }

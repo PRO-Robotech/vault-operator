@@ -323,6 +323,13 @@ func renderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, err
 	return b.String(), nil
 }
 
+// RenderClaimPolicy is renderClaimPolicy for tools outside the operator, such
+// as the policy guard census: the same admitted template forms, the same
+// bounds, the same HCL the operator writes.
+func RenderClaimPolicy(p vaultv1alpha1.PolicySpec, accessor string) (string, error) {
+	return renderClaimPolicy(p, accessor)
+}
+
 // identityStanza judges ip as the schema does, then renders its placeholders.
 func identityStanza(ip vaultv1alpha1.IdentityPath, accessor string) (string, error) {
 	if len(ip.Path) > 512 || !identityPathForm.MatchString(ip.Path) {
