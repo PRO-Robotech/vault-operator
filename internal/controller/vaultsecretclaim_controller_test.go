@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
@@ -64,12 +65,21 @@ func (f *fakeSecretVaultClient) ReadKV(_ context.Context, mount, path string) (m
 	return cloneData(d), true, nil
 }
 
+// ReadKVVersioned follows Vault: a soft-deleted leaf has no data but keeps its
+// current version (0 only once the metadata is gone).
 func (f *fakeSecretVaultClient) ReadKVVersioned(_ context.Context, mount, path string) (map[string]any, int, bool, error) {
-	d, ok := f.store[mount+"|"+path]
+	k := mount + "|" + path
+	d, ok := f.store[k]
 	if !ok {
-		return nil, 0, false, nil
+		return nil, f.versions[k], false, nil
 	}
-	return cloneData(d), f.versions[mount+"|"+path], true, nil
+	return cloneData(d), f.versions[k], true, nil
+}
+
+// softDelete is `vault kv delete`: the current version loses its data, the
+// metadata and the version counter stay.
+func (f *fakeSecretVaultClient) softDelete(mount, path string) {
+	delete(f.store, mount+"|"+path)
 }
 
 func (f *fakeSecretVaultClient) WriteKV(_ context.Context, mount, path string, data map[string]any) error {
@@ -83,12 +93,10 @@ func (f *fakeSecretVaultClient) WriteKVCAS(_ context.Context, mount, path string
 	if f.beforeCASWrite != nil {
 		f.beforeCASWrite(mount, path)
 	}
+	// Vault checks cas against the current version, which a soft-deleted
+	// leaf still has.
 	k := mount + "|" + path
-	cur := 0
-	if _, ok := f.store[k]; ok {
-		cur = f.versions[k]
-	}
-	if cur != cas {
+	if cur := f.versions[k]; cur != cas {
 		return &vault.APIError{StatusCode: http.StatusBadRequest, Errors: []string{"check-and-set parameter did not match the current version"}}
 	}
 	f.store[k] = cloneData(data)
@@ -98,7 +106,7 @@ func (f *fakeSecretVaultClient) WriteKVCAS(_ context.Context, mount, path string
 }
 
 func (f *fakeSecretVaultClient) KVMetadataExists(_ context.Context, mount, path string) (bool, error) {
-	_, ok := f.store[mount+"|"+path]
+	_, ok := f.versions[mount+"|"+path]
 	return ok, nil
 }
 
@@ -417,6 +425,48 @@ var _ = Describe("VaultSecretClaim Controller", func() {
 			leaf := fakeSV.store["secret|clusters/vssharea/apps"]
 			Expect(leaf).To(HaveKey("shared"))
 			Expect(leaf).NotTo(HaveKey("k1"))
+		})
+
+		It("removes no orphan when another claim's VaultConfig cannot be read", func() {
+			makeHealthyVaultConfig(ctx, "vsc-cfg-unread-a")
+			makeHealthyVaultConfig(ctx, "vsc-cfg-unread-b")
+			makeVaultSecretClaim(ctx, "vsunreada", "vsc-cfg-unread-a", vaultv1alpha1.DeletionPolicyRetain,
+				[]vaultv1alpha1.SecretListItem{genItem("a", "apps", "k1"), genItem("b", "apps", "shared")})
+			_, err := reconcileSecretOnce(recon, "vsunreada")
+			Expect(err).NotTo(HaveOccurred())
+			// Another claim writes the same key; it has not run yet, so only its
+			// spec (with the mount of its VaultConfig) says so.
+			other := &vaultv1alpha1.VaultSecretClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "vsunreadb", Namespace: ns},
+				Spec: vaultv1alpha1.VaultSecretClaimSpec{
+					VaultConfigRef: vaultv1alpha1.VaultConfigRef{Name: "vsc-cfg-unread-b"},
+					ClusterRef:     vaultv1alpha1.SecretClusterRef{Name: "vsunreadb"},
+					SecretsPrefix:  "clusters/vsunreada",
+					DeletionPolicy: vaultv1alpha1.DeletionPolicyRetain,
+					SecretList:     []vaultv1alpha1.SecretListItem{genItem("s", "apps", "shared")},
+				},
+			}
+			Expect(k8sClient.Create(ctx, other)).To(Succeed())
+
+			got := getVSC("vsunreada")
+			got.Spec.SecretList = got.Spec.SecretList[:1]
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			ww, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+			Expect(err).NotTo(HaveOccurred())
+			failing := *recon
+			failing.Client = interceptor.NewClient(ww, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*vaultv1alpha1.VaultConfig); ok && key.Name == "vsc-cfg-unread-b" {
+						return errors.New("injected: apiserver unavailable")
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+			_, err = reconcileSecretOnce(&failing, "vsunreada")
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(fakeSV.store["secret|clusters/vsunreada/apps"]).To(HaveKey("shared"))
+			Expect(getVSC("vsunreada").Status.Orphans).NotTo(BeEmpty())
 		})
 
 		It("on a claim written by the previous release fills the journal without writing or removing", func() {

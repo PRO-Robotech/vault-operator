@@ -400,10 +400,17 @@ func (r *VaultSecretClaimReconciler) keysOfOtherClaims(ctx context.Context, clai
 		if o.UID == claim.UID {
 			continue
 		}
+		// The other claim's default mount: without it its spec keys would not
+		// match and a key it writes could be removed, so an unreadable
+		// VaultConfig fails the pass. An absent one leaves only the keys with
+		// an explicit mount, the ones such a claim can write.
 		cfg := &vaultv1alpha1.VaultConfig{}
 		defMount := ""
-		if err := r.Get(ctx, client.ObjectKey{Name: o.Spec.VaultConfigRef.Name}, cfg); err == nil {
+		switch err := r.Get(ctx, client.ObjectKey{Name: o.Spec.VaultConfigRef.Name}, cfg); {
+		case err == nil:
 			defMount = cfg.Spec.Storage.KvMountPath
+		case !apierrors.IsNotFound(err):
+			return nil, fmt.Errorf("get VaultConfig %q of %s/%s: %w", o.Spec.VaultConfigRef.Name, o.Namespace, o.Name, err)
 		}
 		for j := range o.Spec.SecretList {
 			it := &o.Spec.SecretList[j]

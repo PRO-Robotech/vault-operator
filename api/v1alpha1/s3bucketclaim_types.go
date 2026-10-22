@@ -168,6 +168,11 @@ type PendingBucketCreate struct {
 	// Since is when the create was decided; a create that cannot be located
 	// is retried only after a grace period.
 	Since metav1.Time `json:"since"`
+	// ExistingNames are the server names of this login matching RequestedName
+	// (with or without a "-N" suffix, in any status) before the create: none of
+	// them is the bucket the create made.
+	// +optional
+	ExistingNames []string `json:"existingNames,omitempty"`
 }
 
 // +kubebuilder:object:root=true

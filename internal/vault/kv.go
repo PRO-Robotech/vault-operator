@@ -12,6 +12,7 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -31,30 +32,26 @@ func kvPath(kind, mount, path string) (string, error) {
 // ReadKV reads a KV-v2 secret. A missing secret returns (nil, false, nil); the
 // returned map is the inner data.data payload (the actual key/value pairs).
 func (c *Client) ReadKV(ctx context.Context, mount, path string) (map[string]any, bool, error) {
-	p, err := kvPath("data", mount, path)
-	if err != nil {
-		return nil, false, err
-	}
-	resp, err := c.Do(ctx, &Request{Method: http.MethodGet, Path: p})
-	if err != nil {
-		if IsNotFound(err) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	var raw struct {
-		Data struct {
-			Data map[string]any `json:"data"`
-		} `json:"data"`
-	}
-	if err := resp.Decode(&raw); err != nil {
-		return nil, false, fmt.Errorf("decode %s: %w", p, err)
-	}
-	return raw.Data.Data, true, nil
+	data, _, ok, err := c.ReadKVVersioned(ctx, mount, path)
+	return data, ok, err
 }
 
-// ReadKVVersioned is ReadKV plus the current version (0 for an absent leaf),
-// for a following WriteKVCAS.
+// kvDataResponse is the body of a KV-v2 data read. Vault sends the same shape
+// with 404 for a leaf whose current version is deleted or destroyed: data is
+// null, metadata.version is still the current version.
+type kvDataResponse struct {
+	Data struct {
+		Data     map[string]any `json:"data"`
+		Metadata struct {
+			Version int `json:"version"`
+		} `json:"metadata"`
+	} `json:"data"`
+}
+
+// ReadKVVersioned is ReadKV plus the current version, for a following
+// WriteKVCAS. A leaf without data has ok=false and version 0 only when it has
+// no metadata either: after `vault kv delete` or `kv destroy` the current
+// version stays, and a check-and-set write must name it.
 func (c *Client) ReadKVVersioned(ctx context.Context, mount, path string) (map[string]any, int, bool, error) {
 	p, err := kvPath("data", mount, path)
 	if err != nil {
@@ -62,19 +59,18 @@ func (c *Client) ReadKVVersioned(ctx context.Context, mount, path string) (map[s
 	}
 	resp, err := c.Do(ctx, &Request{Method: http.MethodGet, Path: p})
 	if err != nil {
-		if IsNotFound(err) {
-			return nil, 0, false, nil
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+			return nil, 0, false, err
 		}
-		return nil, 0, false, err
+		// A body that is not this shape (`{"errors":[]}` of a leaf without
+		// metadata, or none) reads as version 0: a wrong 0 costs one CAS
+		// rejection, never an overwrite.
+		var raw kvDataResponse
+		_ = json.Unmarshal(apiErr.Body, &raw)
+		return nil, raw.Data.Metadata.Version, false, nil
 	}
-	var raw struct {
-		Data struct {
-			Data     map[string]any `json:"data"`
-			Metadata struct {
-				Version int `json:"version"`
-			} `json:"metadata"`
-		} `json:"data"`
-	}
+	var raw kvDataResponse
 	if err := resp.Decode(&raw); err != nil {
 		return nil, 0, false, fmt.Errorf("decode %s: %w", p, err)
 	}

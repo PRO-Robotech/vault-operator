@@ -13,6 +13,7 @@ package cloudmanager
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,29 @@ func TestClient_FindByRequestedMatchesTheServerNameShape(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Name != "4682dfe35dd7-k8s-c1-x" || got[1].Name != "4682dfe35dd7-k8s-c1-x-1" {
 		t.Fatalf("suffix candidates = %v", names(got))
+	}
+}
+
+// NamesByRequested is the pre-create snapshot: the same name shape as
+// FindByRequested with the suffix, but REMOVED and REMOVING rows count (the
+// server suffixes over them too).
+func TestClient_NamesByRequestedKeepsEveryStatus(t *testing.T) {
+	srv := cmfake.New()
+	seedBucket(srv, "4682dfe35dd7-k8s-c1-x", "c1", pb.Status_REMOVED)
+	seedBucket(srv, "4682dfe35dd7-k8s-c1-x-1", "c1", pb.Status_RUNNING)
+	seedBucket(srv, "4682dfe35dd7-k8s-c1-x-2", "c1", pb.Status_REMOVING)
+	seedBucket(srv, "4682dfe35dd7-k8s-c1-x-old", "c1", pb.Status_RUNNING) // different requested name
+	seedBucket(srv, "aaaa-k8s-c1-x-3", "other", pb.Status_RUNNING)        // another login
+	srv.ScopesOR = true
+	c := newTestClient(t, srv, Options{FindByBucket: true})
+
+	got, err := c.NamesByRequested(context.Background(), "c1", "k8s-c1-x")
+	if err != nil {
+		t.Fatalf("NamesByRequested: %v", err)
+	}
+	want := []string{"4682dfe35dd7-k8s-c1-x", "4682dfe35dd7-k8s-c1-x-1", "4682dfe35dd7-k8s-c1-x-2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("names = %v, want %v", got, want)
 	}
 }
 

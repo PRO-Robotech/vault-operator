@@ -241,6 +241,21 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(srv.Creates).To(Equal(0))
 		})
 
+		It("refuses an explicitly named bucket managed by someone other than the claim says", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-namedmb")
+			srv.Seed(&pb.Bucket{Name: "ffff00-customer-data", CustLogin: cust, Status: pb.Status_RUNNING, ManagedBy: pb.S3BucketManagedBy_CUSTOMER, AccessKey: "AK-x", SecretKey: "SK-x"})
+			c := newS3BucketClaim("s3namedmb", "s3-cfg-namedmb")
+			c.Spec.Bucket.Name = "ffff00-customer-data"
+			Expect(k8sClient.Create(ctx, c)).To(Succeed())
+			reconcileN("s3namedmb", 2)
+
+			got := getS3("s3namedmb")
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+			Expect(reasonOf(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("ManagedByMismatch"))
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(s3Leaf(fakeSV, "s3namedmb", s3TestDest)).To(BeNil())
+		})
+
 		It("refuses an explicitly named bucket of another login, and retries later", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-namedforeign")
 			srv.Seed(&pb.Bucket{Name: "ffff00-foreign-bucket", CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
@@ -329,6 +344,100 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		})
 	})
 
+	Context("recovering a create whose answer was lost", func() {
+		// purgeAndLook deletes the claim, runs the deletion passes and returns
+		// the neighbour bucket's status afterwards.
+		purgeAndLook := func(name, neighbour string) pb.Status {
+			deleteClaim(name)
+			reconcileN(name, 3)
+			return srv.Get(neighbour).GetStatus()
+		}
+
+		It("records the bucket its create made as Created and leaves an unclaimed neighbour \"<name>-N\" alone", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-lost")
+			// The cluster "s3lost-1" left its bucket behind (claim deleted with
+			// Retain, or managed from elsewhere): no claim names it here.
+			neighbour := serverName("s3lost-1")
+			srv.Seed(&pb.Bucket{Name: neighbour, CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-nbr", SecretKey: "SK-nbr"})
+			srv.LoseCreateResponses = 1
+			makeS3BucketClaim(ctx, "s3lost", "s3-cfg-lost")
+
+			reconcileN("s3lost", 1) // create takes effect, its answer is lost
+			Expect(getS3("s3lost").Status.PendingCreate).NotTo(BeNil())
+			reconcileN("s3lost", 1)
+
+			got := getS3("s3lost")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3lost")))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(s3Leaf(fakeSV, "s3lost", s3TestDest)["secretKey"]).NotTo(Equal("SK-nbr"))
+
+			Expect(purgeAndLook("s3lost", neighbour)).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Get(serverName("s3lost")).GetStatus()).To(Equal(pb.Status_REMOVED))
+		})
+
+		It("does not record an unclaimed neighbour \"<name>-N\" bucket when no own bucket appeared", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-sdr")
+			neighbour := serverName("s3sdr-1")
+			srv.Seed(&pb.Bucket{Name: neighbour, CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-nbr", SecretKey: "SK-nbr"})
+			makeS3BucketClaim(ctx, "s3sdr", "s3-cfg-sdr")
+			got := getS3("s3sdr")
+			got.Finalizers = []string{vaultv1alpha1.S3BucketClaimFinalizer}
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			// A create was in flight and nothing came of it: only the marker is recorded.
+			got = getS3("s3sdr")
+			got.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{RequestedName: bucketBaseName(cust, "s3sdr"), Since: metav1.NewTime(time.Now())}
+			Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+			reconcileN("s3sdr", 2)
+
+			got = getS3("s3sdr")
+			Expect(got.Status.BucketName).NotTo(Equal(neighbour))
+			Expect(got.Status.BucketOwnership).NotTo(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(s3Leaf(fakeSV, "s3sdr", s3TestDest)["secretKey"]).NotTo(Equal("SK-nbr"))
+			Expect(purgeAndLook("s3sdr", neighbour)).To(Equal(pb.Status_RUNNING))
+		})
+
+		It("records a suffixed bucket it cannot prove as its own as Adopted, so Purge does not remove it", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-sfx")
+			// A previous bucket of this cluster is REMOVED and an unclaimed
+			// neighbour "s3sfx-1" is live: the server gives the create "-2".
+			srv.Seed(&pb.Bucket{Name: serverName("s3sfx"), CustLogin: cust, Status: pb.Status_REMOVED})
+			neighbour := serverName("s3sfx-1")
+			srv.Seed(&pb.Bucket{Name: neighbour, CustLogin: cust, Status: pb.Status_RUNNING, AccessKey: "AK-nbr", SecretKey: "SK-nbr"})
+			srv.LoseCreateResponses = 1
+			makeS3BucketClaim(ctx, "s3sfx", "s3-cfg-sfx")
+			reconcileN("s3sfx", 2)
+
+			got := getS3("s3sfx")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3sfx") + "-2"))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipAdopted))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+
+			Expect(purgeAndLook("s3sfx", serverName("s3sfx")+"-2")).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Get(neighbour).GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(reasonOf(getS3("s3sfx").Status.Conditions, vaultv1alpha1.ConditionReady)).To(Equal("DeletionBlocked"))
+		})
+
+		It("does not take a bucket with the requested name that its create did not make (another managedBy)", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-mbmark")
+			srv.Seed(&pb.Bucket{Name: serverName("s3mbmark"), CustLogin: cust, Status: pb.Status_RUNNING, ManagedBy: pb.S3BucketManagedBy_CUSTOMER, AccessKey: "AK-c", SecretKey: "SK-c"})
+			makeS3BucketClaim(ctx, "s3mbmark", "s3-cfg-mbmark")
+			got := getS3("s3mbmark")
+			got.Finalizers = []string{vaultv1alpha1.S3BucketClaimFinalizer}
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			got = getS3("s3mbmark")
+			got.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{RequestedName: bucketBaseName(cust, "s3mbmark"), Since: metav1.NewTime(time.Now())}
+			Expect(k8sClient.Status().Update(ctx, got)).To(Succeed())
+			reconcileN("s3mbmark", 1)
+
+			got = getS3("s3mbmark")
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(reasonOf(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("Locating"))
+		})
+	})
+
 	Context("state errors", func() {
 		It("leaves Failed on its own: STOPPED backs off, RUNNING brings it back to Ready", func() {
 			got := readyClaim("s3-cfg-stopped", "s3stopped")
@@ -352,6 +461,22 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			delete(fakeSV.store["secret|clusters/s3repair/s3"], "secretKey")
 			reconcileN("s3repair", 1)
 			Expect(s3Leaf(fakeSV, "s3repair", s3TestDest)["secretKey"]).To(HavePrefix("SK-"))
+		})
+
+		It("restores its keys after the leaf is soft-deleted (vault kv delete)", func() {
+			readyClaim("s3-cfg-softdel", "s3softdel")
+			fakeSV.softDelete("secret", "clusters/s3softdel/s3")
+			reconcileN("s3softdel", 1)
+			Expect(s3Leaf(fakeSV, "s3softdel", s3TestDest)["secretKey"]).To(HavePrefix("SK-"))
+			Expect(getS3("s3softdel").Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		})
+
+		It("restores its keys after the leaf's metadata is deleted (a write with cas=0)", func() {
+			readyClaim("s3-cfg-metadel", "s3metadel")
+			Expect(fakeSV.DeleteKVMetadata(ctx, "secret", "clusters/s3metadel/s3")).To(Succeed())
+			reconcileN("s3metadel", 1)
+			Expect(s3Leaf(fakeSV, "s3metadel", s3TestDest)["secretKey"]).To(HavePrefix("SK-"))
+			Expect(getS3("s3metadel").Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		})
 
 		It("keeps a sibling key that another writer adds between read and write", func() {

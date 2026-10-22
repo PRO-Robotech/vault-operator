@@ -37,23 +37,15 @@ func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVault
 	if region == "" {
 		region = "ru1"
 	}
-	desired := map[string]any{
-		"accessKey":        bucket.AccessKey,
-		"secretKey":        bucket.SecretKey,
-		"bucketName":       bucket.Name,
-		"endpoint":         endpoint,
-		"region":           region,
-		"s3ForcePathStyle": "true",
-	}
-	if bucket.Cname != "" {
-		desired["cname"] = bucket.Cname
-	}
+	desired := s3LeafKeys(bucket, endpoint, region)
 
 	mount := cfg.Spec.Storage.KvMountPath
 	dest := effectiveS3DestinationPath(claim)
 	path := joinPath(claim.Spec.Vault.SecretsPrefix, dest)
 
-	existing, version, exists, err := vc.ReadKVVersioned(ctx, mount, path)
+	// version is the leaf's current version also when it holds no data (soft
+	// deleted): the check-and-set write must name it.
+	existing, version, _, err := vc.ReadKVVersioned(ctx, mount, path)
 	if err != nil {
 		logger.V(1).Info("vault read failed", "err", err.Error())
 		return r.keysPending(claim, "ReadFailed", "reading the Vault path failed; retrying", bucketRequeueTransient), false
@@ -63,11 +55,7 @@ func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVault
 		for k, v := range desired {
 			merged[k] = v
 		}
-		cas := 0
-		if exists {
-			cas = version
-		}
-		if err := vc.WriteKVCAS(ctx, mount, path, merged, cas); err != nil {
+		if err := vc.WriteKVCAS(ctx, mount, path, merged, version); err != nil {
 			if vault.IsCASMismatch(err) {
 				return r.keysPending(claim, "WriteConflict", "the Vault path changed concurrently; re-reading", bucketRequeueRace), false
 			}
@@ -105,7 +93,7 @@ func removeOwnS3Keys(ctx context.Context, vc SecretVaultClient, mount, path, buc
 	if err != nil || !exists {
 		return err
 	}
-	if data["bucketName"] != bucketName {
+	if data[s3KeyBucketName] != bucketName {
 		return nil
 	}
 	for _, k := range s3OwnKeys {
@@ -115,6 +103,37 @@ func removeOwnS3Keys(ctx context.Context, vc SecretVaultClient, mount, path, buc
 		return vc.DeleteKVMetadata(ctx, mount, path)
 	}
 	return vc.WriteKVCAS(ctx, mount, path, data, version)
+}
+
+// s3OwnKeys are the keys this claim writes into its KV leaf (s3LeafKeys);
+// everything else in the leaf belongs to someone else and is never touched.
+var s3OwnKeys = []string{s3KeyAccessKey, s3KeySecretKey, s3KeyBucketName, s3KeyEndpoint, s3KeyRegion, s3KeyForcePathStyle, s3KeyCname}
+
+const (
+	s3KeyAccessKey      = "accessKey"
+	s3KeySecretKey      = "secretKey"
+	s3KeyBucketName     = "bucketName"
+	s3KeyEndpoint       = "endpoint"
+	s3KeyRegion         = "region"
+	s3KeyForcePathStyle = "s3ForcePathStyle"
+	s3KeyCname          = "cname"
+)
+
+// s3LeafKeys is what the leaf holds for this bucket; every key is one of
+// s3OwnKeys, so Purge and a destinationPath change remove all of them.
+func s3LeafKeys(bucket *cloudmanager.Bucket, endpoint, region string) map[string]any {
+	keys := map[string]any{
+		s3KeyAccessKey:      bucket.AccessKey,
+		s3KeySecretKey:      bucket.SecretKey,
+		s3KeyBucketName:     bucket.Name,
+		s3KeyEndpoint:       endpoint,
+		s3KeyRegion:         region,
+		s3KeyForcePathStyle: "true",
+	}
+	if bucket.Cname != "" {
+		keys[s3KeyCname] = bucket.Cname
+	}
+	return keys
 }
 
 // containsAll reports whether data already holds every desired key and value.

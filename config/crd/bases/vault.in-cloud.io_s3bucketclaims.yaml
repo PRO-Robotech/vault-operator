@@ -256,6 +256,14 @@ spec:
                   once status.bucketName is recorded. A bucket found by name while it is set
                   is the one this claim created; without it, a found bucket is Adopted.
                 properties:
+                  existingNames:
+                    description: |-
+                      ExistingNames are the server names of this login matching RequestedName
+                      (with or without a "-N" suffix, in any status) before the create: none of
+                      them is the bucket the create made.
+                    items:
+                      type: string
+                    type: array
                   requestedName:
                     description: RequestedName is the name sent to cloud-manager (before
                       its prefix).

@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -237,6 +238,28 @@ func TestS3BucketPipelineE2E(t *testing.T) {
 	}
 	if v := mustKVVersion(ctx, t, vaultSrv, leafPath); v != v0 {
 		t.Fatalf("steady state wrote: version %d -> %d", v0, v)
+	}
+
+	// `vault kv delete` (soft): the leaf answers 404 but keeps its current
+	// version; the next pass writes with that version and restores the keys.
+	if err := vaultRequest(ctx, vaultSrv, http.MethodDelete, "/v1/"+sharedKVMount+"/data/"+leafPath, nil); err != nil {
+		t.Fatalf("kv delete: %v", err)
+	}
+	reconcileOnce()
+	if restored, err := ReadKVRoot(ctx, vaultSrv, sharedKVMount, leafPath); err != nil || restored["secretKey"] != "SK-"+bucketName {
+		t.Fatalf("after kv delete: leaf=%v err=%v phase=%q", restored, err, get().Status.Phase)
+	}
+	if got := get(); got.Status.Phase != vaultv1alpha1.PhaseReady {
+		t.Fatalf("after kv delete: phase %q", got.Status.Phase)
+	}
+	// Twin: `vault kv metadata delete` removes the version too; the write with
+	// cas=0 restores the keys.
+	if err := vaultRequest(ctx, vaultSrv, http.MethodDelete, "/v1/"+sharedKVMount+"/metadata/"+leafPath, nil); err != nil {
+		t.Fatalf("kv metadata delete: %v", err)
+	}
+	reconcileOnce()
+	if restored, err := ReadKVRoot(ctx, vaultSrv, sharedKVMount, leafPath); err != nil || restored["secretKey"] != "SK-"+bucketName {
+		t.Fatalf("after kv metadata delete: leaf=%v err=%v phase=%q", restored, err, get().Status.Phase)
 	}
 
 	// A key removed outside the operator is restored by the next pass; a

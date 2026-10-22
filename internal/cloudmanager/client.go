@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -110,6 +111,10 @@ type BucketAPI interface {
 	// custLogin whose server name is "<hex>-<requestedName>", plus
 	// "<hex>-<requestedName>-<N>" when allowSuffix, sorted by name length.
 	FindByRequested(ctx context.Context, custLogin, requestedName string, allowSuffix bool) ([]*Bucket, error)
+	// NamesByRequested returns the server names of exactly custLogin matching
+	// "<hex>-<requestedName>" or "<hex>-<requestedName>-<N>" in any status
+	// (REMOVED included): the names a create of requestedName cannot get.
+	NamesByRequested(ctx context.Context, custLogin, requestedName string) ([]string, error)
 	// Remove asks to remove the bucket. nil means accepted (REMOVING);
 	// ErrAlreadyRemoved and ErrBucketNotFound are the two terminal answers.
 	Remove(ctx context.Context, bucketName string) error
@@ -273,6 +278,22 @@ func (c *Client) FindByRequested(ctx context.Context, custLogin, requestedName s
 	return out, nil
 }
 
+func (c *Client) NamesByRequested(ctx context.Context, custLogin, requestedName string) ([]string, error) {
+	resp, err := c.findAll(ctx, []*pb.FindAllRequest_SearchScope{byCustomerScope(custLogin)})
+	if err != nil {
+		return nil, err
+	}
+	re := requestedNameRe(requestedName, true)
+	var out []string
+	for _, b := range resp.GetBucket() {
+		if b.GetCustLogin() == custLogin && re.MatchString(b.GetName()) {
+			out = append(out, b.GetName())
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // requestedNameRe matches the server-assigned names for a requested name: the
 // server prepends "<hex>-" and, on a taken name, appends "-<N>".
 func requestedNameRe(requestedName string, allowSuffix bool) *regexp.Regexp {
@@ -283,19 +304,14 @@ func requestedNameRe(requestedName string, allowSuffix bool) *regexp.Regexp {
 	return regexp.MustCompile(expr + `$`)
 }
 
+// sortByNameLength orders the shortest (unsuffixed) name first, then by name.
 func sortByNameLength(bs []*Bucket) {
-	for i := 1; i < len(bs); i++ {
-		for j := i; j > 0 && less(bs[j], bs[j-1]); j-- {
-			bs[j], bs[j-1] = bs[j-1], bs[j]
+	slices.SortFunc(bs, func(a, b *Bucket) int {
+		if d := len(a.Name) - len(b.Name); d != 0 {
+			return d
 		}
-	}
-}
-
-func less(a, b *Bucket) bool {
-	if len(a.Name) != len(b.Name) {
-		return len(a.Name) < len(b.Name)
-	}
-	return a.Name < b.Name
+		return strings.Compare(a.Name, b.Name)
+	})
 }
 
 func byCustomerScope(custLogin string) *pb.FindAllRequest_SearchScope {
@@ -356,7 +372,7 @@ func classifyRemove(msg string) error {
 }
 
 func managedByEnum(s string) pb.S3BucketManagedBy {
-	if s == "CUSTOMER" {
+	if s == ManagedByCustomer {
 		return pb.S3BucketManagedBy_CUSTOMER
 	}
 	return pb.S3BucketManagedBy_SYSTEM

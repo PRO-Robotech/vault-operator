@@ -193,3 +193,49 @@ func TestClient_WriteKVCAS_SendsCASAndClassifiesAMismatch(t *testing.T) {
 		t.Fatalf("plain 400 classified as CAS mismatch")
 	}
 }
+
+// A leaf removed with `vault kv delete` (or whose current version was
+// destroyed) answers 404 but still has a current version: the body Vault 1.20
+// returns carries it in data.metadata.version, and a check-and-set write must
+// name that version, not 0.
+func TestClient_ReadKVVersioned_SoftDeletedLeafKeepsItsVersion(t *testing.T) {
+	fv := newFakeVault(t)
+	fv.override = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet {
+			return false
+		}
+		switch r.URL.Path {
+		case "/v1/secret/data/clusters/soft/s3":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"request_id":"r","data":{"data":null,"metadata":{"created_time":"2026-10-22T02:17:55Z","custom_metadata":null,"deletion_time":"2026-10-22T02:17:56Z","destroyed":false,"version":4}}}`))
+			return true
+		case "/v1/secret/data/clusters/destroyed/s3":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"data":{"data":null,"metadata":{"deletion_time":"","destroyed":true,"version":2}}}`))
+			return true
+		case "/v1/secret/data/clusters/gone/s3":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[]}`))
+			return true
+		}
+		return false
+	}
+	c := newTestClient(t, fv)
+	for _, tc := range []struct {
+		path    string
+		version int
+	}{
+		{"clusters/soft/s3", 4},
+		{"clusters/destroyed/s3", 2},
+		// Twin: a leaf without metadata (never written or metadata deleted) is version 0.
+		{"clusters/gone/s3", 0},
+	} {
+		data, version, ok, err := c.ReadKVVersioned(context.Background(), "secret", tc.path)
+		if err != nil || ok || data != nil || version != tc.version {
+			t.Fatalf("%s: data=%v version=%d ok=%v err=%v, want no data, version %d, ok=false", tc.path, data, version, ok, err, tc.version)
+		}
+	}
+}

@@ -33,7 +33,9 @@ import (
 	"sync"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/PRO-Robotech/vault-operator/internal/cloudmanager/proto"
@@ -66,6 +68,9 @@ type Server struct {
 	CreateErrs []error
 	// CreateError, when set, answers create with this s3 error.
 	CreateError *pb.CreateError
+	// LoseCreateResponses makes that many creates take effect and then answer
+	// UNAVAILABLE, as a response lost on the way back.
+	LoseCreateResponses int
 	// RemoveMessage, when set, answers removeBucket with this text.
 	RemoveMessage string
 
@@ -195,6 +200,10 @@ func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateR
 		ManagedBy: params.GetManagedBy(),
 		Public:    params.GetPublic(),
 	})
+	if s.LoseCreateResponses > 0 {
+		s.LoseCreateResponses--
+		return nil, status.Error(codes.Unavailable, "cmfake: create response lost")
+	}
 	return &pb.CreateResponse{Result: &pb.CreateResponse_ServiceInfo{
 		ServiceInfo: &pb.Service{Id: fmt.Sprintf("svc-%d", len(s.buckets)), Slug: name},
 	}}, nil

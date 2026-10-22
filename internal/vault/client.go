@@ -461,6 +461,7 @@ func (c *Client) doRaw(ctx context.Context, method, path string, body []byte, to
 		Method:     method,
 		Path:       path,
 		StatusCode: httpResp.StatusCode,
+		Body:       respBody,
 	}
 	// Vault encodes errors as {"errors": ["msg1", ...]}.
 	var errPayload struct {

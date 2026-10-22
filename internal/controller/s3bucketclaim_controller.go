@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -58,10 +59,6 @@ const (
 )
 
 const defaultS3DestinationPath = "backup/s3"
-
-// s3OwnKeys are the keys this claim writes into its KV leaf; everything else in
-// the leaf belongs to someone else and is never touched.
-var s3OwnKeys = []string{"accessKey", "secretKey", "bucketName", "endpoint", "region", "s3ForcePathStyle", "cname"}
 
 // S3BucketClaimReconciler provisions a per-cluster S3 bucket and writes its
 // credentials into Vault.
@@ -217,9 +214,10 @@ func (r *S3BucketClaimReconciler) resolveAndLogin(ctx context.Context, claim *va
 
 // ensureBucket fixes status.bucketName: an explicitly named bucket is adopted;
 // otherwise a live bucket of this login with the derived name is looked up
-// first (found with status.pendingCreate set: this claim created it; without:
-// Adopted), and only then a create is issued, with pendingCreate persisted
-// before the call and the name persisted right after it.
+// first (without status.pendingCreate: Adopted; with it, only a bucket the
+// lost create may have made counts, see pendingCreateCandidates), and only
+// then a create is issued, with pendingCreate persisted before the call and
+// the name persisted right after it.
 func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, others []vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
 	if claim.Status.BucketName != "" {
 		return ctrl.Result{}, true
@@ -240,18 +238,27 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 	}
 	cands = withoutClaimedBuckets(cands, others, claim)
+	if pending != nil {
+		cands = pendingCreateCandidates(cands, pending, requestedName, effectiveManagedBy(claim))
+	}
 	switch {
 	case len(cands) == 1:
 		b := cands[0]
-		ownership, reason := vaultv1alpha1.BucketOwnershipAdopted, "Adopted"
-		if pending != nil {
+		ownership, reason, msg := vaultv1alpha1.BucketOwnershipAdopted, "Adopted", fmt.Sprintf("bucket %q found", b.Name)
+		switch {
+		case pending != nil && !isSuffixedName(b.Name, requestedName):
 			ownership, reason = vaultv1alpha1.BucketOwnershipCreated, "Created"
+		case pending != nil:
+			// The server suffixed the name: the bucket may as well be a
+			// neighbour cluster "<cluster>-N" created meanwhile. Purge then
+			// needs spec.bucket.purgeAdopted.
+			msg = fmt.Sprintf("bucket %q found after a create; a suffixed name is not provably this claim's, recorded as adopted", b.Name)
 		}
 		claim.Status.BucketName = b.Name
 		claim.Status.BucketOwnership = ownership
 		claim.Status.PendingCreate = nil
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionTrue, claim.Generation,
-			reason, fmt.Sprintf("bucket %q found", b.Name))
+			reason, msg)
 		return ctrl.Result{}, true
 	case len(cands) > 1:
 		return r.specFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "AmbiguousBucket",
@@ -265,6 +272,38 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 		return ctrl.Result{RequeueAfter: bucketRequeueCreating}, false
 	}
 	return r.createBucket(ctx, claim, base, requestedName)
+}
+
+// pendingCreateCandidates keeps the candidates the create recorded in pending
+// may have made: absent before it, carrying the managedBy it sent, and, for a
+// "<requested>-N" name, only when "<requested>" itself was taken before the
+// create (the server suffixes a taken name only). A bucket that existed before
+// the create, a neighbour cluster "<cluster>-N" among them, is never taken.
+func pendingCreateCandidates(cands []*cloudmanager.Bucket, pending *vaultv1alpha1.PendingBucketCreate, requestedName, managedBy string) []*cloudmanager.Bucket {
+	existed := make(map[string]bool, len(pending.ExistingNames))
+	baseTaken := false
+	for _, n := range pending.ExistingNames {
+		existed[n] = true
+		if !isSuffixedName(n, requestedName) {
+			baseTaken = true
+		}
+	}
+	out := cands[:0:0]
+	for _, c := range cands {
+		switch {
+		case existed[c.Name], c.ManagedBy != managedBy:
+		case isSuffixedName(c.Name, requestedName) && !baseTaken:
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// isSuffixedName reports whether a server name "<hex>-<requested>[-N]" (as
+// FindByRequested matches it) carries the "-N" the server adds to a taken name.
+func isSuffixedName(name, requestedName string) bool {
+	return !strings.HasSuffix(name, "-"+strings.ToLower(requestedName))
 }
 
 func (r *S3BucketClaimReconciler) adoptNamed(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, name string) (ctrl.Result, bool) {
@@ -285,6 +324,9 @@ func (r *S3BucketClaimReconciler) adoptNamed(ctx context.Context, claim *vaultv1
 	case b.CustLogin != claim.Spec.CustomerLogin:
 		return r.specFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ForeignBucket",
 			fmt.Sprintf("bucket %q does not report this login as its owner", name)), false
+	case b.ManagedBy != effectiveManagedBy(claim):
+		return r.specFail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ManagedByMismatch",
+			fmt.Sprintf("bucket %q is managed by %s, the claim says %s", name, b.ManagedBy, effectiveManagedBy(claim))), false
 	}
 	claim.Status.BucketName = b.Name
 	claim.Status.BucketOwnership = vaultv1alpha1.BucketOwnershipAdopted
@@ -295,7 +337,17 @@ func (r *S3BucketClaimReconciler) adoptNamed(ctx context.Context, claim *vaultv1
 
 func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, requestedName string) (ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
-	claim.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{RequestedName: requestedName, Since: metav1.NewTime(r.now())}
+	// The names taken before the create: a later pass that has to locate the
+	// bucket this create made never takes one of them.
+	existing, err := r.Buckets.NamesByRequested(ctx, claim.Spec.CustomerLogin, requestedName)
+	if err != nil {
+		logger.V(1).Info("cloud-manager findAll failed; not creating", "err", err.Error())
+		claim.Status.Phase = vaultv1alpha1.PhasePending
+		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned, metav1.ConditionFalse, claim.Generation,
+			"FindFailed", "cloud-manager lookup failed; retrying")
+		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
+	}
+	claim.Status.PendingCreate = &vaultv1alpha1.PendingBucketCreate{RequestedName: requestedName, Since: metav1.NewTime(r.now()), ExistingNames: existing}
 	if err := r.persist(ctx, claim, base); err != nil {
 		logger.V(1).Info("persist pendingCreate failed; not creating", "err", err.Error())
 		claim.Status.Phase = vaultv1alpha1.PhasePending
@@ -394,7 +446,7 @@ func (r *S3BucketClaimReconciler) fetchCreds(ctx context.Context, claim *vaultv1
 		// Existing claims are not failed on an unreported owner (purge and
 		// adoption are strict); it is counted so it can be made strict later.
 		bucketOwnerUnverifiedCounter.Inc()
-		log.FromContext(ctx).Info("cloud-manager did not report the bucket owner", "bucket", bucket.Name)
+		log.FromContext(ctx).V(1).Info("cloud-manager did not report the bucket owner", "bucket", bucket.Name)
 	}
 
 	claim.Status.BucketStatus = bucket.Status
