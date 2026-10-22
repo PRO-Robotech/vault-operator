@@ -53,12 +53,12 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `phase` | `enum` | `Pending`, `Configuring`, `Ready`, `Failed`, `Deleting`. |
 | `conditions[]` | `[]Condition` | См. ниже. |
 | `vault.configName` | `string` | Имя резолвнутого VaultConfig. |
-| `vault.authMountPath` | `string` | Зеркало `spec.auth.mountPath`. |
+| `vault.authMountPath` | `string` | `spec.auth.mountPath`, когда заявка приняла этот mount; до принятия и при отказе пусто. |
 | `vault.secretsPrefix` | `string` | Зеркало `spec.secretsPrefix`. |
 | `vault.authMountAccessor` | `string` | Кэш accessor для identity templating. |
 | `vault.appliedPolicies[]` | `[]string` | Журнал политик: имя попадает до записи в Vault и уходит после удаления. |
 | `vault.appliedRoles[]` | `[]string` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления. |
-| `vault.authMountOwned` | `bool` | Факт владения mount: 2xx на создание этой заявкой или её описание в `sys/auth`. |
+| `vault.authMountOwned` | `bool` | Факт владения mount: 2xx на создание этой заявкой, её описание в `sys/auth` или запись `vault.authMountPath` прежнего прохода. |
 | `vault.tokenReviewerJWT.issuedAt` | `time` | Когда выпущен текущий reviewer JWT. |
 | `vault.tokenReviewerJWT.expiresAt` | `time` | Когда истекает. |
 | `vault.tokenReviewerJWT.lastRotated` | `time` | Время последней ротации (`= issuedAt` при ротации). |

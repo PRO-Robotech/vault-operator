@@ -37,7 +37,15 @@ const (
 	// RequeueClaimRefused re-checks a refused claim: the conflicting claim may
 	// be gone, the reserved list may have changed.
 	RequeueClaimRefused = 5 * time.Minute
+	// RequeueClaimSpecChanged restarts a pass the claim's edit cut short. The
+	// edit enqueues the claim by itself; this is the fallback.
+	RequeueClaimSpecChanged = 1 * time.Second
 )
+
+// errSpecChanged stops a pass whose claim was edited while the pass persisted
+// an intent. The pass admitted the previous spec; it neither writes the new
+// one, which CheckOwnership has not judged, nor reports it as observed.
+var errSpecChanged = errors.New("spec changed during the pass")
 
 type StepResult int
 
@@ -63,6 +71,9 @@ type pipelineState struct {
 
 	// View is what CheckOwnership learned about operator mounts and other claims.
 	View *ownershipView
+	// RecordedMount is status.vault.authMountPath as persisted when the pass
+	// began: the mount an earlier pass, or an earlier release, accepted.
+	RecordedMount string
 	// MountOwned is proven in this pass: 2xx from this claim's POST sys/auth,
 	// or sys/auth showing this claim's description. Never read from status.
 	MountOwned bool
@@ -120,23 +131,35 @@ func (r *VaultClaimReconciler) pipelineSteps(claim *vaultv1alpha1.VaultClaim) []
 // executePipeline runs the VaultClaim pipeline. When the claim was already
 // Ready and spec is unchanged, a drift check after CheckOwnership may
 // short-circuit the remaining steps. base is the status as last persisted; the
-// pipeline advances it each time it writes an intent.
+// pipeline advances it each time it writes an intent. Every step works on the
+// spec claim held when the pass began: an intent never refreshes it.
 func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vaultv1alpha1.VaultClaim, base *vaultv1alpha1.VaultClaimStatus) ctrl.Result {
 	logger := log.FromContext(ctx)
 	state := &pipelineState{persist: func(ctx context.Context, c *vaultv1alpha1.VaultClaim) error {
 		return r.persistIntent(ctx, c, base)
 	}}
+	if claim.Status.Vault != nil {
+		state.RecordedMount = claim.Status.Vault.AuthMountPath
+	}
 	key := client.ObjectKeyFromObject(claim)
 
 	// specChanged disables short-circuit: new policies/roles in spec would
 	// be missed by drift detection.
-	wasReady := claim.Status.Phase == vaultv1alpha1.PhaseReady
+	startPhase := claim.Status.Phase
+	wasReady := startPhase == vaultv1alpha1.PhaseReady
 	specChanged := claim.Generation != claim.Status.ObservedGeneration
 
 	setPhase(claim, vaultv1alpha1.PhaseConfiguring)
 
 	for _, s := range r.pipelineSteps(claim) {
 		res, err := s.fn(ctx, claim, state)
+		if errors.Is(err, errSpecChanged) {
+			// Not a failure: the next pass admits the new spec from the start.
+			logger.V(1).Info("spec changed during the pass; starting over", "step", s.name)
+			r.backoff.Reset(key)
+			setPhase(claim, startPhase)
+			return ctrl.Result{RequeueAfter: RequeueClaimSpecChanged}
+		}
 		if err != nil {
 			var requeue time.Duration
 			var co *vault.CircuitOpenError
@@ -196,18 +219,54 @@ func (r *VaultClaimReconciler) refuse(claim *vaultv1alpha1.VaultClaim, state *pi
 	return Refuse, nil
 }
 
-// persistIntent patches status when it differs from base, then advances base.
+// persistIntent persists the ledger fields of claim's status over base, then
+// advances base. It patches a copy: the server answers with the whole object,
+// and a spec edited since the pass began must not replace the spec the pass
+// admitted. Only the resource version comes back into claim. An edit is seen
+// as a new generation in the answer and ends the pass with errSpecChanged.
 func (r *VaultClaimReconciler) persistIntent(ctx context.Context, claim *vaultv1alpha1.VaultClaim, base *vaultv1alpha1.VaultClaimStatus) error {
-	if apiequality.Semantic.DeepEqual(stripHeartbeats(base), stripHeartbeats(&claim.Status)) {
+	want := intentStatus(base, &claim.Status)
+	if apiequality.Semantic.DeepEqual(stripHeartbeats(base), stripHeartbeats(want)) {
 		return nil
 	}
 	orig := claim.DeepCopy()
 	orig.Status = *base
-	if err := r.Status().Patch(ctx, claim, client.MergeFrom(orig)); err != nil {
+	sent := claim.DeepCopy()
+	sent.Status = *want
+	if err := r.Status().Patch(ctx, sent, client.MergeFrom(orig)); err != nil {
 		return fmt.Errorf("persist intent: %w", err)
 	}
-	*base = *claim.Status.DeepCopy()
+	*base = *sent.Status.DeepCopy()
+	claim.ResourceVersion = sent.ResourceVersion
+	if sent.Generation != claim.Generation {
+		return errSpecChanged
+	}
 	return nil
+}
+
+// intentStatus is base with the ledger fields of cur: the Vault config the
+// claim writes through, the mount it accepted and the names it is about to
+// write. Phase, conditions and the rest stay as last persisted, so an intent
+// never shows a claim in a phase it was not in; the pass's outcome goes in the
+// final patch. ConfigName is set before the first Vault write of a pass, so a
+// persisted intent always tells deletion that Vault may hold something.
+func intentStatus(base, cur *vaultv1alpha1.VaultClaimStatus) *vaultv1alpha1.VaultClaimStatus {
+	out := base.DeepCopy()
+	v := cur.Vault
+	if v == nil || (out.Vault == nil && v.ConfigName == "" && v.AuthMountPath == "" &&
+		len(v.AppliedPolicies) == 0 && len(v.AppliedRoles) == 0 && len(v.TransitKeys) == 0) {
+		return out
+	}
+	if out.Vault == nil {
+		out.Vault = &vaultv1alpha1.VaultStatusSummary{}
+	}
+	v = v.DeepCopy()
+	out.Vault.ConfigName = v.ConfigName
+	out.Vault.AuthMountPath = v.AuthMountPath
+	out.Vault.AppliedPolicies = v.AppliedPolicies
+	out.Vault.AppliedRoles = v.AppliedRoles
+	out.Vault.TransitKeys = v.TransitKeys
+	return out
 }
 
 func (r *VaultClaimReconciler) driftCheckAndMaybeShortCircuit(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (bool, ctrl.Result) {

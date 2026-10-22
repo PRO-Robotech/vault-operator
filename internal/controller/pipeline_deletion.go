@@ -47,9 +47,10 @@ func (r *VaultClaimReconciler) handleDeletion(ctx context.Context, claim *vaultv
 		"Deleting", "reverse pipeline in progress")
 
 	// A claim that never got past Step 1 wrote nothing to Vault: Step 1 records
-	// the mount path before any Vault write, and every write is preceded by
-	// its ledger entry.
-	if v := claim.Status.Vault; v != nil && (v.AuthMountPath != "" || len(v.AppliedRoles) > 0 || len(v.AppliedPolicies) > 0) {
+	// the VaultConfig before any Vault write, every write is preceded by its
+	// ledger entry, and the intent before creating a mount persists that
+	// record. An earlier release recorded the mount path instead.
+	if v := claim.Status.Vault; v != nil && (v.ConfigName != "" || v.AuthMountPath != "" || len(v.AppliedRoles) > 0 || len(v.AppliedPolicies) > 0) {
 		if err := r.deleteVaultObjects(ctx, claim); err != nil {
 			logger.V(1).Info("Vault cleanup error", "error", err.Error())
 			logger.Info("Vault cleanup failed, keeping finalizer for retry", "cause", failureText(err))

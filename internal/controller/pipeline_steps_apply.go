@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -32,8 +33,9 @@ import (
 const templateAccessorVar = ".AuthMountAccessor"
 
 // stepEnableAuthMount (owner claims) makes sure the claim's own mount exists
-// and writes its config. Ownership is judged by what sys/auth reports, never by
-// status: a mount that exists without this claim's description is refused, and
+// and writes its config. A mount that exists is configured only when
+// mountAccepted holds: sys/auth shows this claim's description, or the record
+// an earlier pass or release left names it. Any other mount is refused, and
 // neither its config nor its roles are touched.
 func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
 	mount := normMount(claim.Spec.Auth.MountPath)
@@ -55,7 +57,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 	info, exists := mounts[mountKey(mount)]
 	switch {
 	case exists:
-		if !mountIsOurs(info, claim) {
+		if !mountAccepted(info, claim, state.RecordedMount) {
 			claim.Status.Vault.AuthMountOwned = false
 			return r.refuse(claim, state, vaultv1alpha1.ConditionAuthMountReady, ReasonMountConflict,
 				fmt.Sprintf("auth mount %q exists and was not created for this claim", mount))
@@ -78,7 +80,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 					"MountLookupFailed", "reading sys/auth failed: "+failureText(lerr))
 				return Proceed, fmt.Errorf("list auth mounts: %w", lerr)
 			}
-			if info, ok := again[mountKey(mount)]; !ok || !mountIsOurs(info, claim) {
+			if info, ok := again[mountKey(mount)]; !ok || !mountAccepted(info, claim, state.RecordedMount) {
 				claim.Status.Vault.AuthMountOwned = false
 				return r.refuse(claim, state, vaultv1alpha1.ConditionAuthMountReady, ReasonMountConflict,
 					fmt.Sprintf("auth mount %q exists and was not created for this claim", mount))
@@ -95,6 +97,7 @@ func (r *VaultClaimReconciler) stepEnableAuthMount(ctx context.Context, claim *v
 	}
 	state.MountOwned = true
 	claim.Status.Vault.AuthMountOwned = true
+	claim.Status.Vault.AuthMountPath = claim.Spec.Auth.MountPath
 
 	// Vault replaces the config: writing without the JWT would wipe the reviewer.
 	if state.ReviewerJWT == nil || state.ReviewerJWT.Token == "" {
@@ -155,6 +158,10 @@ func (r *VaultClaimReconciler) stepVerifyGuestMount(ctx context.Context, claim *
 			ReasonMountNotConfigured, fmt.Sprintf("auth mount %q has no kubernetes_host configured", mount))
 		return Wait, nil
 	}
+	if claim.Status.Vault == nil {
+		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
+	}
+	claim.Status.Vault.AuthMountPath = claim.Spec.Auth.MountPath
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady, metav1.ConditionTrue, claim.Generation,
 		"GuestMount", fmt.Sprintf("auth mount %q is configured by its owner", mount))
 	return Proceed, nil
@@ -322,9 +329,12 @@ func (r *VaultClaimReconciler) stepApplyRoles(ctx context.Context, claim *vaultv
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
 	mount := normMount(claim.Spec.Auth.MountPath)
-	names := make([]string, 0, len(claim.Spec.Roles))
-	for i := range claim.Spec.Roles {
-		names = append(names, claim.Spec.Roles[i].Name)
+	// The roles are taken once, before the intent: what is written is what
+	// was admitted and read-checked, whatever happens to the claim meanwhile.
+	roles := slices.Clone(claim.Spec.Roles)
+	names := make([]string, 0, len(roles))
+	for i := range roles {
+		names = append(names, roles[i].Name)
 	}
 
 	ledger := claim.Status.Vault.AppliedRoles
@@ -348,8 +358,8 @@ func (r *VaultClaimReconciler) stepApplyRoles(ctx context.Context, claim *vaultv
 	if err := state.intent(ctx, claim); err != nil {
 		return Proceed, err
 	}
-	for i := range claim.Spec.Roles {
-		role := claim.Spec.Roles[i]
+	for i := range roles {
+		role := roles[i]
 		if err := state.Vault.PutKubernetesRole(ctx, mount, role.Name, roleBody(role)); err != nil {
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionRolesApplied, metav1.ConditionFalse, claim.Generation,
 				"PutRoleFailed", fmt.Sprintf("role %q: writing it failed: %s", role.Name, failureText(err)))

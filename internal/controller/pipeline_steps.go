@@ -89,8 +89,9 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
+	// status.vault.authMountPath is not set here: it records a mount the pass
+	// accepted (see mountAccepted), and nothing is accepted yet.
 	claim.Status.Vault.ConfigName = cfg.Name
-	claim.Status.Vault.AuthMountPath = claim.Spec.Auth.MountPath
 	claim.Status.Vault.SecretsPrefix = claim.Spec.SecretsPrefix
 	return Proceed, nil
 }

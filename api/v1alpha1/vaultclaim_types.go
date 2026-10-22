@@ -375,6 +375,11 @@ type VaultStatusSummary struct {
 	// +optional
 	ConfigName string `json:"configName,omitempty"`
 
+	// AuthMountPath is the auth mount this claim was accepted on. It is written
+	// only once the mount is accepted, never before, so a claim that waited
+	// or was refused does not hold it; a claim whose record names its mount
+	// keeps that mount whatever its description (releases before ownership
+	// checks recorded it for every claim and have configured the mount since).
 	// +optional
 	AuthMountPath string `json:"authMountPath,omitempty"`
 
@@ -387,8 +392,9 @@ type VaultStatusSummary struct {
 	AuthMountAccessor string `json:"authMountAccessor,omitempty"`
 
 	// AuthMountOwned records a fact, never an intent: the mount answered 2xx
-	// to this claim's POST sys/auth, or sys/auth reports it as a kubernetes
-	// mount carrying this claim's description.
+	// to this claim's POST sys/auth, sys/auth reports it as a kubernetes
+	// mount carrying this claim's description, or authMountPath already
+	// named it.
 	// +optional
 	AuthMountOwned bool `json:"authMountOwned,omitempty"`
 

@@ -108,12 +108,15 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	oldStatus := claim.Status.DeepCopy()
+	// The generation this pass admits. A pass an edit cut short leaves the
+	// edit unobserved, so the next pass treats the spec as changed.
+	observed := claim.Generation
 
 	// executePipeline advances oldStatus each time it persists an intent, so
 	// the final patch is computed against what the API server already holds.
 	result := r.executePipeline(ctx, claim, oldStatus)
 
-	claim.Status.ObservedGeneration = claim.Generation
+	claim.Status.ObservedGeneration = observed
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}

@@ -116,11 +116,11 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 		present := make(map[string]struct{}, len(existing))
 		for _, name := range existing {
-			present[name] = struct{}{}
+			present[nameKey(name)] = struct{}{}
 		}
 		for i := range claim.Spec.Policies {
 			name := claim.Spec.Policies[i].Name
-			if _, ok := present[name]; !ok {
+			if _, ok := present[nameKey(name)]; !ok {
 				report.MissingPolicies = append(report.MissingPolicies, name)
 			}
 		}
@@ -129,7 +129,11 @@ func (r *VaultClaimReconciler) detectDrift(ctx context.Context, vc VaultClient, 
 		}
 	}
 
-	owned := mountExists && (mountIsOurs(info, claim) || (claim.Status.Vault != nil && claim.Status.Vault.AuthMountOwned))
+	var recorded string
+	if claim.Status.Vault != nil {
+		recorded = claim.Status.Vault.AuthMountPath
+	}
+	owned := mountExists && mountAccepted(info, claim, recorded)
 	if err := r.detectRoleDrift(ctx, vc, claim, owned, &report); err != nil {
 		return report, err
 	}
@@ -150,9 +154,9 @@ func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClie
 	if err != nil {
 		return fmt.Errorf("list roles: %w", err)
 	}
-	desired := make(map[string]struct{}, len(claim.Spec.Roles))
+	desired := make(map[string]string, len(claim.Spec.Roles))
 	for i := range claim.Spec.Roles {
-		desired[claim.Spec.Roles[i].Name] = struct{}{}
+		desired[nameKey(claim.Spec.Roles[i].Name)] = claim.Spec.Roles[i].Name
 	}
 	exclusive := owned && claim.Spec.Auth.ManagesConfig() && claim.Spec.Auth.RolePruningMode() == vaultv1alpha1.RolePruningExclusive
 	var ledger []string
@@ -165,16 +169,16 @@ func (r *VaultClaimReconciler) detectRoleDrift(ctx context.Context, vc VaultClie
 	}
 	present := make(map[string]struct{}, len(existingRoles))
 	for _, name := range existingRoles {
-		present[name] = struct{}{}
-		if _, ok := desired[name]; ok {
+		present[nameKey(name)] = struct{}{}
+		if _, ok := desired[nameKey(name)]; ok {
 			continue
 		}
-		if (exclusive || containsString(ledger, name)) && !keep(name) {
+		if (exclusive || containsName(ledger, name)) && !keep(name) {
 			report.ExtraRoles = append(report.ExtraRoles, name)
 		}
 	}
-	for name := range desired {
-		if _, ok := present[name]; !ok {
+	for key, name := range desired {
+		if _, ok := present[key]; !ok {
 			report.MissingRoles = append(report.MissingRoles, name)
 		}
 	}

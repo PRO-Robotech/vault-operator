@@ -257,6 +257,18 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	h.vaultConfig("default", "vault-operator")
 	h.namespace("acme")
 	claims := prodShapedClaims("acme")
+	// A mount made by hand before its claim: the legacy release configured it
+	// without looking at its description. The upgrade must keep it so.
+	handMade := claims[1].DeepCopy()
+	handMade.Name, handMade.Spec.ClusterRef.Name, handMade.Spec.ClusterRef.KubeconfigSecret = "hm0001", "hm0001", "hm0001-infra-kubeconfig"
+	handMade.Spec.Auth.MountPath, handMade.Spec.SecretsPrefix = "acme-hm0001", "clusters/acme-hm0001"
+	handMade.Spec.Transit = nil
+	handMade.Spec.Policies, handMade.Spec.Roles = handMade.Spec.Policies[:1], handMade.Spec.Roles[:1]
+	handMade.Spec.Policies[0].Name, handMade.Spec.Roles[0].Name = "acme-hm0001-apps", "acme-hm0001-apps"
+	handMade.Spec.Roles[0].Policies = []string{"acme-hm0001-apps"}
+	handMade.Spec.Policies[0].Rules = `path "secret/data/clusters/acme-hm0001/s3" { capabilities = ["read"] }`
+	h.root(http.MethodPost, "sys/auth/acme-hm0001", map[string]string{"type": "kubernetes", "description": "created by hand"})
+	claims = append(claims, handMade)
 	for _, c := range claims {
 		h.kubeconfigSecret("acme", c.Name)
 		// The legacy schema has no autoCreate pointer; the default is the same.
@@ -276,7 +288,7 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	// refuse a snapshot that misses the claims' objects.
 	census := snapshotCensus(t, s0)
 	t.Logf("snapshot census: %v", census)
-	for kind, min := range map[string]int{"policies": 4 + 1, "kubernetesMounts": 2 + 1, "roles": 4 + 1, "transitKeys": 2} {
+	for kind, min := range map[string]int{"policies": 5 + 1, "kubernetesMounts": 3 + 1, "roles": 5 + 1, "transitKeys": 2} {
 		if census[kind] < min {
 			t.Fatalf("snapshot read %d %s, want at least %d", census[kind], kind, min)
 		}
@@ -289,6 +301,9 @@ func TestUpgradeFromLegacyKeepsVaultByteForByte(t *testing.T) {
 	h.cycles(r, 3, claims...)
 	if s1 := h.snapshot(); !bytes.Equal(s0, s1) {
 		t.Fatalf("Vault changed after the upgrade (natural passes):\n%s", diffLines(s0, s1))
+	}
+	if d := dataOf(h.root(http.MethodGet, "sys/auth", nil))["acme-hm0001/"]; d == nil || d.(map[string]any)["description"] != "created by hand" {
+		t.Fatalf("the hand-made mount is not in the snapshot as it was made: %v", d)
 	}
 	for _, c := range claims {
 		if got := h.claim(c).Status.Phase; got != vaultv1alpha1.PhaseReady {

@@ -372,7 +372,7 @@ func prodShapedClaims(ns string) []*vaultv1alpha1.VaultClaim {
 					MountPath:  id,
 					AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
-						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault", Name: "vault-token-reviewer", AutoCreate: true},
+						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-reviewer", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
 					},
 				},
@@ -407,7 +407,7 @@ path "auth/token/renew-self" {
 		c.Spec.Roles = append(c.Spec.Roles, vaultv1alpha1.RoleSpec{
 			Name:                 id + "-kms-plugin",
 			Audience:             "vault-kms-plugin." + id + ".client",
-			BoundServiceAccounts: vaultv1alpha1.BoundServiceAccounts{Name: "client-cp-control-plane-control-plane", Namespace: "beget-system"},
+			BoundServiceAccounts: vaultv1alpha1.BoundServiceAccounts{Name: "client-cp-control-plane-control-plane", Namespace: "platform-system"},
 			Policies:             []string{id + "-etcd-kms"},
 			TokenMaxTTL:          ttl(24 * time.Hour), TokenNoDefaultPolicy: true, TokenTTL: ttl(time.Hour), TokenType: "service",
 		})
@@ -439,7 +439,7 @@ path "secret/data/clusters/` + idB + `/s3" { capabilities = ["read"] }
 path "auth/token/lookup-self" { capabilities = ["read"] }
 `}}
 	b.Spec.Roles = []vaultv1alpha1.RoleSpec{{
-		Name: idB + "-argocd", BoundServiceAccounts: vaultv1alpha1.BoundServiceAccounts{Name: "argocd-repo-server", Namespace: "beget-argocd"},
+		Name: idB + "-argocd", BoundServiceAccounts: vaultv1alpha1.BoundServiceAccounts{Name: "argocd-repo-server", Namespace: "argocd"},
 		Policies: []string{idB + "-apps"}, TokenTTL: ttl(time.Hour),
 	}}
 	kms(b)

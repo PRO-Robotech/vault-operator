@@ -30,7 +30,7 @@ import (
 
 // operatorRoles are the six roles the platform writes on the operator mount;
 // three of them are what the three operators log in with.
-var operatorRoles = []string{"vault-operator", "s3-bucket-operator", "vault-secret-operator", "system-1-ro", "system-1-avp-argocd", "metrics-reader"}
+var operatorRoles = []string{"vault-operator", "s3-bucket-operator", "vault-secret-operator", "platform-ro", "platform-avp-argocd", "metrics-reader"}
 
 // seedOperatorMount writes what the platform's bootstrap writes next to the
 // e2e manager role: the other five roles and the operators' policies.
@@ -41,7 +41,7 @@ func seedOperatorMount(h *harness) {
 	}
 	for _, r := range operatorRoles[1:] {
 		h.root(http.MethodPost, "auth/"+mgmtAuthPath+"/role/"+r, map[string]any{
-			"bound_service_account_names": []string{r}, "bound_service_account_namespaces": []string{"beget-system"},
+			"bound_service_account_names": []string{r}, "bound_service_account_namespaces": []string{"platform-system"},
 			"token_policies": []string{r}, "token_ttl": 600,
 		})
 	}
@@ -61,7 +61,7 @@ func operatorMountState(h *harness) []byte {
 }
 
 func guestClaim(ns, name, role string) *vaultv1alpha1.VaultClaim {
-	prefix := "clusters/system-1/namespaces/" + ns + "/apps/docker-registry/" + name
+	prefix := "clusters/mgmt/namespaces/" + ns + "/apps/docker-registry/" + name
 	return &vaultv1alpha1.VaultClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: vaultv1alpha1.VaultClaimSpec{
@@ -98,7 +98,7 @@ func TestGuestOnOperatorMountE2E(t *testing.T) {
 	guest := guestClaim("registry", "zot-1", "zot-1")
 	// No reserved role list is configured: the ledger rule alone must protect
 	// a platform role the guest names.
-	squatter := guestClaim("registry", "zot-2", "system-1-ro")
+	squatter := guestClaim("registry", "zot-2", "platform-ro")
 	intruder := prodShapedClaims("registry")[0]
 	intruder.Name, intruder.Spec.ClusterRef.Name = "intruder", "intruder"
 	intruder.Spec.Auth.MountPath = mgmtAuthPath
@@ -228,13 +228,22 @@ func TestOwnershipE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 		h.cycles(r, 1, c)
-		if got := h.claim(c).Status.Vault.AuthMountPath; got != "acme-ee0001" {
-			t.Fatalf("status.vault.authMountPath = %q; the claim did not wait at step 2", got)
+		waited := h.claim(c)
+		if got := reasonOf(waited, vaultv1alpha1.ConditionKubeconfigAvailable); got != "NotFound" {
+			t.Fatalf("KubeconfigAvailable reason = %s; the claim did not wait for its kubeconfig", got)
+		}
+		// A record of the mount is what accepts it; waiting must not earn one.
+		if waited.Status.Vault != nil && waited.Status.Vault.AuthMountPath != "" {
+			t.Fatalf("status.vault.authMountPath = %q after waiting", waited.Status.Vault.AuthMountPath)
 		}
 		h.kubeconfigSecret("acme", c.Name)
 		h.cycles(r, 3, c)
-		if got := reasonOf(h.claim(c), vaultv1alpha1.ConditionAuthMountReady); got != controller.ReasonMountConflict {
-			t.Fatalf("AuthMountReady reason = %s", got)
+		got := h.claim(c)
+		if reason := reasonOf(got, vaultv1alpha1.ConditionAuthMountReady); reason != controller.ReasonMountConflict {
+			t.Fatalf("AuthMountReady reason = %s", reason)
+		}
+		if got.Status.Vault != nil && got.Status.Vault.AuthMountPath != "" {
+			t.Fatalf("status.vault.authMountPath = %q for a refused mount", got.Status.Vault.AuthMountPath)
 		}
 		if host := dataOf(h.root(http.MethodGet, "auth/acme-ee0001/config", nil))["kubernetes_host"]; host != nil && host != "" {
 			t.Fatalf("config of a foreign mount was written: kubernetes_host=%v", host)
@@ -243,6 +252,54 @@ func TestOwnershipE2E(t *testing.T) {
 		if _, ok := dataOf(h.root(http.MethodGet, "sys/auth", nil))["acme-ee0001/"]; !ok {
 			t.Fatal("a foreign mount was disabled by a claim's deletion")
 		}
+	})
+
+	t.Run("names are compared the way Vault resolves them", func(t *testing.T) {
+		const ext = "ext-template"
+		h.root(http.MethodPut, "sys/policies/acl/"+ext, map[string]string{"policy": `path "secret/data/ext/*" { capabilities = ["read"] }`})
+		before := dataOf(h.root(http.MethodGet, "sys/policies/acl/"+ext, nil))["policy"]
+		names := h.reconciler(controller.OwnershipPolicy{ReservedPolicyNames: []string{"vault-operator-admin"}, ExternalPolicyNames: []string{ext}}, policyguard.ModeAudit)
+		mk := func(id string) *vaultv1alpha1.VaultClaim {
+			c := shapes[1].DeepCopy()
+			c.Name, c.Spec.ClusterRef.Name, c.Spec.ClusterRef.KubeconfigSecret = id, id, id+"-infra-kubeconfig"
+			c.Spec.Auth.MountPath, c.Spec.SecretsPrefix = "acme-"+id, "clusters/acme-"+id
+			c.Spec.Transit, c.Spec.Policies, c.Spec.Roles = nil, nil, nil
+			h.kubeconfigSecret("acme", id)
+			return c
+		}
+		// A ledger entry in another case names the external policy.
+		ledger := mk("nk0001")
+		// A role reference in another case names the reserved policy.
+		ref := mk("nk0002")
+		ref.Spec.Policies = []vaultv1alpha1.PolicySpec{{Name: "nk-own", Rules: `path "secret/data/clusters/acme-nk0002/*" { capabilities = ["read"] }`}}
+		ref.Spec.Roles = []vaultv1alpha1.RoleSpec{{Name: "nk-r", BoundServiceAccounts: vaultv1alpha1.BoundServiceAccounts{Name: "a", Namespace: "x"},
+			Policies: []string{"nk-own", "Vault-Operator-Admin"}}}
+		for _, c := range []*vaultv1alpha1.VaultClaim{ledger, ref} {
+			if err := h.k8s.Create(h.ctx, c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fresh := h.claim(ledger)
+		fresh.Status.Vault = &vaultv1alpha1.VaultStatusSummary{AppliedPolicies: []string{"EXT-TEMPLATE"}}
+		if err := h.k8s.Status().Update(h.ctx, fresh); err != nil {
+			t.Fatal(err)
+		}
+		h.cycles(names, 3, ledger, ref)
+		if after := dataOf(h.root(http.MethodGet, "sys/policies/acl/"+ext, nil))["policy"]; after != before {
+			t.Fatalf("external policy %s after a ledger entry in another case: %v", ext, after)
+		}
+		if got := reasonOf(h.claim(ref), vaultv1alpha1.ConditionRolesApplied); got != controller.ReasonPolicyReferenceForbidden {
+			t.Fatalf("RolesApplied reason = %s, want PolicyReferenceForbidden", got)
+		}
+		if role := dataOf(h.root(http.MethodGet, "auth/acme-nk0002/role/nk-r", nil)); role != nil {
+			t.Fatalf("a role referencing the reserved policy reached Vault: %v", role["token_policies"])
+		}
+		h.deleteClaim(names, ledger)
+		h.deleteClaim(names, ref)
+		if after := dataOf(h.root(http.MethodGet, "sys/policies/acl/"+ext, nil))["policy"]; after != before {
+			t.Fatal("external policy removed by a claim's deletion")
+		}
+		h.root(http.MethodDelete, "sys/policies/acl/"+ext, nil)
 	})
 
 	t.Run("the ledger removes what left spec", func(t *testing.T) {

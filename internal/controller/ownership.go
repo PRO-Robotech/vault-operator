@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -43,21 +44,25 @@ type OwnershipPolicy struct {
 }
 
 func (o OwnershipPolicy) reservedPolicy(name string) bool {
-	return containsString(builtinReservedPolicies, name) || containsString(o.ReservedPolicyNames, name)
+	return containsName(builtinReservedPolicies, name) || containsName(o.ReservedPolicyNames, name)
 }
 
 // protectedPolicy: a claim never writes or deletes it.
 func (o OwnershipPolicy) protectedPolicy(name string) bool {
-	return o.reservedPolicy(name) || containsString(o.ExternalPolicyNames, name)
+	return o.reservedPolicy(name) || containsName(o.ExternalPolicyNames, name)
 }
 
-func containsString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
+// nameKey is a policy or role name as Vault resolves it: Vault lower-cases a
+// policy name and trims its spaces before every lookup, write and delete, and
+// stores kubernetes roles lower-cased. "Ext-Template" and " ext-template "
+// are the object "ext-template", so every ownership comparison of policy and
+// role names goes through nameKey.
+func nameKey(name string) string { return strings.ToLower(strings.TrimSpace(name)) }
+
+// containsName reports whether list names the same Vault object as name.
+func containsName(list []string, name string) bool {
+	k := nameKey(name)
+	return slices.ContainsFunc(list, func(x string) bool { return nameKey(x) == k })
 }
 
 func normMount(m string) string { return strings.Trim(m, "/") }
@@ -143,7 +148,7 @@ func (v *ownershipView) reservedRole(mount, role string) bool {
 	if !ok {
 		return false
 	}
-	return containsString(roles, role) || containsString(v.policy.ReservedRoleNames, role)
+	return containsName(roles, role) || containsName(v.policy.ReservedRoleNames, role)
 }
 
 // claimPolicyNames is spec ∪ ledger: a claim holds a name it declares and a
@@ -216,7 +221,7 @@ func (v *ownershipView) admit(claim *vaultv1alpha1.VaultClaim, enforceRefs bool)
 		return &admissionRefusal{vaultv1alpha1.ConditionAuthMountReady, ReasonMountConflict,
 			fmt.Sprintf("auth mount %q is an operator mount; only a claim with spec.auth.manageConfig=false may use it", mount)}
 	}
-	if guest && !v.isOperatorMount(mount) && !containsString(v.policy.GuestMounts, mount) {
+	if guest && !v.isOperatorMount(mount) && !slices.Contains(v.policy.GuestMounts, mount) {
 		return &admissionRefusal{vaultv1alpha1.ConditionAuthMountReady, ReasonMountConflict,
 			fmt.Sprintf("auth mount %q is neither an operator mount nor allow-listed for guest claims", mount)}
 	}
@@ -237,10 +242,10 @@ func (v *ownershipView) admit(claim *vaultv1alpha1.VaultClaim, enforceRefs bool)
 				fmt.Sprintf("role %q on auth mount %q is reserved", role.Name, mount)}
 		}
 		for _, ref := range role.Policies {
-			if _, own := declared[ref]; own {
+			if _, own := declared[nameKey(ref)]; own {
 				continue
 			}
-			if v.policy.reservedPolicy(ref) || (enforceRefs && !containsString(v.policy.ExternalPolicyNames, ref)) {
+			if v.policy.reservedPolicy(ref) || (enforceRefs && !containsName(v.policy.ExternalPolicyNames, ref)) {
 				return &admissionRefusal{vaultv1alpha1.ConditionRolesApplied, ReasonPolicyReferenceForbidden,
 					fmt.Sprintf("role %q references policy %q, which the claim neither declares nor may reference", role.Name, ref)}
 			}
@@ -260,7 +265,7 @@ func (v *ownershipView) admit(claim *vaultv1alpha1.VaultClaim, enforceRefs bool)
 				fmt.Sprintf("spec.secretsPrefix %q overlaps the prefix of VaultClaim %s", claim.Spec.SecretsPrefix, who)}
 		}
 		for _, name := range claimPolicyNames(other) {
-			if _, ok := declared[name]; ok {
+			if _, ok := declared[nameKey(name)]; ok {
 				return &admissionRefusal{vaultv1alpha1.ConditionPoliciesApplied, ReasonOwnershipConflict,
 					fmt.Sprintf("policy %q belongs to VaultClaim %s", name, who)}
 			}
@@ -268,7 +273,7 @@ func (v *ownershipView) admit(claim *vaultv1alpha1.VaultClaim, enforceRefs bool)
 		if otherMount == mount {
 			theirs := claimRoleNames(other)
 			for i := range claim.Spec.Roles {
-				if containsString(theirs, claim.Spec.Roles[i].Name) {
+				if containsName(theirs, claim.Spec.Roles[i].Name) {
 					return &admissionRefusal{vaultv1alpha1.ConditionRolesApplied, ReasonOwnershipConflict,
 						fmt.Sprintf("role %q on auth mount %q belongs to VaultClaim %s", claim.Spec.Roles[i].Name, mount, who)}
 				}
@@ -276,7 +281,7 @@ func (v *ownershipView) admit(claim *vaultv1alpha1.VaultClaim, enforceRefs bool)
 		}
 		theirKeys := claimTransitKeys(other)
 		for _, key := range claimTransitKeys(claim) {
-			if containsString(theirKeys, key) {
+			if slices.Contains(theirKeys, key) {
 				return &admissionRefusal{vaultv1alpha1.ConditionTransitKeysReady, ReasonOwnershipConflict,
 					fmt.Sprintf("transit key %q belongs to VaultClaim %s", key, who)}
 			}
@@ -291,7 +296,7 @@ func (v *ownershipView) referenceWarnings(claim *vaultv1alpha1.VaultClaim) []str
 	var out []string
 	for i := range claim.Spec.Roles {
 		for _, ref := range claim.Spec.Roles[i].Policies {
-			if _, own := declared[ref]; own || containsString(v.policy.ExternalPolicyNames, ref) {
+			if _, own := declared[nameKey(ref)]; own || containsName(v.policy.ExternalPolicyNames, ref) {
 				continue
 			}
 			out = append(out, fmt.Sprintf("role %q references policy %q, which the claim neither declares nor may reference", claim.Spec.Roles[i].Name, ref))
@@ -300,30 +305,32 @@ func (v *ownershipView) referenceWarnings(claim *vaultv1alpha1.VaultClaim) []str
 	return out
 }
 
+// declaredPolicies is the set of the claim's policy names, keyed by nameKey.
 func declaredPolicies(claim *vaultv1alpha1.VaultClaim) map[string]struct{} {
 	out := make(map[string]struct{}, len(claim.Spec.Policies))
 	for i := range claim.Spec.Policies {
-		out[claim.Spec.Policies[i].Name] = struct{}{}
+		out[nameKey(claim.Spec.Policies[i].Name)] = struct{}{}
 	}
 	return out
 }
 
 // heldByOthers collects the names other claims hold, so that pruning and
-// deletion never remove them even when this claim's ledger lists them.
+// deletion never remove them even when this claim's ledger lists them. Names
+// are keyed by nameKey.
 type heldByOthers struct {
 	policies map[string]struct{}
-	roles    map[string]struct{} // mount + "/" + role
+	roles    map[string]struct{} // mount + "/" + nameKey(role)
 }
 
 func collectHeld(others []*vaultv1alpha1.VaultClaim) heldByOthers {
 	h := heldByOthers{policies: map[string]struct{}{}, roles: map[string]struct{}{}}
 	for _, o := range others {
 		for _, n := range claimPolicyNames(o) {
-			h.policies[n] = struct{}{}
+			h.policies[nameKey(n)] = struct{}{}
 		}
 		m := normMount(o.Spec.Auth.MountPath)
 		for _, n := range claimRoleNames(o) {
-			h.roles[m+"/"+n] = struct{}{}
+			h.roles[m+"/"+nameKey(n)] = struct{}{}
 		}
 	}
 	return h
@@ -337,7 +344,7 @@ func (r *VaultClaimReconciler) deletablePolicies(candidates []string, held heldB
 		if r.Ownership.protectedPolicy(n) {
 			continue
 		}
-		if _, ok := held.policies[n]; ok {
+		if _, ok := held.policies[nameKey(n)]; ok {
 			continue
 		}
 		out = append(out, n)
@@ -351,7 +358,7 @@ func deletableRoles(view *ownershipView, mount string, candidates []string, held
 		if view.reservedRole(mount, n) {
 			continue
 		}
-		if _, ok := held.roles[normMount(mount)+"/"+n]; ok {
+		if _, ok := held.roles[normMount(mount)+"/"+nameKey(n)]; ok {
 			continue
 		}
 		out = append(out, n)
@@ -367,9 +374,29 @@ func mountDescription(claim *vaultv1alpha1.VaultClaim) string {
 }
 
 // mountIsOurs: sys/auth shows a kubernetes mount with this claim's
-// description. Status is never evidence: it is written before any Vault call.
+// description, which only the operator's own POST sys/auth writes. Deletion
+// disables a mount on this evidence alone.
 func mountIsOurs(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim) bool {
 	return info.Type == "kubernetes" && info.Description == mountDescription(claim)
+}
+
+// mountAccepted: the claim may configure the kubernetes mount sys/auth shows
+// at its mountPath. Either the mount carries this claim's description, or
+// recorded — status.vault.authMountPath as last persisted — names it. This
+// release writes that record only after it accepted the mount, never before,
+// so a claim that was refused or has not reached its mount step cannot hold
+// it. A release before ownership checks wrote it for every claim and has
+// configured that mount since; its claims keep their mount whatever its
+// description, and the description is left as it is.
+func mountAccepted(info vault.AuthMountInfo, claim *vaultv1alpha1.VaultClaim, recorded string) bool {
+	if info.Type != "kubernetes" {
+		return false
+	}
+	if info.Description == mountDescription(claim) {
+		return true
+	}
+	mount := normMount(claim.Spec.Auth.MountPath)
+	return mount != "" && normMount(recorded) == mount
 }
 
 func mountKey(mount string) string { return normMount(mount) + "/" }
@@ -391,15 +418,16 @@ func union(a, b []string) []string {
 	return out
 }
 
-// minus returns a − b, keeping a's order.
+// minus returns the names of a that name no Vault object b names (by
+// nameKey), keeping a's order and spelling.
 func minus(a, b []string) []string {
 	drop := make(map[string]struct{}, len(b))
 	for _, s := range b {
-		drop[s] = struct{}{}
+		drop[nameKey(s)] = struct{}{}
 	}
 	out := make([]string, 0, len(a))
 	for _, s := range a {
-		if _, ok := drop[s]; !ok {
+		if _, ok := drop[nameKey(s)]; !ok {
 			out = append(out, s)
 		}
 	}

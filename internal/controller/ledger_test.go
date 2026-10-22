@@ -99,7 +99,7 @@ func newClaim(name, configName, secretName string, opts ...claimOpt) *vaultv1alp
 				MountPath:  "kubernetes-" + name,
 				AutoCreate: ptr.To(true),
 				TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
-					ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
+					ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 					TTL:            metav1.Duration{Duration: 24 * time.Hour},
 				},
 			},
@@ -663,7 +663,10 @@ var _ = Describe("VaultClaim ledger, ownership and guest mode", func() {
 			createClaim(newClaim(name, cfg, name+"-kc"))
 			_, err := reconcileClaim(recon, name)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(claimNamed(name).Status.Vault.AuthMountPath).To(Equal("kubernetes-" + name))
+			waited := claimNamed(name)
+			Expect(reasonOf(waited, vaultv1alpha1.ConditionKubeconfigAvailable)).To(Equal("NotFound"))
+			// The wait records no mount: a record is what accepts one.
+			Expect(waited.Status.Vault.AuthMountPath).To(BeEmpty())
 
 			makeKubeconfigSecret(context.Background(), name+"-kc", true)
 			DeferCleanup(func() {

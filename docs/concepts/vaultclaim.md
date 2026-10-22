@@ -49,9 +49,9 @@ spec:
 | `observedGeneration` | Последнее обработанное `metadata.generation` |
 | `conditions[]` | 8 типов: `ConfigResolved`, `VaultReachable`, `KubeconfigAvailable`, `TokenReviewerJWTFresh`, `AuthMountReady`, `PoliciesApplied`, `RolesApplied`, `Ready` |
 | `vault.configName` | Имя резолвнутого VaultConfig |
-| `vault.authMountPath` | Путь auth-mount в Vault |
+| `vault.authMountPath` | auth-mount, который заявка приняла; пишется только после принятия mount |
 | `vault.authMountAccessor` | Accessor (кэшируется лениво при первом использовании в templating) |
-| `vault.authMountOwned` | Факт владения mount: 2xx на создание этой заявкой или описание этой заявки в `sys/auth` |
+| `vault.authMountOwned` | Факт владения mount: 2xx на создание этой заявкой, описание этой заявки в `sys/auth` или запись `vault.authMountPath` прежнего прохода |
 | `vault.appliedPolicies[]` | Журнал политик: имя попадает до записи в Vault и уходит после удаления |
 | `vault.appliedRoles[]` | Журнал ролей: имя попадает до записи в Vault и уходит после удаления |
 | `vault.tokenReviewerJWT.*` | Timestamps жизненного цикла reviewer JWT (без самого JWT) |
