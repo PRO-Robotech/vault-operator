@@ -60,7 +60,7 @@ func TestApplyCopy_WritesAndDetectsNoChange(t *testing.T) {
 	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
 	item := copyItem()
 
-	h1, changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 	if err != nil || !changed {
 		t.Fatalf("first apply: changed=%v err=%v", changed, err)
 	}
@@ -68,12 +68,12 @@ func TestApplyCopy_WritesAndDetectsNoChange(t *testing.T) {
 		t.Fatalf("destination = %v", got)
 	}
 
-	_, changed, err = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	changed, err = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
-	if changed {
-		t.Fatalf("expected no change when source hash matches")
+	if changed || kv.writes != 1 {
+		t.Fatalf("expected no write when the destination already holds the source value: changed=%v writes=%d", changed, kv.writes)
 	}
 }
 
@@ -81,18 +81,31 @@ func TestApplyCopy_RecopiesOnSourceChange(t *testing.T) {
 	kv := newFakeKV()
 	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
 	item := copyItem()
-	h1, _, _ := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, "")
+	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 
 	kv.seed("system/dex", map[string]any{"staticClient": "xyz"})
-	h2, changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, h1)
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
 	if err != nil || !changed {
 		t.Fatalf("expected recopy on source change: changed=%v err=%v", changed, err)
 	}
-	if h1 == h2 {
-		t.Fatalf("source hash should change with value")
-	}
 	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "xyz" {
 		t.Fatalf("destination not updated: %v", got)
+	}
+}
+
+func TestApplyCopy_RepairsAnEditedDestination(t *testing.T) {
+	kv := newFakeKV()
+	kv.seed("system/dex", map[string]any{"staticClient": "abc"})
+	item := copyItem()
+	_, _ = applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
+
+	kv.store["secret|clusters/ec8a00/grafana"]["staticClient"] = "tampered"
+	changed, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item)
+	if err != nil || !changed {
+		t.Fatalf("expected a repair: changed=%v err=%v", changed, err)
+	}
+	if got := kv.store["secret|clusters/ec8a00/grafana"]["staticClient"]; got != "abc" {
+		t.Fatalf("destination not repaired: %v", got)
 	}
 }
 
@@ -102,7 +115,7 @@ func TestApplyCopy_PreservesSiblingKeys(t *testing.T) {
 	kv.seed("clusters/ec8a00/grafana", map[string]any{"other": "keep"})
 	item := copyItem()
 
-	if _, _, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item, ""); err != nil {
+	if _, err := applyCopyItem(context.Background(), kv, "secret", "clusters/ec8a00", item); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	dst := kv.store["secret|clusters/ec8a00/grafana"]

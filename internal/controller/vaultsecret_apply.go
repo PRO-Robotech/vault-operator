@@ -14,8 +14,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -81,15 +81,6 @@ func criteriaHash(g vaultv1alpha1.GenerateSpec) string {
 	return sha256Hex(strconv.Itoa(effLength(g)), g.Charset, effHash(g))
 }
 
-// sourceHashCopy hashes the copy input (path + key + value); a change re-copies.
-func sourceHashCopy(src vaultv1alpha1.SourceSpec, value any) (string, error) {
-	vb, err := json.Marshal(value)
-	if err != nil {
-		return "", fmt.Errorf("marshal source value: %w", err)
-	}
-	return sha256Hex(src.Path, src.Key, string(vb)), nil
-}
-
 // validateCopySources checks every copy item's source exists before any write
 func validateCopySources(ctx context.Context, kv kvClient, defMount string, items []vaultv1alpha1.SecretListItem) error {
 	for i := range items {
@@ -109,39 +100,36 @@ func validateCopySources(ctx context.Context, kv kvClient, defMount string, item
 	return nil
 }
 
-// applyCopyItem re-copies the source into the destination only when the source
-// changed; sibling keys at the destination survive (KV-v2 writes full-replace).
-func applyCopyItem(ctx context.Context, kv kvClient, defMount, secretsPrefix string, item *vaultv1alpha1.SecretListItem, prevHash string) (string, bool, error) {
+// applyCopyItem copies the source value into the destination when the
+// destination does not already hold it, so a source change and an outside edit
+// of the destination are both repaired; sibling keys at the destination
+// survive (KV-v2 writes full-replace). No hash of the value is kept anywhere.
+func applyCopyItem(ctx context.Context, kv kvClient, defMount, secretsPrefix string, item *vaultv1alpha1.SecretListItem) (bool, error) {
 	srcMount := resolveMount(item.Source.Mount, defMount)
 	srcData, ok, err := kv.ReadKV(ctx, srcMount, item.Source.Path)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	if !ok || !hasKey(srcData, item.Source.Key) {
-		return "", false, fmt.Errorf("item %q: source %s/%s#%s not found", item.Name, srcMount, item.Source.Path, item.Source.Key)
+		return false, fmt.Errorf("item %q: source %s/%s#%s not found", item.Name, srcMount, item.Source.Path, item.Source.Key)
 	}
 	value := srcData[item.Source.Key]
-
-	sh, err := sourceHashCopy(*item.Source, value)
-	if err != nil {
-		return "", false, err
-	}
-	if prevHash == sh {
-		return sh, false, nil
-	}
 
 	dstMount := resolveMount(item.Destination.Mount, defMount)
 	dstPath := joinPath(secretsPrefix, item.Destination.Path)
 	dstData, _, err := kv.ReadKV(ctx, dstMount, dstPath)
 	if err != nil {
-		return "", false, err
+		return false, err
+	}
+	if cur, ok := dstData[item.Destination.Key]; ok && reflect.DeepEqual(cur, value) {
+		return false, nil
 	}
 	merged := cloneData(dstData)
 	merged[item.Destination.Key] = value
 	if err := kv.WriteKV(ctx, dstMount, dstPath, merged); err != nil {
-		return "", false, err
+		return false, err
 	}
-	return sh, true, nil
+	return true, nil
 }
 
 // applyGenerateItem generates create-once: it regenerates only on a missing key

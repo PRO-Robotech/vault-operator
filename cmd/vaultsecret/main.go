@@ -52,6 +52,9 @@ func main() {
 	var enableHTTP2 bool
 	var pprofAddr string
 	var tlsOpts []func(*tls.Config)
+	var concurrentReconciles int
+	var kubeQPS float64
+	var kubeBurst int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -70,6 +73,10 @@ func main() {
 			"Set e.g. 127.0.0.1:8082 to enable, binding to loopback so it is reachable only via "+
 			"`kubectl port-forward` (access gated by pods/portforward RBAC).")
 	opts := zap.Options{Development: true}
+	flag.IntVar(&concurrentReconciles, "vaultsecretclaim-concurrent-reconciles", 1,
+		"VaultSecretClaims reconciled in parallel; one claim is never reconciled twice at once.")
+	flag.Float64Var(&kubeQPS, "kube-api-qps", 0, "Kubernetes API client QPS; 0 keeps the library default.")
+	flag.IntVar(&kubeBurst, "kube-api-burst", 0, "Kubernetes API client burst; 0 keeps the library default.")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -101,7 +108,14 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg := ctrl.GetConfigOrDie()
+	if kubeQPS > 0 {
+		restCfg.QPS = float32(kubeQPS)
+	}
+	if kubeBurst > 0 {
+		restCfg.Burst = kubeBurst
+	}
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
@@ -119,6 +133,8 @@ func main() {
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorderFor("vaultsecretclaim-controller"),
 		VaultFactory: &controller.DefaultSecretVaultClientFactory{},
+
+		MaxConcurrentReconciles: concurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultSecretClaim")
 		os.Exit(1)

@@ -12,6 +12,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -50,6 +51,67 @@ func (c *Client) ReadKV(ctx context.Context, mount, path string) (map[string]any
 		return nil, false, fmt.Errorf("decode %s: %w", p, err)
 	}
 	return raw.Data.Data, true, nil
+}
+
+// ReadKVVersioned is ReadKV plus the current version (0 for an absent leaf),
+// for a following WriteKVCAS.
+func (c *Client) ReadKVVersioned(ctx context.Context, mount, path string) (map[string]any, int, bool, error) {
+	p, err := kvPath("data", mount, path)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	resp, err := c.Do(ctx, &Request{Method: http.MethodGet, Path: p})
+	if err != nil {
+		if IsNotFound(err) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, false, err
+	}
+	var raw struct {
+		Data struct {
+			Data     map[string]any `json:"data"`
+			Metadata struct {
+				Version int `json:"version"`
+			} `json:"metadata"`
+		} `json:"data"`
+	}
+	if err := resp.Decode(&raw); err != nil {
+		return nil, 0, false, fmt.Errorf("decode %s: %w", p, err)
+	}
+	return raw.Data.Data, raw.Data.Metadata.Version, true, nil
+}
+
+// WriteKVCAS writes a KV-v2 secret only if its current version is cas (0: the
+// leaf must not exist). A concurrent writer makes it fail with an error for
+// which IsCASMismatch is true; re-read and retry.
+func (c *Client) WriteKVCAS(ctx context.Context, mount, path string, data map[string]any, cas int) error {
+	if len(data) == 0 {
+		return fmt.Errorf("vault WriteKVCAS: empty data")
+	}
+	p, err := kvPath("data", mount, path)
+	if err != nil {
+		return err
+	}
+	_, err = c.Do(ctx, &Request{
+		Method: http.MethodPost,
+		Path:   p,
+		Body:   map[string]any{"data": data, "options": map[string]any{"cas": cas}},
+	})
+	return err
+}
+
+// IsCASMismatch reports a KV-v2 check-and-set rejection.
+func IsCASMismatch(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	for _, e := range apiErr.Errors {
+		if strings.Contains(e, "check-and-set parameter did not match") {
+			return true
+		}
+	}
+	return false
 }
 
 // WriteKV writes a KV-v2 secret, creating a new version. data is wrapped in the

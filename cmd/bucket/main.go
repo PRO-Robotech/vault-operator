@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -52,6 +53,12 @@ func main() {
 	var pprofAddr string
 	var cloudManagerAddr string
 	var defaultS3ConfigurationID string
+	var cmTimeout, cmKeepalive time.Duration
+	var cmFindByBucket bool
+	var cmFindRetries int
+	var concurrentReconciles int
+	var kubeQPS float64
+	var kubeBurst int
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -72,6 +79,19 @@ func main() {
 		"gRPC address of svc-cloud-manager (bucket create/find/remove).")
 	flag.StringVar(&defaultS3ConfigurationID, "default-s3-configuration-id", "s3_v1",
 		"cloud-manager S3 configuration id used when spec.bucket.configurationId is empty.")
+	flag.DurationVar(&cmTimeout, "cloud-manager-timeout", 15*time.Second,
+		"Deadline of every cloud-manager call.")
+	flag.DurationVar(&cmKeepalive, "cloud-manager-keepalive", 0,
+		"gRPC keepalive ping interval while a cloud-manager call is active; 0 disables pings.")
+	flag.BoolVar(&cmFindByBucket, "cloud-manager-find-by-bucket", true,
+		"Look a known bucket up with a ByBucket scope; false falls back to the ByCustomer query. "+
+			"Results are filtered by exact name and owner on the client either way.")
+	flag.IntVar(&cmFindRetries, "cloud-manager-find-retries", 1,
+		"Extra attempts of a findAll call that failed with UNAVAILABLE (create and remove are never retried).")
+	flag.IntVar(&concurrentReconciles, "s3bucketclaim-concurrent-reconciles", 2,
+		"S3BucketClaims reconciled in parallel; one claim is never reconciled twice at once.")
+	flag.Float64Var(&kubeQPS, "kube-api-qps", 0, "Kubernetes API client QPS; 0 keeps the library default.")
+	flag.IntVar(&kubeBurst, "kube-api-burst", 0, "Kubernetes API client burst; 0 keeps the library default.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -104,7 +124,14 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg := ctrl.GetConfigOrDie()
+	if kubeQPS > 0 {
+		restCfg.QPS = float32(kubeQPS)
+	}
+	if kubeBurst > 0 {
+		restCfg.Burst = kubeBurst
+	}
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
@@ -117,19 +144,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	buckets, err := cloudmanager.New(cloudManagerAddr)
+	buckets, err := cloudmanager.NewWithOptions(cloudManagerAddr, cloudmanager.Options{
+		CallTimeout:  cmTimeout,
+		Keepalive:    cmKeepalive,
+		FindByBucket: cmFindByBucket,
+		FindRetries:  cmFindRetries,
+	})
 	if err != nil {
 		setupLog.Error(err, "unable to create cloud-manager client", "addr", cloudManagerAddr)
 		os.Exit(1)
 	}
 
 	if err := (&controller.S3BucketClaimReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		Recorder:               mgr.GetEventRecorderFor("s3bucketclaim-controller"),
-		VaultFactory:           &controller.DefaultSecretVaultClientFactory{},
-		Buckets:                buckets,
-		DefaultConfigurationID: defaultS3ConfigurationID,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                mgr.GetEventRecorderFor("s3bucketclaim-controller"),
+		VaultFactory:            &controller.DefaultSecretVaultClientFactory{},
+		Buckets:                 buckets,
+		DefaultConfigurationID:  defaultS3ConfigurationID,
+		MaxConcurrentReconciles: concurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "S3BucketClaim")
 		os.Exit(1)
