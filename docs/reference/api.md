@@ -78,7 +78,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | `ConfigResolved` | VaultConfig найден, `Reachable=True`, `SharedMountFound=True` | Не найден / VaultConfig недоступен / mount отсутствует |
 | `VaultReachable` | Login в Vault прошёл успешно | Login failed (sealed Vault, network, неверный role) |
 | `KubeconfigAvailable` | Secret kubeconfig'а существует и содержит ключ `value` | Secret отсутствует или malformed |
-| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, или последняя попытка ротации провалилась |
+| `TokenReviewerJWTFresh` | Текущий reviewer JWT в пределах 30% TTL | Не выпущен, expired, последняя попытка ротации провалилась, или `ForeignReviewer`: SA/CRB ревьюера чужие |
 | `AuthMountReady` | Auth-mount существует и `auth/{mount}/config` записан | `POST sys/auth` failed (не 400) или `POST .../config` failed |
 | `PoliciesApplied` | Все `spec.policies[]` записаны | Хотя бы один `PUT sys/policies/acl` failed |
 | `RolesApplied` | Все `spec.roles[]` записаны + soft-purge выполнен | Хотя бы один `POST role` failed или `LIST` failed |
@@ -286,6 +286,8 @@ Reason отказов: `Conflict` (более старая заявка уже �
 | `ReviewerJWTRotated` | Normal | Reviewer JWT обновлён |
 | `RolesPurged` | Normal | Soft-purge удалил роли, которых нет в spec |
 | `DriftDetected` | Warning | Drift найден на Ready claim'е |
+| `AuthMountAccessorChanged` | Warning | Accessor auth-mount сменился (mount пересоздан); шаблонные политики отрендерены заново |
+| `ForeignReviewer` | Warning | SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки; объекты не тронуты, заявка `Failed` |
 | `DeletionStuck` | Warning | Reverse pipeline застрял на Vault |
 | `TargetCleanupBestEffort` | Warning | Cleanup в infra-кластере не удался (finalizer всё равно снимется) |
 | `VaultClaimDeleted` | Normal | Reverse pipeline завершён, finalizer снят |

@@ -8,6 +8,20 @@
 |---|---|
 | [vaultclaim.yaml](vaultclaim.yaml) | Один VaultClaim с шаблонизированной policy и N роли |
 
+## Короче: `identityPaths`
+
+Путь по namespace и имени SA без экранирования — плейсхолдеры, которые оператор сам превращает в шаблон Vault (`*` в `identityPaths` не принимается, путь точный):
+
+```yaml
+policies:
+  - name: ec8a00-namespace-scoped
+    identityPaths:
+      - path: secret/data/clusters/ec8a00/{serviceAccountNamespace}/{serviceAccountName}
+        capabilities: [read]
+```
+
+Ниже — прежняя форма с экранированием в `rules`; она по-прежнему работает байт в байт.
+
 ## Идея
 
 ```hcl
