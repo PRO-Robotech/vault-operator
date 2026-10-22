@@ -191,16 +191,50 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(srv.Creates).To(Equal(0))
 		})
 
-		It("does not adopt a same-named bucket of another login", func() {
+		It("fails closed when another login occupies the exact requested server name", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-foreignname")
-			srv.Seed(&pb.Bucket{Name: serverName("s3foreignname"), CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+			base := serverName("s3foreignname")
+			srv.Seed(&pb.Bucket{Name: base, CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
 			makeS3BucketClaim(ctx, "s3foreignname", "s3-cfg-foreignname")
 			reconcileN("s3foreignname", 2)
 
 			got := getS3("s3foreignname")
-			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
-			Expect(got.Status.BucketName).To(Equal(serverName("s3foreignname") + "-1"))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+			Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+			Expect(got.Status.BucketOwnership).To(BeEmpty())
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(got.Status.PendingCreate).NotTo(BeNil())
+			pending := got.Status.PendingCreate.DeepCopy()
+			Expect(s3Leaf(fakeSV, "s3foreignname", s3TestDest)).To(BeNil())
+			recon = &S3BucketClaimReconciler{
+				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
+				VaultFactory: recon.VaultFactory, Buckets: recon.Buckets,
+				Now: func() time.Time { return time.Now().Add(24 * time.Hour) },
+			}
+			res := reconcileN("s3foreignname", 3)
+			Expect(res.RequeueAfter).To(BeZero())
+			Expect(getS3("s3foreignname").Status.PendingCreate).To(Equal(pending))
 			Expect(srv.Creates).To(Equal(1))
+			Expect(purgeAndLook("s3foreignname", base+"-1")).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Get(base).GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Removes).To(BeZero())
+		})
+
+		It("creates its own exact name while another login has its distinct prefix", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-foreignprefix")
+			foreign := cmfake.Prefix("other") + "-" + bucketBaseName(cust, "s3foreignprefix")
+			srv.Seed(&pb.Bucket{Name: foreign, CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+			makeS3BucketClaim(ctx, "s3foreignprefix", "s3-cfg-foreignprefix")
+			reconcileN("s3foreignprefix", 2)
+
+			got := getS3("s3foreignprefix")
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3foreignprefix")))
+			Expect(s3Leaf(fakeSV, "s3foreignprefix", s3TestDest)["bucketName"]).To(Equal(got.Status.BucketName))
+			Expect(srv.Creates).To(Equal(1))
+			Expect(purgeAndLook("s3foreignprefix", got.Status.BucketName)).To(Equal(pb.Status_REMOVED))
+			Expect(srv.Get(foreign).GetStatus()).To(Equal(pb.Status_RUNNING))
 		})
 
 		It("survives a lost status patch after create without creating a second bucket", func() {
