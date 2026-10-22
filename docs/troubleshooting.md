@@ -292,7 +292,7 @@ kubectl get vaultsecretclaim <name> -n <ns> \
 
 | condition (False) | reason | причина | действие |
 |---|---|---|---|
-| `SourcesResolved` | `MissingSource` | для `copy` источник `source.path#source.key` отсутствует в Vault | завести источник (`vault kv put …`); до этого **ни один** элемент не пишется (all-or-nothing на pre-validate) |
+| `SourcesResolved` | `MissingSource` | для `copy` источник `source.path#source.key` отсутствует в Vault (`… not found`) либо Vault не дал его прочесть (`reading source … failed: <класс сбоя>`, полный текст — в логе оператора на V(1)) | завести источник (`vault kv put …`) или устранить сбой чтения; до этого **ни один** элемент не пишется (all-or-nothing на pre-validate) |
 | `ItemsApplied` | `DuplicateDestination` | два элемента пишут в один `destination.path + key` | поправить spec — пара path+key уникальна в пределах CR |
 | `ItemsApplied` | `ApplyFailed` | хотя бы один элемент не записался | смотреть `status.items[].message` (часто 403 — недостаточно прав в `vault-secret-operator-admin`) |
 

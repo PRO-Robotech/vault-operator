@@ -42,8 +42,8 @@
 | `kubernetes_host` | URL apiserver'а из kubeconfig-секрета |
 | `kubernetes_ca_cert` | CA-bundle из kubeconfig-секрета |
 | `token_reviewer_jwt` | JWT, выпущенный TokenRequest'ом для SA `vault-token-reviewer` |
-| `issuer` | `spec.auth.issuer` или `iss` claim из OIDC discovery |
-| `disable_iss_validation` | `true`, если `issuer` пуст и discovery провалился |
+| `issuer` | `spec.auth.issuer`, `iss` claim из OIDC discovery или, если discovery не ответил, `status.vault.issuer`, найденный на том же API server (`status.vault.issuerHost`) |
+| `disable_iss_validation` | `true`, если `issuer` пуст, discovery провалился и сохранённого issuer этого API server нет |
 | `disable_local_ca_jwt` | Всегда `true` — Vault работает вне infra-кластера |
 
 **Идемпотентность:** при `POST sys/auth` Vault отвечает 400, если mount уже существует — оператор игнорирует и идёт к `auth/{mount}/config`.

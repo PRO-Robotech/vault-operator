@@ -34,9 +34,12 @@ path "sys/policies/acl/*"        { capabilities = ["create", "read", "update", "
 # Чтение sys/mounts (для проверки наличия KV-mount + drift detection)
 path "sys/mounts"                { capabilities = ["read", "list"] }
 
-# Token-management (для renew-self)
+# Token-management: renew-self, lookup-self (проверка, жив ли токен после 403)
+# и revoke-self (отзыв заменённого или сброшенного токена — без него токен
+# живёт до конца TTL, если роль выдаёт токен без default-policy)
 path "auth/token/renew-self"     { capabilities = ["update"] }
 path "auth/token/lookup-self"    { capabilities = ["read"] }
+path "auth/token/revoke-self"    { capabilities = ["update"] }
 EOF
 ```
 

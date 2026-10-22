@@ -93,7 +93,7 @@ func (r *VaultClaimReconciler) deleteVaultObjects(ctx context.Context, claim *va
 	if err != nil {
 		return fmt.Errorf("build vault client: %w", err)
 	}
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		return fmt.Errorf("vault login: %w", err)
 	}
 

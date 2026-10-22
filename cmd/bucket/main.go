@@ -12,6 +12,7 @@ You may obtain a copy of the License at
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -23,20 +24,24 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 	"github.com/PRO-Robotech/vault-operator/internal/controller"
+	"github.com/PRO-Robotech/vault-operator/internal/operator"
 )
 
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+// tokenRevokeTimeout bounds the revoke of the Vault tokens at shutdown.
+const tokenRevokeTimeout = 10 * time.Second
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -59,6 +64,9 @@ func main() {
 	var concurrentReconciles int
 	var kubeQPS float64
 	var kubeBurst int
+	var cmQPS float64
+	var cmBurst int
+	var run operator.Flags
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -92,7 +100,11 @@ func main() {
 		"S3BucketClaims reconciled in parallel; one claim is never reconciled twice at once.")
 	flag.Float64Var(&kubeQPS, "kube-api-qps", 0, "Kubernetes API client QPS; 0 keeps the library default.")
 	flag.IntVar(&kubeBurst, "kube-api-burst", 0, "Kubernetes API client burst; 0 keeps the library default.")
-	opts := zap.Options{Development: true}
+	flag.Float64Var(&cmQPS, "cloud-manager-qps", cloudmanager.DefaultQPS,
+		"Calls per second to cloud-manager; a negative value disables the limit.")
+	flag.IntVar(&cmBurst, "cloud-manager-burst", cloudmanager.DefaultBurst, "Burst of the cloud-manager call limit.")
+	run.Bind(flag.CommandLine)
+	opts := operator.LogOptions()
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -131,14 +143,16 @@ func main() {
 	if kubeBurst > 0 {
 		restCfg.Burst = kubeBurst
 	}
-	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "bucket-operator.in-cloud.io",
 		PprofBindAddress:       pprofAddr,
-	})
+	}
+	run.Apply(&mgrOpts)
+	mgr, err := ctrl.NewManager(restCfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -149,17 +163,25 @@ func main() {
 		Keepalive:    cmKeepalive,
 		FindByBucket: cmFindByBucket,
 		FindRetries:  cmFindRetries,
+		QPS:          cmQPS,
+		Burst:        cmBurst,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create cloud-manager client", "addr", cloudManagerAddr)
 		os.Exit(1)
 	}
 
+	// One client cache for both controllers: one Vault token per VaultConfig.
+	vaultClients := &controller.DefaultVaultClientFactory{Options: run.VaultOptions(concurrentReconciles)}
+	progress := run.NewWatchdog()
+	rt := run.Runtime(progress)
+
 	if err := (&controller.S3BucketClaimReconciler{
 		Client:                  mgr.GetClient(),
 		Scheme:                  mgr.GetScheme(),
 		Recorder:                mgr.GetEventRecorderFor("s3bucketclaim-controller"),
-		VaultFactory:            &controller.DefaultSecretVaultClientFactory{},
+		VaultFactory:            &controller.DefaultSecretVaultClientFactory{Shared: vaultClients},
+		Runtime:                 rt,
 		Buckets:                 buckets,
 		DefaultConfigurationID:  defaultS3ConfigurationID,
 		MaxConcurrentReconciles: concurrentReconciles,
@@ -173,24 +195,31 @@ func main() {
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
 		Recorder:         mgr.GetEventRecorderFor("vaultconfig-controller"),
-		VaultFactory:     &controller.DefaultVaultClientFactory{},
+		VaultFactory:     vaultClients,
 		VaultConfigOwner: vaultv1alpha1.OwnerBucketOperator,
+		Runtime:          rt,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultConfig")
 		os.Exit(1)
 	}
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+	if err := operator.AddProbes(mgr, progress); err != nil {
+		setupLog.Error(err, "unable to set up probes")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+	err = controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindS3BucketClaim)
+	if err != nil {
+		setupLog.Error(err, "unable to register the claim inventory metrics")
 		os.Exit(1)
 	}
 
 	setupLog.Info("starting bucket-operator", "cloud-manager-addr", cloudManagerAddr)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	err = mgr.Start(ctrl.SetupSignalHandler())
+	// The controllers have stopped: give the Vault tokens back.
+	revokeCtx, cancel := context.WithTimeout(context.Background(), tokenRevokeTimeout)
+	vaultClients.RevokeAll(revokeCtx)
+	cancel()
+	if err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

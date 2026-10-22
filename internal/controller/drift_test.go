@@ -46,13 +46,10 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 			// some unrelated mounts to prove we ignore them
 			"kubernetes-other/": {Type: "kubernetes"},
 		},
-		ListPoliciesResp: []string{
-			"ec8a00-vmauth-reader",
-			"ec8a00-argocd-reader",
-			"unrelated-policy", // a user-managed policy we don't own
-		},
-		ListRolesResp: []string{"vmauth-reader", "argocd-reader"},
-		AuthConfigs:   reviewerSet(),
+		// A user-managed policy we don't own sits next to ours.
+		WrittenPolicies: policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader", "unrelated-policy"),
+		WrittenRoles:    roleBodies("vmauth-reader", "argocd-reader"),
+		AuthConfigs:     reviewerSet(),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -62,6 +59,26 @@ func TestDetectDrift_NoDrift(t *testing.T) {
 	if report.Found() {
 		t.Errorf("expected no drift, got %+v", report)
 	}
+}
+
+// policyBodies is the fake's Vault holding these policies.
+func policyBodies(names ...string) map[string]string {
+	out := make(map[string]string, len(names))
+	for _, n := range names {
+		out[n] = `path "*" { capabilities = ["read"] }`
+	}
+	return out
+}
+
+// roleBodies is the fake's Vault holding these roles, each with the body the
+// apply step writes for driftFixtureClaim's role spec (a name and nothing
+// else): content drift runs for every claim and must find nothing here.
+func roleBodies(names ...string) map[string]vault.KubernetesRole {
+	out := make(map[string]vault.KubernetesRole, len(names))
+	for _, n := range names {
+		out[n] = roleBody(vaultv1alpha1.RoleSpec{Name: n})
+	}
+	return out
 }
 
 // reviewerSet returns the fixture mount's auth config with a reviewer set.
@@ -75,8 +92,8 @@ func TestDetectDrift_ReviewerJWTUnset(t *testing.T) {
 	// Left behind by a config write without token_reviewer_jwt.
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
-		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:      []string{"vmauth-reader", "argocd-reader"},
+		WrittenPolicies:    policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		WrittenRoles:       roleBodies("vmauth-reader", "argocd-reader"),
 		AuthConfigs: map[string]vault.KubernetesAuthConfig{
 			"kubernetes-ec8a00": {KubernetesHost: "https://infra:6443"},
 		},
@@ -97,8 +114,8 @@ func TestDetectDrift_ReviewerJWTUnset(t *testing.T) {
 func TestDetectDrift_MountMissingSkipsAuthConfigRead(t *testing.T) {
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{},
-		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:      []string{"vmauth-reader", "argocd-reader"},
+		WrittenPolicies:    policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		WrittenRoles:       roleBodies("vmauth-reader", "argocd-reader"),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -129,8 +146,8 @@ func TestDetectDrift_AuthMountMissing(t *testing.T) {
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{
 			"kubernetes-other/": {Type: "kubernetes"},
 		},
-		ListPoliciesResp: []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:    []string{"vmauth-reader", "argocd-reader"},
+		WrittenPolicies: policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		WrittenRoles:    roleBodies("vmauth-reader", "argocd-reader"),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -145,11 +162,9 @@ func TestDetectDrift_AuthMountMissing(t *testing.T) {
 func TestDetectDrift_PolicyMissing(t *testing.T) {
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
-		ListPoliciesResp: []string{
-			"ec8a00-vmauth-reader",
-			// "ec8a00-argocd-reader" missing
-		},
-		ListRolesResp: []string{"vmauth-reader", "argocd-reader"},
+		// "ec8a00-argocd-reader" missing
+		WrittenPolicies: policyBodies("ec8a00-vmauth-reader"),
+		WrittenRoles:    roleBodies("vmauth-reader", "argocd-reader"),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -167,8 +182,9 @@ var ownDriftMount = vault.AuthMountInfo{Type: "kubernetes", Description: "vault-
 func TestDetectDrift_RoleExtra(t *testing.T) {
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": ownDriftMount},
-		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:      []string{"vmauth-reader", "argocd-reader", "rogue-role"},
+		WrittenPolicies:    policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		// Exclusive on the claim's own mount: the role listing is read.
+		ListRolesResp: []string{"vmauth-reader", "argocd-reader", "rogue-role"},
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -185,8 +201,8 @@ func TestDetectDrift_RoleExtra(t *testing.T) {
 func TestDetectDrift_RoleOnForeignMountIsNotExtra(t *testing.T) {
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes", Description: "someone else"}},
-		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:      []string{"vmauth-reader", "argocd-reader", "rogue-role"},
+		WrittenPolicies:    policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		WrittenRoles:       roleBodies("vmauth-reader", "argocd-reader", "rogue-role"),
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())
@@ -201,8 +217,8 @@ func TestDetectDrift_RoleOnForeignMountIsNotExtra(t *testing.T) {
 func TestDetectDrift_RoleMissing(t *testing.T) {
 	fake := &fakeVaultClient{
 		ListAuthMountsResp: map[string]vault.AuthMountInfo{"kubernetes-ec8a00/": {Type: "kubernetes"}},
-		ListPoliciesResp:   []string{"ec8a00-vmauth-reader", "ec8a00-argocd-reader"},
-		ListRolesResp:      []string{"vmauth-reader"}, // argocd-reader missing
+		WrittenPolicies:    policyBodies("ec8a00-vmauth-reader", "ec8a00-argocd-reader"),
+		WrittenRoles:       roleBodies("vmauth-reader"), // argocd-reader missing
 	}
 	r := &VaultClaimReconciler{}
 	report, err := r.detectDrift(context.Background(), fake, driftFixtureClaim())

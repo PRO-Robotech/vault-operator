@@ -160,6 +160,7 @@ path "secret/data/clusters/+/backup/s3"     { capabilities = ["create", "update"
 path "secret/metadata/clusters/+/backup/s3" { capabilities = ["read", "delete"] }
 path "auth/token/renew-self"                { capabilities = ["update"] }
 path "auth/token/lookup-self"               { capabilities = ["read"] }
+path "auth/token/revoke-self"               { capabilities = ["update"] }
 ```
 
 Что НЕ выдаётся: `sys/*`, `auth/+/role/*` (только vault-operator), запись вне листа `backup/s3` (только vault-secret-operator).

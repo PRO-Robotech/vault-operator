@@ -69,6 +69,13 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+# make test runs without -race. These packages hold state shared between
+# reconcile workers (the Vault token, the target-cluster client cache) and need
+# no envtest, so the race detector runs on them on every change.
+.PHONY: test-race
+test-race: ## Run the race detector on the packages with state shared between goroutines.
+	go test -race -count=1 ./internal/vault/... ./internal/target/... ./internal/health/...
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:
@@ -103,6 +110,12 @@ test-e2e-pipeline: manifests generate fmt vet envtest vault ## Run pipeline e2e 
 	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 		go test -tags=e2e ./test/e2e_pipeline/... -v -count=1 -timeout 15m
+
+.PHONY: test-load
+test-load: manifests generate fmt vet envtest vault ## Measure 1000 guest claims under a manager (envtest + `vault server -dev` $(VAULT_VERSION)); LOAD_WINDOW sets the steady window (default 10m).
+	PATH="$(LOCALBIN):$$PATH" E2E_VAULT_VERSION=$(VAULT_VERSION) \
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+		go test -tags=e2e,load ./test/e2e_pipeline/... -run TestLoadThousandClaimsE2E -v -count=1 -timeout 30m
 
 .PHONY: test-e2e-secret-pipeline
 test-e2e-secret-pipeline: manifests generate fmt vet envtest vault ## Run VaultSecretClaim e2e only (envtest k8s + `vault server -dev` $(VAULT_VERSION)).

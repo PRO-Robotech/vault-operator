@@ -217,7 +217,7 @@ func TestContentDriftFindsTamperedRole(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, liveObjects{}, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedRoles) != 1 {
@@ -244,7 +244,7 @@ func TestContentDriftFindsRewrittenPolicy(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, liveObjects{}, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 1 {
@@ -268,7 +268,7 @@ func TestContentDriftIgnoresFormatting(t *testing.T) {
 	}
 
 	var report DriftReport
-	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, ""); err != nil {
+	if err := transitReconciler().detectContentDrift(context.Background(), fake, claim, &report, liveObjects{}, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(report.ChangedPolicies) != 0 {

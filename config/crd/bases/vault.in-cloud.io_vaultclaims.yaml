@@ -561,6 +561,17 @@ spec:
                     type: string
                   configName:
                     type: string
+                  issuer:
+                    description: |-
+                      Issuer is the service account issuer last discovered in the target
+                      cluster. A pass whose discovery fails configures the mount with it, but
+                      only while the kubeconfig still points at IssuerHost.
+                    type: string
+                  issuerHost:
+                    description: |-
+                      IssuerHost is the target API server Issuer was discovered on. A pass
+                      that finds another host and cannot discover drops Issuer.
+                    type: string
                   lastDriftCheckAt:
                     description: |-
                       LastDriftCheckAt is the timestamp of the most recent drift detection

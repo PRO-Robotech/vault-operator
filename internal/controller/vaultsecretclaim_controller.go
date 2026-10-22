@@ -23,8 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -53,6 +53,9 @@ type VaultSecretClaimReconciler struct {
 
 	// MaxConcurrentReconciles bounds parallel claims (0 → 1).
 	MaxConcurrentReconciles int
+
+	// Runtime carries the process-wide reconcile settings.
+	Runtime Runtime
 }
 
 func (r *VaultSecretClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -104,18 +107,22 @@ func (r *VaultSecretClaimReconciler) reconcile(ctx context.Context, claim *vault
 	defMount := cfg.Spec.Storage.KvMountPath
 
 	if err := validateUniqueDestinations(claim.Spec.SecretList); err != nil {
+		msg := statusText(err)
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionItemsApplied, metav1.ConditionFalse, claim.Generation,
-			"DuplicateDestination", err.Error())
-		r.markFailed(claim, "DuplicateDestination", err.Error())
-		r.event(claim, "DuplicateDestination", err.Error())
+			"DuplicateDestination", msg)
+		r.markFailed(claim, "DuplicateDestination", msg)
+		r.event(claim, "DuplicateDestination", msg)
+		// A spec error: only an edit of the claim clears it, and an edit
+		// starts a pass at once.
 		return ctrl.Result{}
 	}
 
 	if err := validateCopySources(ctx, vc, defMount, claim.Spec.SecretList); err != nil {
+		msg := statusText(err)
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionSourcesResolved, metav1.ConditionFalse, claim.Generation,
-			"MissingSource", err.Error())
-		r.markFailed(claim, "MissingSource", err.Error())
-		r.event(claim, "MissingSource", err.Error())
+			"MissingSource", msg)
+		r.markFailed(claim, "MissingSource", msg)
+		r.event(claim, "MissingSource", msg)
 		return ctrl.Result{RequeueAfter: secretRequeueApplyFailed}
 	}
 
@@ -164,18 +171,20 @@ func (r *VaultSecretClaimReconciler) resolveAndLogin(ctx context.Context, claim 
 	}
 	vc, err := r.VaultFactory.For(ctx, r.Client, cfg)
 	if err != nil {
+		log.FromContext(ctx).V(1).Info("building the Vault client failed", "err", err.Error())
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			"FactoryError", err.Error())
+			"FactoryError", "building the Vault client failed: "+failureText(err))
 		return nil, nil, ctrl.Result{RequeueAfter: secretRequeueLoginTransient}, false
 	}
 
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
+		log.FromContext(ctx).V(1).Info("Vault login failed", "err", err.Error())
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
 		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			reason, err.Error())
+			reason, "Vault login failed: "+failureText(err))
 		return nil, nil, ctrl.Result{RequeueAfter: secretRequeueLoginTransient}, false
 	}
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionTrue, claim.Generation,
@@ -210,14 +219,15 @@ func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVa
 		case vaultv1alpha1.SecretTypeGenerate:
 			newHash, changed, err = applyGenerateItem(ctx, vc, defMount, claim.Spec.SecretsPrefix, item, p.SourceHash)
 		default:
-			err = fmt.Errorf("item %q: unknown type %q", item.Name, item.Type)
+			err = statusErrorf("item %q: unknown type %q", item.Name, item.Type)
 		}
 
 		st := vaultv1alpha1.SecretItemStatus{Name: item.Name}
 		switch {
 		case err != nil:
+			log.FromContext(ctx).V(1).Info("applying an item failed", "item", item.Name, "err", err.Error())
 			st.State = vaultv1alpha1.ItemStateFailed
-			st.Message = err.Error()
+			st.Message = statusText(err)
 			if item.Type == vaultv1alpha1.SecretTypeGenerate {
 				st.SourceHash = p.SourceHash
 			}
@@ -225,7 +235,7 @@ func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVa
 			// What was written before stays journaled until this item succeeds.
 			st.Destination = p.Destination
 			allOK = false
-			r.event(claim, "ItemApplyFailed", fmt.Sprintf("item %q: %v", item.Name, err))
+			r.event(claim, "ItemApplyFailed", fmt.Sprintf("item %q: %s", item.Name, statusText(err)))
 		default:
 			st.State = vaultv1alpha1.ItemStateApplied
 			st.SourceHash = newHash
@@ -247,7 +257,8 @@ func (r *VaultSecretClaimReconciler) applyItems(ctx context.Context, vc SecretVa
 	left, err := r.removeOrphans(ctx, vc, claim, orphans)
 	claim.Status.Orphans = left
 	if err != nil {
-		r.event(claim, "OrphanRemovalFailed", fmt.Sprintf("removing keys of dropped items: %v", err))
+		log.FromContext(ctx).V(1).Info("removing keys of dropped items failed", "err", err.Error())
+		r.event(claim, "OrphanRemovalFailed", "removing keys of dropped items: "+statusText(err))
 		return false
 	}
 	return allOK
@@ -443,7 +454,8 @@ func (r *VaultSecretClaimReconciler) handleDeletion(ctx context.Context, claim *
 			return ctrl.Result{RequeueAfter: secretRequeueApplyFailed}, nil
 		}
 		if err := r.purge(ctx, vc, cfg.Spec.Storage.KvMountPath, claim); err != nil {
-			r.event(claim, "DeletionStuck", fmt.Sprintf("purge failed: %v", err))
+			log.FromContext(ctx).V(1).Info("purge failed", "err", err.Error())
+			r.event(claim, "DeletionStuck", "purge failed: "+statusText(err))
 			return ctrl.Result{RequeueAfter: secretRequeueApplyFailed}, nil
 		}
 	}
@@ -468,7 +480,7 @@ func (r *VaultSecretClaimReconciler) clientForDeletion(ctx context.Context, clai
 	if err != nil {
 		return nil, nil, false
 	}
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		return nil, nil, false
 	}
 	return vc, cfg, true
@@ -521,7 +533,7 @@ func validateUniqueDestinations(items []vaultv1alpha1.SecretListItem) error {
 		it := &items[i]
 		key := it.Destination.Mount + "|" + it.Destination.Path + "|" + it.Destination.Key
 		if other, ok := seen[key]; ok {
-			return fmt.Errorf("items %q and %q write the same destination %s#%s", other, it.Name, it.Destination.Path, it.Destination.Key)
+			return statusErrorf("items %q and %q write the same destination %s#%s", other, it.Name, it.Destination.Path, it.Destination.Key)
 		}
 		seen[key] = it.Name
 	}
@@ -563,13 +575,24 @@ func (r *VaultSecretClaimReconciler) now() time.Time {
 }
 
 func (r *VaultSecretClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := indexConfigRef(mgr, &vaultv1alpha1.VaultSecretClaim{}, secretClaimConfigRef); err != nil {
+		return fmt.Errorf("index VaultSecretClaims by VaultConfig: %w", err)
+	}
+	// Status and finalizer writes (every pass writes status when anything
+	// changed) do not wake the claim, nor does the informer resync: a pass
+	// that has to come back asks for it with RequeueAfter, and a Ready claim
+	// is re-applied only on a change of the claim, a reachability change of
+	// its VaultConfig, or at controller start (docs/VAULTSECRETCLAIM-SPEC.md
+	// §5: no periodic polling of values). Deletion bumps generation, so Purge
+	// still starts at once.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.VaultSecretClaim{}).
+		For(&vaultv1alpha1.VaultSecretClaim{}, builder.WithPredicates(claimChangedPredicate())).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findSecretClaimsForVaultConfig),
+			builder.WithPredicates(vaultConfigFanOutPredicate()),
 		).
-		WithOptions(controller.Options{MaxConcurrentReconciles: max(1, r.MaxConcurrentReconciles)}).
+		WithOptions(r.Runtime.controllerOptions(max(1, r.MaxConcurrentReconciles))).
 		Named("vaultsecretclaim").
-		Complete(r)
+		Complete(r.Runtime.wrap(r))
 }

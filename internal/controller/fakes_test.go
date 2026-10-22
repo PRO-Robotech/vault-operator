@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -95,8 +96,12 @@ type fakeVaultClient struct {
 	// tests use it to model a mount appearing between list and create.
 	OnEnableAuth func(f *fakeVaultClient)
 
+	LookupSelfErr error
+
 	SealCalls           int
 	LoginCalls          int
+	LookupSelfCalls     int
+	ReadAuthMountCalls  int
 	MountCalls          int
 	ClearCalls          int
 	EnableAuthCalls     int
@@ -124,7 +129,9 @@ func (f *fakeVaultClient) SealStatus(_ context.Context) (*vault.SealStatus, erro
 	return f.SealResp, nil
 }
 
-func (f *fakeVaultClient) Login(_ context.Context) error {
+// EnsureLoggedIn counts every call in LoginCalls: tests read it as "passes
+// that reached the login step".
+func (f *fakeVaultClient) EnsureLoggedIn(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.LoginCalls++
@@ -133,6 +140,25 @@ func (f *fakeVaultClient) Login(_ context.Context) error {
 	}
 	f.tokenString = "stub-token"
 	return nil
+}
+
+func (f *fakeVaultClient) LookupSelf(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.LookupSelfCalls++
+	return f.LookupSelfErr
+}
+
+// ReadAuthMount answers from ListAuthMountsResp, the fake's sys/auth.
+func (f *fakeVaultClient) ReadAuthMount(_ context.Context, mount string) (vault.AuthMountInfo, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadAuthMountCalls++
+	if f.ListAuthMountsErr != nil {
+		return vault.AuthMountInfo{}, false, f.ListAuthMountsErr
+	}
+	info, ok := f.ListAuthMountsResp[strings.Trim(mount, "/")+"/"]
+	return info, ok, nil
 }
 
 func (f *fakeVaultClient) SharedMountExists(_ context.Context, _ string) (bool, error) {

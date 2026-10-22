@@ -76,7 +76,7 @@ spec:
 | `items[].state` | `Applied`, `Pending`, `Failed` |
 | `items[].sourceHash` | Хеш входа (copy: `path+key+value`; generate: критерии) — детект изменений |
 | `items[].lastAppliedAt` | Время последней записи в Vault |
-| `items[].message` | Текст ошибки при `Failed` |
+| `items[].message` | Причина `Failed`: ошибка в spec элемента — её текстом (например, `generate.hash=bcrypt requires destination.hashedKey`), сбой Vault — классом сбоя без адресов и текста драйвера (`the remote endpoint is unreachable`); полный текст — в логе оператора на V(1) |
 
 > Сами **значения** секретов в `status` не попадают — только `sourceHash`. Сгенерированные пароли существуют только в Vault.
 
