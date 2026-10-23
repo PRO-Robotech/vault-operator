@@ -222,7 +222,7 @@ type VaultSecretClaimStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=vsc
+// +kubebuilder:resource:shortName=vscl
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
