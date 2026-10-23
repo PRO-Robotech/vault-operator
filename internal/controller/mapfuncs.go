@@ -83,8 +83,21 @@ func kubeconfigSecretPredicate() predicate.Predicate {
 	}
 	return predicate.Funcs{
 		CreateFunc:  func(e event.CreateEvent) bool { return matches(e.Object) },
-		UpdateFunc:  func(e event.UpdateEvent) bool { return matches(e.ObjectNew) },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return matches(e.ObjectNew) && secretMetadataChanged(e) },
 		DeleteFunc:  func(e event.DeleteEvent) bool { return matches(e.Object) },
 		GenericFunc: func(e event.GenericEvent) bool { return matches(e.Object) },
 	}
+}
+
+// Повтор metadata после relist/resync не означает смену содержимого Secret.
+// Если версии неизвестны, сохраняем событие, чтобы не потерять реальную ротацию.
+func secretMetadataChanged(e event.UpdateEvent) bool {
+	if e.ObjectNew == nil {
+		return false
+	}
+	if e.ObjectOld == nil {
+		return true
+	}
+	oldVersion, newVersion := e.ObjectOld.GetResourceVersion(), e.ObjectNew.GetResourceVersion()
+	return oldVersion == "" || newVersion == "" || oldVersion != newVersion
 }
