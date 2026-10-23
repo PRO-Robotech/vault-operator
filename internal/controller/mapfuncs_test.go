@@ -219,3 +219,36 @@ func equalSlices(a, b []string) bool {
 
 // _ keeps client.Object referenced in case the file is split later.
 var _ client.Object = (*vaultv1alpha1.VaultClaim)(nil)
+
+// Повтор одного resourceVersion не означает ротацию kubeconfig.
+func TestKubeconfigSecretMetadataReplay(t *testing.T) {
+	predicate := kubeconfigSecretPredicate()
+	metadata := func(rv string) client.Object {
+		return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "cluster-infra-kubeconfig", Namespace: "tenant", ResourceVersion: rv}}
+	}
+	for _, tc := range []struct {
+		name      string
+		old, next client.Object
+		want      bool
+	}{
+		{"same version", metadata("42"), metadata("42"), false},
+		{"rotated version", metadata("42"), metadata("43"), true},
+		{"missing previous object", nil, metadata("43"), true},
+		{"missing new object", metadata("42"), nil, false},
+		{"unknown previous version", metadata(""), metadata("43"), true},
+		{"unknown new version", metadata("42"), metadata(""), true},
+		{"both versions unknown", metadata(""), metadata(""), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := predicate.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.next}); got != tc.want {
+				t.Fatalf("Update = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	for _, rv := range []string{"42", ""} {
+		obj := metadata(rv)
+		if !predicate.Create(event.CreateEvent{Object: obj}) || !predicate.Delete(event.DeleteEvent{Object: obj}) || !predicate.Generic(event.GenericEvent{Object: obj}) {
+			t.Fatalf("lifecycle event lost for resourceVersion %q", rv)
+		}
+	}
+}
