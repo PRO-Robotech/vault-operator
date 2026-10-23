@@ -102,7 +102,7 @@ API group: `vault.in-cloud.io/v1alpha1`
 | Поле | Scope | Описание |
 |---|---|---|
 | Kind | Namespaced | `vault.in-cloud.io/v1alpha1` |
-| Short name | `vsc` | `kubectl get vsc` |
+| Short name | `vscl` | `kubectl get vscl` |
 | Subresources | `status` | |
 | Print columns | Phase, Cluster, Age | |
 | Контроллер | `vault-secret-operator` | отдельный процесс/SA/роль с write-правом |
