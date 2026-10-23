@@ -83,9 +83,11 @@ func TestClient_DisableAuthMethod_NotFoundIsOK(t *testing.T) {
 func TestClient_WriteKubernetesAuthConfig(t *testing.T) {
 	fv := newFakeVault(t)
 	var receivedBody KubernetesAuthConfig
+	var rawBody []byte
 	fv.override = func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/auth/kubernetes-ec8a00/config" {
 			b, _ := io.ReadAll(r.Body)
+			rawBody = b
 			_ = json.Unmarshal(b, &receivedBody)
 			w.WriteHeader(http.StatusNoContent)
 			return true
@@ -111,6 +113,11 @@ func TestClient_WriteKubernetesAuthConfig(t *testing.T) {
 	}
 	if !receivedBody.DisableLocalCAJWT {
 		t.Fatalf("expected disable_local_ca_jwt=true")
+	}
+	// Sent explicitly false: SA annotations never become alias metadata that a
+	// templated policy reads.
+	if !strings.Contains(string(rawBody), `"use_annotations_as_alias_metadata":false`) {
+		t.Fatalf("use_annotations_as_alias_metadata=false not sent: %s", rawBody)
 	}
 }
 
@@ -161,7 +168,7 @@ func TestClient_ListAuthMounts_DataKey(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{
 					"kubernetes-mgmt/":   map[string]any{"type": "kubernetes", "accessor": "auth_k8s_mgmt"},
-					"kubernetes-ec8a00/": map[string]any{"type": "kubernetes", "accessor": "auth_k8s_ec8a00"},
+					"kubernetes-ec8a00/": map[string]any{"type": "kubernetes", "accessor": "auth_k8s_ec8a00", "description": "vault-operator: per-cluster auth for ns/ec8a00"},
 				},
 			})
 			return true
@@ -178,6 +185,11 @@ func TestClient_ListAuthMounts_DataKey(t *testing.T) {
 	}
 	if mounts["kubernetes-ec8a00/"].Accessor != "auth_k8s_ec8a00" {
 		t.Fatalf("unexpected accessor %q", mounts["kubernetes-ec8a00/"].Accessor)
+	}
+	// Ownership of a mount is judged by its description; dropping it would make
+	// every mount look foreign.
+	if got := mounts["kubernetes-ec8a00/"].Description; got != "vault-operator: per-cluster auth for ns/ec8a00" {
+		t.Fatalf("description = %q", got)
 	}
 }
 

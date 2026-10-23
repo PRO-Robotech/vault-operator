@@ -1,0 +1,22 @@
+name: Vulnerability check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  govulncheck:
+    name: Vulnerability check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Fails (exit 3) on a vulnerability reachable from the code.
+      - name: govulncheck
+        run: make vulncheck

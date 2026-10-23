@@ -16,13 +16,14 @@ import (
 )
 
 func TestGenerate_LengthAndAlphabet(t *testing.T) {
+	// 41 × log2(3) ≈ 65 bits: above the entropy floor.
 	const charset = "abc"
-	s, err := Generate(32, charset)
+	s, err := Generate(41, charset)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	if len([]rune(s)) != 32 {
-		t.Fatalf("length = %d, want 32", len([]rune(s)))
+	if len([]rune(s)) != 41 {
+		t.Fatalf("length = %d, want 41", len([]rune(s)))
 	}
 	for _, c := range s {
 		if !strings.ContainsRune(charset, c) {
@@ -95,5 +96,29 @@ func TestExpandCharset_LiteralTrailingDash(t *testing.T) {
 	got := string(expandCharset("ab-"))
 	if got != "ab-" {
 		t.Fatalf("expandCharset = %q, want %q", got, "ab-")
+	}
+}
+
+// The floor is on entropy, not on length: length × log2(distinct symbols).
+func TestGenerate_EntropyFloor(t *testing.T) {
+	cases := []struct {
+		length  int
+		charset string
+		ok      bool
+	}{
+		{8, "", false},                           // 8 × log2(62) ≈ 47.6 bits
+		{10, "", false},                          // ≈ 59.5
+		{11, "", true},                           // ≈ 65.5
+		{16, "", true},                           // ≈ 95.3: the production minimum
+		{63, "ab", false},                        // 63 bits
+		{64, "ab", true},                         // 64 bits
+		{40, "aaaaaaaaaaaaaaaaaaaaaaaab", false}, // dedups to 2 symbols: 40 bits
+		{64, "aaaaaaaaaaaaaaaaaaaaaaaab", true},
+	}
+	for _, c := range cases {
+		_, err := Generate(c.length, c.charset)
+		if (err == nil) != c.ok {
+			t.Errorf("Generate(%d, %q): err=%v, want ok=%v", c.length, c.charset, err, c.ok)
+		}
 	}
 }

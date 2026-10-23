@@ -15,7 +15,8 @@
 | [VaultClaim](concepts/vaultclaim.md) | Per-cluster ресурс — auth-mount + policies + roles |
 | [VaultSecretClaim](concepts/vaultsecretclaim.md) | Per-cluster наполнение Vault значениями (generate/copy), отдельный vault-secret-operator |
 | [VaultConfig](concepts/vaultconfig.md) | Cluster-scoped подключение к Vault, health-проба |
-| [Pipeline](concepts/pipeline.md) | 7-шаговый цикл reconcile + drift detection |
+| [Pipeline](concepts/pipeline.md) | Шаги reconcile + drift detection |
+| [Владение и гостевые заявки](concepts/ownership.md) | Журнал, владение mount, резерв, ограда правил, причины отказа |
 | [Auth & Policies](concepts/auth-and-policies.md) | Kubernetes Auth Method, ACL-policies, role bindings |
 | [Identity templating](concepts/identity-templating.md) | `{{ .AuthMountAccessor }}` для namespace-scoped доступа |
 
@@ -23,6 +24,7 @@
 
 | Документ | Описание |
 |----------|----------|
+| [МР-1: выпуск и приёмка](user-guide/release-mr1.md) | Изменения, совместимость, обновление, откат и границы доказательств #13/#18 |
 | [Установка](user-guide/installation.md) | Развёртывание оператора в management-кластере |
 | [Развёртывание vault-secret-operator](user-guide/deploying-vault-secret-operator.md) | Отдельный контроллер VaultSecretClaim + bootstrap Vault |
 | [Создание VaultClaim](user-guide/creating-vaultclaim.md) | Как описать клиент-кластер и его доступ |

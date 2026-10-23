@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -29,20 +30,34 @@ import (
 )
 
 // VaultManifests render the Namespace + Deployment + Service for a Vault
-// dev-mode pod inside the Kind cluster. The image (`hashicorp/vault:1.18`) is
-// pulled directly from Docker Hub.
+// dev-mode pod inside the Kind cluster. The image is the production Vault
+// version pinned by digest (defaultVaultImage), overridable with VAULT_IMAGE,
+// and is pulled directly from Docker Hub.
 //
 // Dev mode auto-initialises + unseals + creates `secret/` KV-v2 mount + sets
 // the root token to the fixed value below — exactly the bootstrap surface
 // the operator expects from a freshly-provisioned Vault.
 const (
-	vaultNamespace  = "vault-system"
-	vaultRootToken  = "dev-root-token"
-	vaultImage      = "hashicorp/vault:1.18"
-	vaultLocalPort  = "18200"
-	vaultPortInPod  = "8200"
-	vaultSvcAddress = "http://vault.vault-system.svc:8200"
+	vaultNamespace = "vault-system"
+	vaultRootToken = "dev-root-token"
+	// defaultVaultImage follows the production Vault version.
+	defaultVaultImage = "hashicorp/vault:1.20.1@sha256:50e1ecbe385742293c4a7e18c90f55d4dcc39724a05c6ab35933305fe7622cf3"
+	vaultLocalPort    = "18200"
+	vaultPortInPod    = "8200"
+	vaultSvcAddress   = "http://vault.vault-system.svc:8200"
 )
+
+// vaultImage is VAULT_IMAGE when set, otherwise defaultVaultImage.
+func vaultImage() string {
+	if img := os.Getenv("VAULT_IMAGE"); img != "" {
+		return img
+	}
+	return defaultVaultImage
+}
+
+func vaultManifests() string {
+	return strings.ReplaceAll(vaultManifestsYAML, "__VAULT_IMAGE__", vaultImage())
+}
 
 const vaultManifestsYAML = `
 apiVersion: v1
@@ -67,7 +82,7 @@ spec:
     spec:
       containers:
       - name: vault
-        image: hashicorp/vault:1.18
+        image: __VAULT_IMAGE__
         args:
         - server
         - -dev
@@ -106,7 +121,7 @@ spec:
 // Kind cluster via `kubectl apply -f -`. Idempotent.
 func ApplyVaultManifests() error {
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
-	cmd.Stdin = bytes.NewReader([]byte(vaultManifestsYAML))
+	cmd.Stdin = bytes.NewReader([]byte(vaultManifests()))
 	_, err := utils.Run(cmd)
 	return err
 }
@@ -114,7 +129,7 @@ func ApplyVaultManifests() error {
 // DeleteVaultManifests removes everything ApplyVaultManifests created.
 func DeleteVaultManifests() error {
 	cmd := exec.Command("kubectl", "delete", "-f", "-", "--ignore-not-found", "--wait=false")
-	cmd.Stdin = bytes.NewReader([]byte(vaultManifestsYAML))
+	cmd.Stdin = bytes.NewReader([]byte(vaultManifests()))
 	_, err := utils.Run(cmd)
 	return err
 }

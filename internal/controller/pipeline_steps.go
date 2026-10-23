@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/policyguard"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 	"github.com/PRO-Robotech/vault-operator/internal/vault"
 )
@@ -65,18 +66,18 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	vc, err := r.VaultFactory.For(ctx, r.Client, cfg)
 	if err != nil {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			"FactoryError", err.Error())
+			"FactoryError", "building the Vault client failed: "+failureText(err))
 		return Proceed, fmt.Errorf("build vault client: %w", err)
 	}
 	state.Vault = vc
 
-	if err := vc.Login(ctx); err != nil {
+	if err := vc.EnsureLoggedIn(ctx); err != nil {
 		reason := ReasonLoginFailed
 		if vault.IsCircuitOpen(err) {
 			reason = ReasonCircuitOpen
 		}
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionVaultReachable, metav1.ConditionFalse, claim.Generation,
-			reason, err.Error())
+			reason, "Vault login failed: "+failureText(err))
 		return Proceed, fmt.Errorf("vault login: %w", err)
 	}
 
@@ -88,10 +89,42 @@ func (r *VaultClaimReconciler) stepResolveConfigAndLogin(ctx context.Context, cl
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
+	// status.vault.authMountPath is not set here: it records a mount the pass
+	// accepted (see mountAccepted), and nothing is accepted yet.
 	claim.Status.Vault.ConfigName = cfg.Name
-	claim.Status.Vault.AuthMountPath = claim.Spec.Auth.MountPath
 	claim.Status.Vault.SecretsPrefix = claim.Spec.SecretsPrefix
 	return Proceed, nil
+}
+
+// stepCheckOwnership (Step 2) refuses a claim that asks for a name, mount or
+// prefix it may not have. It reads only Kubernetes state and runs before the
+// first Vault write of every pass.
+func (r *VaultClaimReconciler) stepCheckOwnership(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
+	view, err := r.buildOwnershipView(ctx, claim)
+	if err != nil {
+		return Proceed, err
+	}
+	state.View = view
+	if refusal := view.admit(claim, r.guardMode(claim) == policyguard.ModeEnforce); refusal != nil {
+		return r.refuse(claim, state, refusal.condition, refusal.reason, refusal.message)
+	}
+	for _, w := range view.referenceWarnings(claim) {
+		policyGuardViolations.WithLabelValues(string(policyguard.ModeAudit), ReasonPolicyReferenceForbidden).Inc()
+		if r.Recorder != nil {
+			r.Recorder.Event(claim, corev1.EventTypeWarning, ReasonPolicyReferenceForbidden, w+" (audit mode: applied)")
+		}
+	}
+	return Proceed, nil
+}
+
+// guardMode is the operator's --policy-guard for owner claims. A guest is
+// always judged in enforce mode: guest claims are new, so no existing claim
+// depends on leniency.
+func (r *VaultClaimReconciler) guardMode(claim *vaultv1alpha1.VaultClaim) policyguard.Mode {
+	if !claim.Spec.Auth.ManagesConfig() || r.PolicyGuard == policyguard.ModeEnforce {
+		return policyguard.ModeEnforce
+	}
+	return policyguard.ModeAudit
 }
 
 func (r *VaultClaimReconciler) stepWaitKubeconfig(ctx context.Context, claim *vaultv1alpha1.VaultClaim, state *pipelineState) (StepResult, error) {
@@ -123,15 +156,20 @@ func (r *VaultClaimReconciler) stepEnsureTargetSA(ctx context.Context, claim *va
 	cs, err := r.TargetManager.Get(ctx, state.Kubeconfig)
 	if err != nil {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionFalse, claim.Generation,
-			"TargetClientError", err.Error())
+			"TargetClientError", "building the target cluster client failed: "+failureText(err))
 		return Proceed, fmt.Errorf("build target client: %w", err)
 	}
 	state.Target = cs
 
 	if claim.Spec.Auth.TokenReviewer.ServiceAccount.AutoCreate {
 		if err := target.EnsureTokenReviewerSA(ctx, cs, claim); err != nil {
+			if target.IsForeignReviewer(err) {
+				ref := claim.Spec.Auth.TokenReviewer.ServiceAccount
+				return r.refuse(claim, state, vaultv1alpha1.ConditionTokenReviewerJWTFresh, ReasonForeignReviewer,
+					fmt.Sprintf("token reviewer %s/%s or its binding exists without this claim's labels; it is left as it is", ref.Namespace, ref.Name))
+			}
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionFalse, claim.Generation,
-				"TargetSAFailed", err.Error())
+				"TargetSAFailed", "ensuring the token reviewer ServiceAccount failed: "+failureText(err))
 			return Proceed, fmt.Errorf("ensure target SA: %w", err)
 		}
 	}
@@ -156,7 +194,7 @@ func (r *VaultClaimReconciler) stepIssueReviewerJWT(ctx context.Context, claim *
 	issued, err := target.IssueReviewerJWT(ctx, state.Target, claim, now)
 	if err != nil {
 		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionTokenReviewerJWTFresh, metav1.ConditionFalse, claim.Generation,
-			"TokenRequestFailed", err.Error())
+			"TokenRequestFailed", "requesting the reviewer token failed: "+failureText(err))
 		reviewerJWTRenewalCounter.WithLabelValues(ReviewerJWTResultFailed).Inc()
 		return Proceed, fmt.Errorf("issue reviewer JWT: %w", err)
 	}

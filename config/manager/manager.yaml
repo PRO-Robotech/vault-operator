@@ -96,4 +96,6 @@ spec:
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
-      terminationGracePeriodSeconds: 10
+      # Above --graceful-shutdown-timeout (25s): reconciles in flight finish
+      # and the Vault tokens are revoked before the kubelet kills the pod.
+      terminationGracePeriodSeconds: 40

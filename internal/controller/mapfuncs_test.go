@@ -61,11 +61,11 @@ func makeClaim(name, ns, configName, kubeconfigSecret string) *vaultv1alpha1.Vau
 
 func TestFindClaimsForVaultConfig_FanOut(t *testing.T) {
 	scheme := newMapfuncTestScheme(t)
-	cli := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(
+	cli := withClaimIndex(fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(
 		makeClaim("c1", "ns-a", "shared", ""),
 		makeClaim("c2", "ns-b", "shared", ""),
 		makeClaim("c3", "ns-a", "other", ""),
-	).Build()
+	)).Build()
 	r := &VaultClaimReconciler{Client: cli}
 
 	got := r.findClaimsForVaultConfig(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: "shared"}})
@@ -85,9 +85,9 @@ func TestFindClaimsForVaultConfig_WrongType(t *testing.T) {
 
 func TestFindClaimsForVaultConfig_NoMatches(t *testing.T) {
 	scheme := newMapfuncTestScheme(t)
-	cli := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(
+	cli := withClaimIndex(fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(
 		makeClaim("c1", "ns-a", "other", ""),
-	).Build()
+	)).Build()
 	r := &VaultClaimReconciler{Client: cli}
 
 	got := r.findClaimsForVaultConfig(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: "nobody-refs-this"}})
@@ -138,6 +138,28 @@ func TestFindClaimsForSecret_DifferentNamespaceIgnored(t *testing.T) {
 	}
 }
 
+// The Secret watch holds metadata only: the event object is a
+// PartialObjectMetadata, and the claim behind it is found all the same.
+func TestFindClaimsForSecret_MetadataObject(t *testing.T) {
+	scheme := newMapfuncTestScheme(t)
+	c := makeClaim("c1", "ns-a", "shared", "")
+	c.Spec.ClusterRef.Name = "c1"
+	cli := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(c).Build()
+	r := &VaultClaimReconciler{Client: cli}
+
+	meta := &metav1.PartialObjectMetadata{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Name: "c1-infra-kubeconfig", Namespace: "ns-a"},
+	}
+	if got := sortedRequestNames(r.findClaimsForSecret(context.Background(), meta)); !equalSlices(got, []string{"ns-a/c1"}) {
+		t.Errorf("got %v want %v", got, []string{"ns-a/c1"})
+	}
+	meta.Kind = "ConfigMap"
+	if got := r.findClaimsForSecret(context.Background(), meta); len(got) != 0 {
+		t.Errorf("a ConfigMap was mapped to claims: %v", got)
+	}
+}
+
 func TestFindClaimsForSecret_WrongType(t *testing.T) {
 	r := &VaultClaimReconciler{Client: fakeclient.NewClientBuilder().WithScheme(newMapfuncTestScheme(t)).Build()}
 	got := r.findClaimsForSecret(context.Background(), &vaultv1alpha1.VaultClaim{})
@@ -177,6 +199,12 @@ func TestKubeconfigSecretPredicate(t *testing.T) {
 	}
 }
 
+// withClaimIndex registers the index the fan-out reads, as SetupWithManager
+// does on the manager's cache.
+func withClaimIndex(b *fakeclient.ClientBuilder) *fakeclient.ClientBuilder {
+	return b.WithIndex(&vaultv1alpha1.VaultClaim{}, IndexVaultConfigRef, configRefIndex(vaultClaimConfigRef))
+}
+
 func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -191,3 +219,36 @@ func equalSlices(a, b []string) bool {
 
 // _ keeps client.Object referenced in case the file is split later.
 var _ client.Object = (*vaultv1alpha1.VaultClaim)(nil)
+
+// Повтор одного resourceVersion не означает ротацию kubeconfig.
+func TestKubeconfigSecretMetadataReplay(t *testing.T) {
+	predicate := kubeconfigSecretPredicate()
+	metadata := func(rv string) client.Object {
+		return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "cluster-infra-kubeconfig", Namespace: "tenant", ResourceVersion: rv}}
+	}
+	for _, tc := range []struct {
+		name      string
+		old, next client.Object
+		want      bool
+	}{
+		{"same version", metadata("42"), metadata("42"), false},
+		{"rotated version", metadata("42"), metadata("43"), true},
+		{"missing previous object", nil, metadata("43"), true},
+		{"missing new object", metadata("42"), nil, false},
+		{"unknown previous version", metadata(""), metadata("43"), true},
+		{"unknown new version", metadata("42"), metadata(""), true},
+		{"both versions unknown", metadata(""), metadata(""), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := predicate.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.next}); got != tc.want {
+				t.Fatalf("Update = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	for _, rv := range []string{"42", ""} {
+		obj := metadata(rv)
+		if !predicate.Create(event.CreateEvent{Object: obj}) || !predicate.Delete(event.DeleteEvent{Object: obj}) || !predicate.Generic(event.GenericEvent{Object: obj}) {
+			t.Fatalf("lifecycle event lost for resourceVersion %q", rv)
+		}
+	}
+}
