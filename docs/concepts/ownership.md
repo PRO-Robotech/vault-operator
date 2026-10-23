@@ -75,6 +75,6 @@
 
 ## Причины отказа
 
-Отказ ставит `Phase=Failed`, `Ready=False` с той же причиной и перепроверяется раз в 5 минут. Закрытый набор: `OwnershipConflict`, `PolicyGuardViolation`, `PolicyReferenceForbidden`, `MountConflict`, `KeyAdoptionRestricted`, `MountNotOwned` (только при удалении), `ForeignReviewer` (SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки). Каждая из них означает «прежний выпуск применил бы то, что новый отверг» — от этого зависит [откат](../user-guide/rollback.md).
+Отказ ставит `Phase=Failed`, `Ready=False` с той же причиной и перепроверяется раз в 5 минут, `RenderFailed` — при правке spec либо раз в 10 минут. Закрытый набор: `OwnershipConflict`, `PolicyGuardViolation`, `PolicyReferenceForbidden`, `MountConflict`, `KeyAdoptionRestricted`, `MountNotOwned` (только при удалении), `ForeignReviewer` (SA или ClusterRoleBinding ревьюера в infra-кластере без меток этой заявки), `RenderFailed` (правила политики не рендерятся, см. [identity-templating.md](identity-templating.md)). Каждая из них означает «прежний выпуск применил бы то, что новый отверг» — от этого зависит [откат](../user-guide/rollback.md). `RenderFailed` шире: под ней и ошибка разбора, которую прежний выпуск тоже не применит; шлюз отката считает её целиком.
 
 Тексты условий и событий берутся из таблицы и не содержат адресов Vault и целевых кластеров; исходная ошибка — в журнале оператора на уровне V(1).

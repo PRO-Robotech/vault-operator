@@ -68,7 +68,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 | reason | причина | действие |
 |---|---|---|
 | `AccessorLookupFailed` | не удалось получить accessor для `{{ .AuthMountAccessor }}` шаблона | сначала должен быть `AuthMountReady=True` — если auth method не создан, шаг 5 неуспешен |
-| `RenderFailed` | template error в HCL либо форма шаблона вне закрытого набора | проверить `spec.policies[].rules`: допустимы текст, `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` и строковые константы; сообщение называет отвергнутую конструкцию и её позицию |
+| `RenderFailed` | `rules` не рендерятся: ошибка разбора шаблона, форма вне закрытого набора, неэкранированный шаблон Vault, `rules` длиннее 16384 байт, отрендеренное тело больше 262144 байт. Это отказ, а не транзиентная ошибка: `Phase=Failed`, `Ready=False reason=RenderFailed`, `Degraded` не меняется, `StepRetrying` нет; повтор — при правке spec либо раз в 10 минут | исправить `spec.policies[].rules`: допустимы текст, `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` и строковые константы. Сообщение называет причину: отвергнутую конструкцию и её позицию (`range at policy:<строка>:<байт>`), длину и предел (`16385 bytes, the limit is 16384`), размер и предел (`at least … bytes, the limit is 262144`) |
 | `PutPolicyFailed` | Vault отверг policy (часто 400 — invalid HCL) | смотреть message — обычно невалидный HCL |
 
 ### RolesApplied=False

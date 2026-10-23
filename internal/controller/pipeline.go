@@ -195,6 +195,10 @@ func (r *VaultClaimReconciler) executePipeline(ctx context.Context, claim *vault
 			setPhase(claim, vaultv1alpha1.PhaseFailed)
 			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation,
 				state.RefusedReason, fmt.Sprintf("step %s refused the claim; see its condition", s.name))
+			if state.RefusedReason == ReasonRenderFailed {
+				r.renderRefusals.record(key, claim.Generation, r.now())
+				return ctrl.Result{RequeueAfter: RequeueClaimRenderRefused}, false
+			}
 			return ctrl.Result{RequeueAfter: RequeueClaimRefused}, false
 		}
 

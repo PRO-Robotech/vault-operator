@@ -86,6 +86,16 @@ func condReason(conds []metav1.Condition, condType string) string {
 	return ""
 }
 
+type createResponseBuckets struct {
+	cloudmanager.BucketAPI
+	response string
+}
+
+func (b createResponseBuckets) Create(ctx context.Context, in cloudmanager.CreateInput) (string, error) {
+	_, err := b.BucketAPI.Create(ctx, in)
+	return b.response, err
+}
+
 var _ = Describe("S3BucketClaim Controller", func() {
 	const cust = s3Cust
 	var (
@@ -181,16 +191,54 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(srv.Creates).To(Equal(0))
 		})
 
-		It("does not adopt a same-named bucket of another login", func() {
+		It("fails closed when another login occupies the exact requested server name", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-foreignname")
-			srv.Seed(&pb.Bucket{Name: serverName("s3foreignname"), CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+			base := serverName("s3foreignname")
+			srv.Seed(&pb.Bucket{Name: base, CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
 			makeS3BucketClaim(ctx, "s3foreignname", "s3-cfg-foreignname")
 			reconcileN("s3foreignname", 2)
 
 			got := getS3("s3foreignname")
-			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
-			Expect(got.Status.BucketName).To(Equal(serverName("s3foreignname") + "-1"))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+			Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+			Expect(got.Status.BucketOwnership).To(BeEmpty())
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(got.Status.PendingCreate).NotTo(BeNil())
+			pending := got.Status.PendingCreate.DeepCopy()
+			Expect(s3Leaf(fakeSV, "s3foreignname", s3TestDest)).To(BeNil())
+			recon = &S3BucketClaimReconciler{
+				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
+				VaultFactory: recon.VaultFactory, Buckets: recon.Buckets,
+				Now: func() time.Time { return time.Now().Add(24 * time.Hour) },
+			}
+			res := reconcileN("s3foreignname", 3)
+			Expect(res.RequeueAfter).To(BeZero())
+			Expect(getS3("s3foreignname").Status.PendingCreate).To(Equal(pending))
 			Expect(srv.Creates).To(Equal(1))
+			deleteClaim("s3foreignname")
+			reconcileN("s3foreignname", 3)
+			Expect(srv.Get(base + "-1").GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Get(base).GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Removes).To(BeZero())
+		})
+
+		It("creates its own exact name while another login has its distinct prefix", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-foreignprefix")
+			foreign := cmfake.Prefix("other") + "-" + bucketBaseName(cust, "s3foreignprefix")
+			srv.Seed(&pb.Bucket{Name: foreign, CustLogin: "other", Status: pb.Status_RUNNING, AccessKey: "AK-x", SecretKey: "SK-x"})
+			makeS3BucketClaim(ctx, "s3foreignprefix", "s3-cfg-foreignprefix")
+			reconcileN("s3foreignprefix", 2)
+
+			got := getS3("s3foreignprefix")
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3foreignprefix")))
+			Expect(s3Leaf(fakeSV, "s3foreignprefix", s3TestDest)["bucketName"]).To(Equal(got.Status.BucketName))
+			Expect(srv.Creates).To(Equal(1))
+			deleteClaim("s3foreignprefix")
+			reconcileN("s3foreignprefix", 3)
+			Expect(srv.Get(got.Status.BucketName).GetStatus()).To(Equal(pb.Status_REMOVED))
+			Expect(srv.Get(foreign).GetStatus()).To(Equal(pb.Status_RUNNING))
 		})
 
 		It("survives a lost status patch after create without creating a second bucket", func() {
@@ -396,6 +444,69 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(got.Status.BucketOwnership).NotTo(Equal(vaultv1alpha1.BucketOwnershipCreated))
 			Expect(s3Leaf(fakeSV, "s3sdr", s3TestDest)["secretKey"]).NotTo(Equal("SK-nbr"))
 			Expect(purgeAndLook("s3sdr", neighbour)).To(Equal(pb.Status_RUNNING))
+		})
+
+		It("rejects a create response that changed the numeric cluster suffix", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-number")
+			// cloud-manager увеличивает существующий числовой хвост:
+			// вместо нового суффикса s3number-11 становится s3number-12.
+			srv.Seed(&pb.Bucket{Name: serverName("s3number-11"), CustLogin: cust, Status: pb.Status_REMOVED})
+			makeS3BucketClaim(ctx, "s3number-11", "s3-cfg-number")
+			reconcileN("s3number-11", 2)
+
+			got := getS3("s3number-11")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(srv.Get(serverName("s3number-12"))).NotTo(BeNil())
+			Expect(got.Status.BucketName).To(BeEmpty())
+			Expect(got.Status.PendingCreate).NotTo(BeNil())
+			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
+			// Детерминированное несовпадение имени не создаёт новую сироту,
+			// даже когда срок незавершённого создания давно истёк.
+			recon = &S3BucketClaimReconciler{
+				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
+				VaultFactory: recon.VaultFactory, Buckets: recon.Buckets,
+				Now: func() time.Time { return time.Now().Add(24 * time.Hour) },
+			}
+			reconcileN("s3number-11", 3)
+			Expect(srv.Creates).To(Equal(1))
+			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))
+		})
+
+		DescribeTable("rejects a create response outside the persisted name baseline",
+			func(name string, baseTaken bool) {
+				makeHealthyVaultConfig(ctx, "s3-cfg-"+name)
+				response := serverName(name) + "-1"
+				if baseTaken {
+					response = serverName(name)
+					srv.Seed(&pb.Bucket{Name: response, CustLogin: cust, Status: pb.Status_REMOVED})
+				}
+				recon.Buckets = createResponseBuckets{BucketAPI: recon.Buckets, response: response}
+				makeS3BucketClaim(ctx, name, "s3-cfg-"+name)
+				reconcileN(name, 2)
+
+				Expect(srv.Creates).To(Equal(1))
+				Expect(getS3(name).Status.BucketName).To(BeEmpty())
+				Expect(s3Leaf(fakeSV, name, s3TestDest)).To(BeNil())
+				recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+				reconcileN(name, 3)
+				Expect(srv.Creates).To(Equal(1))
+			},
+			Entry("suffix without a taken base", "s3unexpected", false),
+			Entry("name already present before create", "s3existing", true),
+		)
+
+		It("accepts a create response with an appended suffix when the base was taken", func() {
+			makeHealthyVaultConfig(ctx, "s3-cfg-appended")
+			srv.Seed(&pb.Bucket{Name: serverName("s3appended"), CustLogin: cust, Status: pb.Status_REMOVED})
+			makeS3BucketClaim(ctx, "s3appended", "s3-cfg-appended")
+			reconcileN("s3appended", 2)
+
+			got := getS3("s3appended")
+			Expect(srv.Creates).To(Equal(1))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3appended") + "-1"))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(purgeAndLook("s3appended", serverName("s3appended")+"-1")).To(Equal(pb.Status_REMOVED))
 		})
 
 		It("records a suffixed bucket it cannot prove as its own as Adopted, so Purge does not remove it", func() {

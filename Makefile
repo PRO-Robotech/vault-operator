@@ -273,7 +273,7 @@ $(GOVULNCHECK): $(LOCALBIN)
 .PHONY: vault
 vault: $(VAULT)-$(VAULT_VERSION) ## Download the pinned vault binary (checksum-verified) into bin/.
 	@ln -sf "$$(realpath "$(VAULT)-$(VAULT_VERSION)")" "$(VAULT)"
-$(VAULT)-$(VAULT_VERSION): $(LOCALBIN)
+$(VAULT)-$(VAULT_VERSION): | $(LOCALBIN)
 	@set -e; os=$$(go env GOOS); arch=$$(go env GOARCH); \
 	case "$$os/$$arch" in \
 		linux/amd64) sum="$(VAULT_SHA256_linux_amd64)" ;; \

@@ -12,13 +12,11 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/policyguard"
@@ -246,14 +244,12 @@ func (r *VaultClaimReconciler) stepApplyPolicies(ctx context.Context, claim *vau
 		p := claim.Spec.Policies[i]
 		body, err := renderClaimPolicy(p, accessor)
 		if err != nil {
-			log.FromContext(ctx).V(1).Info("policy does not render", "policy", p.Name, "error", err.Error())
-			msg := fmt.Sprintf("policy %q: the rules do not render as a template", p.Name)
-			if errors.Is(err, errBareIdentity) {
-				msg = fmt.Sprintf("policy %q: %s", p.Name, errBareIdentity.Error())
-			}
-			setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionPoliciesApplied, metav1.ConditionFalse, claim.Generation,
-				"RenderFailed", msg)
-			return Proceed, fmt.Errorf("render policy %q: %w", p.Name, err)
+			// The outcome is decided by spec and the accessor: retrying it
+			// changes nothing, so the claim is refused. The render error is
+			// built from spec and the operator's limits (renderClaimPolicy)
+			// and names what the writer has to change.
+			return r.refuse(claim, state, vaultv1alpha1.ConditionPoliciesApplied, ReasonRenderFailed,
+				fmt.Sprintf("policy %q: %s", p.Name, err.Error()))
 		}
 		if v := policyguard.Check(body, scope); len(v) > 0 {
 			for _, x := range v {
