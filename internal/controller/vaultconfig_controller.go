@@ -383,6 +383,7 @@ func (r *VaultConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		b = b.WatchesMetadata(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findVaultConfigsForCABundle),
+			builder.WithPredicates(predicate.Funcs{UpdateFunc: secretMetadataChanged}),
 		)
 	}
 
