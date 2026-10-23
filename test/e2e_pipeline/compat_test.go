@@ -133,6 +133,12 @@ func legacyTree(t *testing.T) (crdDir, driver string) {
 	if ref == "" {
 		ref = legacyRef
 	}
+	return legacyDriverTree(t, ref, legacyDriverSource)
+}
+
+// legacyDriverTree собирает настоящий контроллер выбранного выпуска с узким драйвером.
+func legacyDriverTree(t *testing.T, ref, source string) (crdDir, driver string) {
+	t.Helper()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -160,7 +166,7 @@ func legacyTree(t *testing.T) (crdDir, driver string) {
 	if err := os.MkdirAll(mainDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mainDir, "main.go"), []byte(legacyDriverSource), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(mainDir, "main.go"), []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	driver = filepath.Join(dir, "legacy-driver")
