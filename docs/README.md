@@ -24,6 +24,7 @@
 
 | Документ | Описание |
 |----------|----------|
+| [МР-1: выпуск и приёмка](user-guide/release-mr1.md) | Изменения, совместимость, обновление, откат и границы доказательств #13/#18 |
 | [Установка](user-guide/installation.md) | Развёртывание оператора в management-кластере |
 | [Развёртывание vault-secret-operator](user-guide/deploying-vault-secret-operator.md) | Отдельный контроллер VaultSecretClaim + bootstrap Vault |
 | [Создание VaultClaim](user-guide/creating-vaultclaim.md) | Как описать клиент-кластер и его доступ |
