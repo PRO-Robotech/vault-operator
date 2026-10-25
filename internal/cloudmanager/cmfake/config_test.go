@@ -123,7 +123,9 @@ func TestLoadConfig_Refusals(t *testing.T) {
 			writeFile(t, dir, "b/empty", "\n")
 			return strings.Replace(y, filepath.Join(dir, "b/secretKey"), filepath.Join(dir, "b/empty"), 1)
 		}, "empty"},
-		"bad duration": {func(_ *testing.T, _, y string) string { return strings.Replace(y, "retryDelay: 3s", "retryDelay: soon", 1) }, "retryDelay"},
+		"bad duration": {func(_ *testing.T, _, y string) string {
+			return strings.Replace(y, "retryDelay: 3s", "retryDelay: soon", 1)
+		}, "retryDelay"},
 		"shared keys": {func(t *testing.T, dir, y string) string {
 			return strings.Replace(y, filepath.Join(dir, "b/accessKey"), filepath.Join(dir, "a/accessKey"), 1)
 		}, "access key"},

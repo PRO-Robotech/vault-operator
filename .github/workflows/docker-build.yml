@@ -125,6 +125,20 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
 
+      # Двойник cloud-manager — служба стенда kind, не прод-компонент.
+      - name: Build and push cmfake image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.cmfake
+          push: ${{ github.event_name == 'push' }}
+          provenance: false
+          platforms: linux/amd64
+          tags: |
+            ${{ github.event_name == 'push' && secrets.DOCKERHUB_USERNAME || 'local' }}/cmfake:${{ steps.sanitize.outputs.branch }}-${{ steps.short-sha.outputs.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
       - name: Record after test source
         run: |
           python3 -I - after <<'PY'

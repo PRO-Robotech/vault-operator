@@ -8,17 +8,19 @@ You may obtain a copy of the License at
     http://www.apache.org/licenses/LICENSE-2.0
 */
 
-// Package cmfake is an in-process cloud-manager gRPC server for tests. It
-// reproduces the server semantics the operator depends on, as read from the
-// cloud-manager sources:
+// Package cmfake — двойник cloud-manager в двух видах на одном контракте
+// gRPC: Server — внутри процесса теста (bufconn, ручки сбоев), Store со
+// Service и Run — самостоятельная служба cmd/cmfake для стенда (клиенты из
+// конфига, бакеты в S3-совместимом хранилище стенда). Оба повторяют
+// семантику настоящей службы, прочитанную в её исходниках:
 //
-//   - findAll: scopes are ANDed, values inside one scope are ORed (IN); no
-//     scope returns everything; REMOVED rows are returned too;
-//   - create: the real name is lower(prefix + "-" + requested); a taken name
-//     (in any status, REMOVED included) gets a "-N" suffix instead of an error;
-//   - removeBucket: always "success" with an optional text error: "Not found"
-//     (never existed), "Already removed" (status REMOVED); otherwise the bucket
-//     goes REMOVING and becomes REMOVED asynchronously.
+//   - findAll: области через И, значения внутри области через ИЛИ (IN); без
+//     области — всё; строки REMOVED возвращаются тоже;
+//   - create: настоящее имя — lower(префикс + "-" + запрошенное); занятое имя
+//     (в любом статусе, REMOVED тоже) получает суффикс «-N», а не отказ;
+//   - removeBucket: всегда «успех» с необязательным текстом ошибки: «Not
+//     found» (не было никогда), «Already removed» (статус REMOVED); иначе
+//     бакет уходит в REMOVING и становится REMOVED асинхронно.
 package cmfake
 
 import (
@@ -27,8 +29,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -166,20 +166,9 @@ func (s *Server) find(name string) *pb.Bucket {
 	return nil
 }
 
-var suffixRe = regexp.MustCompile(`-([0-9]+)$`)
-
-// uniqName mirrors getUniqBucketName: while the name exists in any status,
-// append "-1" or increment a trailing "-N".
+// uniqName mirrors getUniqBucketName (nextFreeName).
 func (s *Server) uniqName(name string) string {
-	for s.find(name) != nil {
-		if m := suffixRe.FindStringSubmatchIndex(name); m != nil {
-			n, _ := strconv.Atoi(name[m[2]:m[3]])
-			name = name[:m[0]] + "-" + strconv.Itoa(n+1)
-			continue
-		}
-		name += "-1"
-	}
-	return name
+	return nextFreeName(name, func(n string) bool { return s.find(n) != nil })
 }
 
 func (s *Server) Create(ctx context.Context, req *pb.CreateRequest) (*pb.CreateResponse, error) {
