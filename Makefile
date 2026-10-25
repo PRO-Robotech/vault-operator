@@ -3,6 +3,7 @@ IMG ?= controller:latest
 IMG_VAULTSECRET ?= vault-secret-operator:latest
 IMG_BUCKET ?= bucket-operator:latest
 IMG_CMFAKE ?= cmfake:latest
+IMG_S3_SWEEPER ?= s3-sweeper:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -157,6 +158,7 @@ build: manifests generate fmt vet ## Build manager binaries.
 	go build -o bin/vault-secret-manager cmd/vaultsecret/main.go
 	go build -o bin/bucket-operator cmd/bucket/main.go
 	go build -o bin/cmfake ./cmd/cmfake
+	go build -o bin/s3-sweeper ./cmd/s3-sweeper
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -180,6 +182,10 @@ docker-build-bucket: ## Build docker image with the bucket-operator.
 .PHONY: docker-build-cmfake
 docker-build-cmfake: ## Build docker image with the cloud-manager double for the kind stand.
 	$(CONTAINER_TOOL) build -f Dockerfile.cmfake -t ${IMG_CMFAKE} .
+
+.PHONY: docker-build-s3-sweeper
+docker-build-s3-sweeper: ## Build docker image with the CI bucket sweeper.
+	$(CONTAINER_TOOL) build -f Dockerfile.s3-sweeper -t ${IMG_S3_SWEEPER} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
