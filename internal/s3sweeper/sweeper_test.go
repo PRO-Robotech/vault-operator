@@ -602,8 +602,9 @@ func TestSweep_NothingFinishedRemovesNothingAndCountsRows(t *testing.T) {
 // ownerlessRecords — бакеты, названные журналом строками без владельца.
 func (h *harness) ownerlessRecords(t *testing.T) []string {
 	t.Helper()
-	var out []string
-	for _, r := range h.records(t, "row without owner, kept") {
+	recs := h.records(t, "row without owner, kept")
+	out := make([]string, 0, len(recs))
+	for _, r := range recs {
 		out = append(out, r["bucket"].(string))
 	}
 	return out
