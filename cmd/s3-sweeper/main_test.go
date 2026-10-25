@@ -64,9 +64,10 @@ func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
-// seed сеет бакет владельца login с ключами, которых в журнале быть не должно.
-func seed(srv *cmfake.Server, name string, st pb.Status) {
-	srv.Seed(&pb.Bucket{Name: name, CustLogin: login, Status: st,
+// seed сеет живой (RUNNING) бакет владельца login с ключами, которых в журнале
+// быть не должно; иного статуса пробам команды не нужно.
+func seed(srv *cmfake.Server, name string) {
+	srv.Seed(&pb.Bucket{Name: name, CustLogin: login, Status: pb.Status_RUNNING,
 		AccessKey: "AK-" + secretMark, SecretKey: "SK-" + secretMark})
 }
 
@@ -123,8 +124,8 @@ func TestRun_JobRemovesTheJobBucketsOverTheNetwork(t *testing.T) {
 	addr := serveTCP(t, srv)
 	own := cmfake.Prefix(login) + "-k8s-" + login + "-ci-4242"
 	other := cmfake.Prefix(login) + "-k8s-" + login + "-ci-4243"
-	seed(srv, own, pb.Status_RUNNING)
-	seed(srv, other, pb.Status_RUNNING)
+	seed(srv, own)
+	seed(srv, other)
 
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{"job", "--cloud-manager-addr", addr, "--login", login,
@@ -146,7 +147,7 @@ func TestRun_AddressFromEnvAndDryRun(t *testing.T) {
 	srv := cmfake.New()
 	addr := serveTCP(t, srv)
 	own := cmfake.Prefix(login) + "-k8s-" + login + "-ci-31"
-	seed(srv, own, pb.Status_RUNNING)
+	seed(srv, own)
 
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{"job", "--login", login, "--job-id", "31", "--dry-run"},
@@ -183,8 +184,8 @@ func TestRun_SweepAsksTheJobStatus(t *testing.T) {
 	addr := serveTCP(t, srv)
 	done := cmfake.Prefix(login) + "-k8s-" + login + "-ci-100"
 	alive := cmfake.Prefix(login) + "-k8s-" + login + "-ci-200"
-	seed(srv, done, pb.Status_RUNNING)
-	seed(srv, alive, pb.Status_RUNNING)
+	seed(srv, done)
+	seed(srv, alive)
 	gl := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("PRIVATE-TOKEN") != "tok-1" {
 			http.Error(w, "token", http.StatusUnauthorized)
