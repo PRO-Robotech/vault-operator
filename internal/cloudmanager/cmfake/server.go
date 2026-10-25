@@ -55,6 +55,10 @@ type Server struct {
 	// ScopesOR switches findAll to OR semantics between scopes, to prove the
 	// client does not trust the server-side search area.
 	ScopesOR bool
+	// IgnoreScopes отдаёт на findAll все строки, какие бы области ни пришли, —
+	// как служба, чья область поиска шире запрошенной: доказывает, что
+	// вызывающий судит владельца строки сам.
+	IgnoreScopes bool
 	// RemovalPolls is how many findAll calls observe REMOVING before REMOVED.
 	RemovalPolls int
 
@@ -257,7 +261,7 @@ func (s *Server) FindAll(ctx context.Context, req *pb.FindAllRequest) (*pb.FindA
 		if s.hidden[b.GetName()] > 0 {
 			continue
 		}
-		if s.matches(b, req.GetScope()) {
+		if s.IgnoreScopes || s.matches(b, req.GetScope()) {
 			resp.Bucket = append(resp.Bucket, cloneBucket(b))
 		}
 	}

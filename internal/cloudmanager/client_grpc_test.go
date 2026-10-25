@@ -404,3 +404,45 @@ func TestOptions_CreateMustFitTheReconcileDeadline(t *testing.T) {
 		t.Errorf("CreateDeadline = %s, want the configured 1m", got)
 	}
 }
+
+// ListByCustomer отдаёт строки логина в любом статусе, REMOVED тоже, и не
+// судит владельца: строку другого логина, которую вернула служба с широкой
+// областью поиска, вызывающий видит и решает о ней сам. Ключей в перечне нет.
+func TestClient_ListByCustomerReturnsEveryRowWithoutKeys(t *testing.T) {
+	srv := cmfake.New()
+	srv.Seed(&pb.Bucket{Name: "aa11-k8s-c1-x", CustLogin: "c1", Status: pb.Status_RUNNING,
+		AccessKey: "AK-x", SecretKey: "SK-x", ManagedBy: pb.S3BucketManagedBy_SYSTEM})
+	seedBucket(srv, "aa11-k8s-c1-y", "c1", pb.Status_REMOVED)
+	seedBucket(srv, "bb22-k8s-other-z", "other", pb.Status_RUNNING)
+	c := newTestClient(t, srv, Options{})
+
+	got, err := c.ListByCustomer(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("ListByCustomer: %v", err)
+	}
+	if strings.Join(names(got), ",") != "aa11-k8s-c1-x,aa11-k8s-c1-y" {
+		t.Fatalf("rows = %v, want both rows of c1 in server order", names(got))
+	}
+	if got[0].Status != StatusRunning || got[1].Status != StatusRemoved || got[0].CustLogin != "c1" {
+		t.Fatalf("rows = %+v, want statuses and owner as the server answered", got)
+	}
+	for _, b := range got {
+		if b.AccessKey != "" || b.SecretKey != "" {
+			t.Fatalf("row %q carries keys; a listing must not hand them out", b.Name)
+		}
+	}
+	if len(srv.LastScopes) != 1 || len(srv.LastScopes[0].GetByCustomer().GetLogin()) != 1 ||
+		srv.LastScopes[0].GetByCustomer().GetLogin()[0] != "c1" {
+		t.Fatalf("scopes = %v, want ByCustomer[c1] only", srv.LastScopes)
+	}
+
+	// Служба с областью шире запрошенной: чужая строка доходит до вызывающего.
+	srv.IgnoreScopes = true
+	got, err = c.ListByCustomer(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("ListByCustomer wide: %v", err)
+	}
+	if len(got) != 3 || got[2].CustLogin != "other" {
+		t.Fatalf("wide rows = %v, want the foreign row passed through unjudged", names(got))
+	}
+}

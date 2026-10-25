@@ -212,3 +212,33 @@ func TestEveryDockerfileIsBuiltByTheImageWorkflow(t *testing.T) {
 	}
 	t.Logf("Dockerfiles read %d, build steps %d", read, len(built))
 }
+
+// Уборщик бакетов CI (Dockerfile.s3-sweeper) публикуется под своим именем
+// образа той же схемой тега: задание CI берёт его по имени ветки и sha.
+func TestTheS3SweeperImageIsPublishedUnderItsName(t *testing.T) {
+	w, ok := readWorkflows(t)["docker-build.yml"]
+	if !ok {
+		t.Fatal("docker-build.yml not read")
+	}
+	steps := 0
+	for _, j := range w.Jobs {
+		for _, s := range j.Steps {
+			if !strings.HasPrefix(s.Uses, "docker/build-push-action@") {
+				continue
+			}
+			steps++
+			if file, _ := s.With["file"].(string); strings.TrimPrefix(file, "./") != "Dockerfile.s3-sweeper" {
+				continue
+			}
+			tags, _ := s.With["tags"].(string)
+			if !strings.Contains(tags, "/s3-sweeper:${{ steps.sanitize.outputs.branch }}-${{ steps.short-sha.outputs.sha }}") {
+				t.Fatalf("Dockerfile.s3-sweeper tags = %q, want <namespace>/s3-sweeper:<branch>-<sha8>", tags)
+			}
+			if push, _ := s.With["push"].(string); push != "${{ github.event_name == 'push' }}" {
+				t.Fatalf("Dockerfile.s3-sweeper push = %q, want pushes only on push events", push)
+			}
+			return
+		}
+	}
+	t.Fatalf("Dockerfile.s3-sweeper is not built by docker-build.yml (build steps read %d)", steps)
+}

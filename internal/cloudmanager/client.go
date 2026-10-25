@@ -531,3 +531,6 @@ func mapCreateError(e *pb.CreateError) error {
 		return &CreateRejectedError{Code: e.GetCode().String(), Message: e.GetMessage()}
 	}
 }
+
+// ListByCustomer — каркас красной пробы.
+func (c *Client) ListByCustomer(context.Context, string) ([]*Bucket, error) { return nil, nil }
