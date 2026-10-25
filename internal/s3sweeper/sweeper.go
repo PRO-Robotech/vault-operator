@@ -24,6 +24,11 @@ You may obtain a copy of the License at
 // бакеты (ai-test-*), их уборщик не трогает никогда. removeBucket не
 // принимает логина и вызывающего не проверяет, поэтому оба условия судятся
 // здесь, на каждой строке каждого перечня.
+//
+// Пустой cust_login — известная форма ответа службы — владельцем не
+// считается: строка нашей формы без владельца не снимается ни запуском, ни
+// планом, называется в журнале и делает исход красным (ErrOwnerless) — чья
+// она, решает человек, а не уборщик.
 package s3sweeper
 
 import (
@@ -149,8 +154,20 @@ func ciNameRe(login string) *regexp.Regexp {
 	return regexp.MustCompile(`^[0-9a-f]+-k8s-` + regexp.QuoteMeta(login) + `-ci-([1-9][0-9]*)(?:-[0-9]+)?$`)
 }
 
-// matcher судит строку перечня: она наша, только если владелец — этот логин
-// и имя целиком нашей формы. Возвращает номер задания из имени.
+// pick — суждение о строке перечня.
+type pick int
+
+const (
+	// skip — строка не наша либо не цель запуска.
+	skip pick = iota
+	// take — цель: владелец — этот логин, имя целиком нашей формы.
+	take
+	// ownerless — имя нашей формы при пустом владельце: не снимается, исход
+	// красный.
+	ownerless
+)
+
+// matcher судит строку перечня по форме имени логина.
 type matcher map[string]*regexp.Regexp
 
 func newMatcher(logins []string) matcher {
@@ -161,19 +178,58 @@ func newMatcher(logins []string) matcher {
 	return m
 }
 
-func (m matcher) job(login string, b *cloudmanager.Bucket) (uint64, bool) {
-	if b.CustLogin != login {
-		return 0, false
-	}
+// judge: строка наша (take), только если владелец — этот логин и имя целиком
+// нашей формы; та же форма с пустым владельцем — ownerless; прочее — skip.
+// Номер задания из имени возвращается при take и ownerless.
+func (m matcher) judge(login string, b *cloudmanager.Bucket) (uint64, pick) {
 	sub := m[login].FindStringSubmatch(b.Name)
 	if sub == nil {
-		return 0, false
+		return 0, skip
 	}
 	id, err := strconv.ParseUint(sub[1], 10, 64)
 	if err != nil {
-		return 0, false
+		return 0, skip
 	}
-	return id, true
+	switch b.CustLogin {
+	case login:
+		return id, take
+	case "":
+		return id, ownerless
+	default:
+		return 0, skip
+	}
+}
+
+// ownerlessSet копит строки без владельца; каждая называется журналом один
+// раз, сколько бы перечней её ни показали. Строка REMOVED не копится:
+// снимать в ней нечего.
+type ownerlessSet struct {
+	log  *slog.Logger
+	seen map[string]bool
+	rows []Leftover
+}
+
+func newOwnerlessSet(log *slog.Logger) *ownerlessSet {
+	return &ownerlessSet{log: log, seen: map[string]bool{}}
+}
+
+func (s *ownerlessSet) add(login string, b *cloudmanager.Bucket) {
+	if b.Status == cloudmanager.StatusRemoved || s.seen[b.Name] {
+		return
+	}
+	s.seen[b.Name] = true
+	s.rows = append(s.rows, Leftover{Login: login, Name: b.Name, Status: b.Status})
+	s.log.Error("row without owner, kept", "login", login, "bucket", b.Name, "status", b.Status)
+}
+
+// finish кладёт строки без владельца в итог и добавляет их отказ к отказу
+// запуска: ни один из двух не заслоняет другой.
+func (s *ownerlessSet) finish(rep Report, err error) (Report, error) {
+	rep.Ownerless = s.rows
+	if len(s.rows) > 0 {
+		err = errors.Join(err, fmt.Errorf("%w: %d row(s)", ErrOwnerless, len(s.rows)))
+	}
+	return rep, err
 }
 
 func (o *Options) validate() error {
@@ -218,59 +274,70 @@ func RunJob(ctx context.Context, cloud Cloud, jobID uint64, o Options) (Report, 
 	}
 	m := newMatcher(o.Logins)
 	o.Log.Info("job sweep started", "job", jobID, "logins", o.Logins, "dryRun", o.DryRun)
-	want := func(login string, b *cloudmanager.Bucket) bool {
-		id, ok := m.job(login, b)
-		return ok && id == jobID
+	want := func(login string, b *cloudmanager.Bucket) pick {
+		if id, p := m.judge(login, b); id == jobID {
+			return p
+		}
+		return skip
 	}
+	own := newOwnerlessSet(o.Log)
 	if o.DryRun {
-		return plan(ctx, cloud, o, want)
+		return own.finish(plan(ctx, cloud, o, want, own))
 	}
-	return drain(ctx, cloud, o, want)
+	return own.finish(drain(ctx, cloud, o, want, own))
 }
 
 // RunSweep снимает бакеты заданий CI, которые API CI называет завершёнными.
 // Задания идущие не трогаются; задания без статуса или со статусом вне
-// словаря не трогаются и делают исход красным (ErrJobUnclassified).
+// словаря не трогаются и делают исход красным (ErrJobUnclassified). Строки
+// без владельца копятся первым перечнем, их задания не спрашиваются.
 func RunSweep(ctx context.Context, cloud Cloud, jobs JobStatusSource, o Options) (Report, error) {
 	if err := o.validate(); err != nil {
 		return Report{}, err
 	}
 	m := newMatcher(o.Logins)
 	o.Log.Info("scheduled sweep started", "logins", o.Logins, "dryRun", o.DryRun)
+	own := newOwnerlessSet(o.Log)
 	live := map[uint64]bool{}
 	read := 0
 	for _, login := range o.Logins {
 		rows, err := cloud.ListByCustomer(ctx, login)
 		if err != nil {
 			o.Log.Error("listing failed", "login", login, "reason", reason(err))
-			return Report{}, fmt.Errorf("list buckets of %s: %s", login, reason(err))
+			return own.finish(Report{}, fmt.Errorf("list buckets of %s: %s", login, reason(err)))
 		}
 		read += len(rows)
 		for _, b := range rows {
-			if id, ok := m.job(login, b); ok && b.Status != cloudmanager.StatusRemoved {
+			switch id, p := m.judge(login, b); {
+			case p == ownerless:
+				own.add(login, b)
+			case p == take && b.Status != cloudmanager.StatusRemoved:
 				live[id] = true
 			}
 		}
 	}
 	finished, unclassified := classifyJobs(ctx, jobs, live, o.Log)
-	want := func(login string, b *cloudmanager.Bucket) bool {
-		id, ok := m.job(login, b)
-		return ok && finished[id]
+	want := func(login string, b *cloudmanager.Bucket) pick {
+		if id, p := m.judge(login, b); p == take && finished[id] {
+			return take
+		}
+		return skip
 	}
 	rep := Report{Rows: read}
 	var err error
 	switch {
 	case len(finished) == 0:
-		o.Log.Info("summary", "rows", read, "jobs", len(live), "finished", 0, "removed", 0)
+		o.Log.Info("summary", "rows", read, "jobs", len(live), "finished", 0, "removed", 0,
+			"ownerless", len(own.rows))
 	case o.DryRun:
-		rep, err = plan(ctx, cloud, o, want)
+		rep, err = plan(ctx, cloud, o, want, own)
 	default:
-		rep, err = drain(ctx, cloud, o, want)
+		rep, err = drain(ctx, cloud, o, want, own)
 	}
 	if err == nil && unclassified > 0 {
 		err = fmt.Errorf("%w: %d job(s)", ErrJobUnclassified, unclassified)
 	}
-	return rep, err
+	return own.finish(rep, err)
 }
 
 // classifyJobs спрашивает статус каждого задания один раз; возвращает
@@ -305,10 +372,10 @@ func classifyJobs(ctx context.Context, jobs JobStatusSource, live map[uint64]boo
 	return finished, unclassified
 }
 
-type wantFunc func(login string, b *cloudmanager.Bucket) bool
+type wantFunc func(login string, b *cloudmanager.Bucket) pick
 
-// plan печатает, что сделал бы запуск, одним перечнем.
-func plan(ctx context.Context, cloud Cloud, o Options, want wantFunc) (Report, error) {
+// plan печатает, что сделал бы запуск, одним перечнем, и ничего не снимает.
+func plan(ctx context.Context, cloud Cloud, o Options, want wantFunc, own *ownerlessSet) (Report, error) {
 	var rep Report
 	for _, login := range o.Logins {
 		rows, err := cloud.ListByCustomer(ctx, login)
@@ -318,13 +385,16 @@ func plan(ctx context.Context, cloud Cloud, o Options, want wantFunc) (Report, e
 		}
 		rep.Rows += len(rows)
 		for _, b := range rows {
-			if !want(login, b) {
-				continue
+			switch want(login, b) {
+			case take:
+				o.Log.Info("plan", "login", login, "bucket", b.Name, "status", b.Status, "action", actionOf(b.Status))
+			case ownerless:
+				own.add(login, b)
+			case skip:
 			}
-			o.Log.Info("plan", "login", login, "bucket", b.Name, "status", b.Status, "action", actionOf(b.Status))
 		}
 	}
-	o.Log.Info("summary", "dryRun", true, "rows", rep.Rows)
+	o.Log.Info("summary", "dryRun", true, "rows", rep.Rows, "ownerless", len(own.rows))
 	return rep, nil
 }
 
@@ -349,12 +419,12 @@ type pass struct {
 // drain снимает цели и ждёт REMOVED до срока. Цели выбираются заново
 // каждым перечнем: бакет задания, вышедший из CREATING, снимается следующим
 // проходом. Снятие уже ушедшего в REMOVING не повторяется.
-func drain(ctx context.Context, cloud Cloud, o Options, want wantFunc) (Report, error) {
+func drain(ctx context.Context, cloud Cloud, o Options, want wantFunc, own *ownerlessSet) (Report, error) {
 	var rep Report
 	accepted := map[string]bool{}
 	deadline := o.Clock.Now().Add(o.Timeout)
 	for first := true; ; first = false {
-		p, err := runPass(ctx, cloud, o, want, accepted, &rep)
+		p, err := runPass(ctx, cloud, o, want, own, accepted, &rep)
 		if first {
 			rep.Rows = p.rows
 		}
@@ -362,7 +432,8 @@ func drain(ctx context.Context, cloud Cloud, o Options, want wantFunc) (Report, 
 			return rep, err
 		}
 		if p.listErr == nil && len(p.pending) == 0 {
-			o.Log.Info("summary", "rows", rep.Rows, "removed", len(rep.Removed), "left", 0)
+			o.Log.Info("summary", "rows", rep.Rows, "removed", len(rep.Removed), "left", 0,
+				"ownerless", len(own.rows))
 			return rep, nil
 		}
 		if !o.Clock.Now().Before(deadline) {
@@ -370,7 +441,8 @@ func drain(ctx context.Context, cloud Cloud, o Options, want wantFunc) (Report, 
 			for _, l := range p.pending {
 				o.Log.Error("bucket left", "login", l.Login, "bucket", l.Name, "status", l.Status)
 			}
-			o.Log.Error("summary", "rows", rep.Rows, "removed", len(rep.Removed), "left", len(p.pending))
+			o.Log.Error("summary", "rows", rep.Rows, "removed", len(rep.Removed), "left", len(p.pending),
+				"ownerless", len(own.rows))
 			if p.listErr != nil {
 				return rep, fmt.Errorf("%w: listing failed: %s", ErrLeftovers, reason(p.listErr))
 			}
@@ -387,8 +459,8 @@ type target struct {
 	b     *cloudmanager.Bucket
 }
 
-func runPass(ctx context.Context, cloud Cloud, o Options, want wantFunc, accepted map[string]bool,
-	rep *Report) (pass, error) {
+func runPass(ctx context.Context, cloud Cloud, o Options, want wantFunc, own *ownerlessSet,
+	accepted map[string]bool, rep *Report) (pass, error) {
 	var p pass
 	var toRemove []target
 	for _, login := range o.Logins {
@@ -400,8 +472,13 @@ func runPass(ctx context.Context, cloud Cloud, o Options, want wantFunc, accepte
 		}
 		p.rows += len(rows)
 		for _, b := range rows {
-			if !want(login, b) {
+			switch want(login, b) {
+			case skip:
 				continue
+			case ownerless:
+				own.add(login, b)
+				continue
+			case take:
 			}
 			switch b.Status {
 			case cloudmanager.StatusRemoved:
