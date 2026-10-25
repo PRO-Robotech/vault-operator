@@ -99,13 +99,28 @@ func systemCreate(login, name string) cloudmanager.CreateInput {
 
 // Настоящий клиент оператора против поднятой службы: заказ, повторный заказ,
 // поиск своего и чужого, лимит, удаление, неизвестный логин и конфигурация.
+// Шаги идут по порядку на одной службе: каждый опирается на состояние,
+// оставленное предыдущими (лимит — на два бакета заказа, удаление — на
+// суффиксный бакет, повторный заказ после удаления — на освобождённое место).
 func TestIntegration_RealClientAgainstTheRunningService(t *testing.T) {
 	rs := startService(t)
 	c := newRealClient(t, rs.addr)
 	ctx := context.Background()
 	base := Prefix("tenant-a") + "-k8s-a-c1"
 
-	// Заказ.
+	name := checkCreate(ctx, t, rs, c, base)
+	second := checkRepeatCreate(ctx, t, c, base)
+	checkForeignTenant(ctx, t, c, name)
+	checkLimit(ctx, t, c)
+	checkRemove(ctx, t, rs, c, second)
+	checkUnknownLogin(ctx, t, c)
+	checkCreateCodes(ctx, t, c)
+}
+
+// checkCreate — заказ: имя по форме службы, клиент узнаёт в нём запрошенное,
+// поиск своего отдаёт ключи арендатора, бакет заведён на S3-сервере.
+func checkCreate(ctx context.Context, t *testing.T, rs *runningService, c *cloudmanager.Client, base string) string {
+	t.Helper()
 	name, err := c.Create(ctx, systemCreate("tenant-a", "k8s-a-c1"))
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -127,8 +142,13 @@ func TestIntegration_RealClientAgainstTheRunningService(t *testing.T) {
 	if !rs.s3.hasBucket(name) {
 		t.Fatal("bucket not provisioned on the S3 server")
 	}
+	return name
+}
 
-	// Повторный заказ — суффикс, оба видны поиском по запрошенному имени.
+// checkRepeatCreate — повторный заказ: суффикс, оба видны поиском по
+// запрошенному имени. Возвращает имя суффиксного бакета.
+func checkRepeatCreate(ctx context.Context, t *testing.T, c *cloudmanager.Client, base string) string {
+	t.Helper()
 	second, err := c.Create(ctx, systemCreate("tenant-a", "k8s-a-c1"))
 	if err != nil || second != base+"-1" {
 		t.Fatalf("repeat create = %q, %v; want %q", second, err, base+"-1")
@@ -137,22 +157,36 @@ func TestIntegration_RealClientAgainstTheRunningService(t *testing.T) {
 	if err != nil || len(found) != 2 || found[0].Name != base || found[1].Name != base+"-1" {
 		t.Fatalf("FindByRequested = %+v, %v", found, err)
 	}
+	return second
+}
 
-	// Арендатор B чужого бакета не получает: клиент видит чужого владельца.
+// checkForeignTenant — арендатор B чужого бакета не получает: клиент видит
+// чужого владельца.
+func checkForeignTenant(ctx context.Context, t *testing.T, c *cloudmanager.Client, name string) {
+	t.Helper()
 	if _, err := c.FindByBucket(ctx, "tenant-b", name); !errors.Is(err, cloudmanager.ErrForeignBucket) {
 		t.Fatalf("tenant-b find of tenant-a bucket: %v, want ErrForeignBucket", err)
 	}
 	if got, err := c.FindByRequested(ctx, "tenant-b", "k8s-a-c1", true); err != nil || len(got) != 0 {
 		t.Fatalf("tenant-b FindByRequested = %+v, %v; want none", got, err)
 	}
+}
 
-	// Лимит tenant-a — 2: третий заказ — тот же отказ, что у настоящей службы.
-	_, err = c.Create(ctx, systemCreate("tenant-a", "k8s-a-c2"))
+// checkLimit — лимит tenant-a — 2: третий заказ — тот же отказ, что у
+// настоящей службы.
+func checkLimit(ctx context.Context, t *testing.T, c *cloudmanager.Client) {
+	t.Helper()
+	_, err := c.Create(ctx, systemCreate("tenant-a", "k8s-a-c2"))
 	if !errors.Is(err, cloudmanager.ErrBucketLimitReached) {
 		t.Fatalf("over the limit: %v, want ErrBucketLimitReached", err)
 	}
+}
 
-	// Удаление: REMOVING → REMOVED, бакет снят с S3-сервера, повтор — «уже снят».
+// checkRemove — удаление: REMOVING → REMOVED, бакет снят с S3-сервера,
+// повтор — «уже снят», отсутствующий — «не найден», снятый бакет место
+// освободил.
+func checkRemove(ctx context.Context, t *testing.T, rs *runningService, c *cloudmanager.Client, second string) {
+	t.Helper()
 	if err := c.Remove(ctx, second); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
@@ -178,10 +212,14 @@ func TestIntegration_RealClientAgainstTheRunningService(t *testing.T) {
 	if _, err := c.Create(ctx, systemCreate("tenant-a", "k8s-a-c2")); err != nil {
 		t.Fatalf("create after removal: %v", err)
 	}
+}
 
-	// Неизвестный логин — ошибка gRPC с кодом INTERNAL, как у настоящей службы
-	// (поиск клиента идёт вне перехвата ошибок S3), а не ответ s3_error.
-	_, err = c.Create(ctx, systemCreate("nobody", "k8s-x"))
+// checkUnknownLogin — неизвестный логин — ошибка gRPC с кодом INTERNAL, как у
+// настоящей службы (поиск клиента идёт вне перехвата ошибок S3), а не ответ
+// s3_error.
+func checkUnknownLogin(ctx context.Context, t *testing.T, c *cloudmanager.Client) {
+	t.Helper()
+	_, err := c.Create(ctx, systemCreate("nobody", "k8s-x"))
 	if status.Code(errors.Unwrap(err)) != codes.Internal {
 		t.Fatalf("unknown login: %v, want gRPC INTERNAL", err)
 	}
@@ -191,8 +229,12 @@ func TestIntegration_RealClientAgainstTheRunningService(t *testing.T) {
 			t.Fatalf("unknown login mapped to %v", sentinel)
 		}
 	}
+}
 
-	// Неизвестная конфигурация и недопустимое имя — коды ответа create.
+// checkCreateCodes — неизвестная конфигурация и недопустимое имя — коды
+// ответа create.
+func checkCreateCodes(ctx context.Context, t *testing.T, c *cloudmanager.Client) {
+	t.Helper()
 	in := systemCreate("tenant-b", "k8s-b-c1")
 	in.ConfigurationID = "s3_v9"
 	if _, err := c.Create(ctx, in); !errors.Is(err, cloudmanager.ErrConfigurationNotFound) {
