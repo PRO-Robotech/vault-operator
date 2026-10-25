@@ -18,8 +18,9 @@ You may obtain a copy of the License at
 // которые API CI называет завершёнными. Адрес cloud-manager — флагом
 // --cloud-manager-addr либо переменной CLOUD_MANAGER_ADDR; токен API CI —
 // S3_SWEEPER_GITLAB_TOKEN (заголовок PRIVATE-TOKEN) либо CI_JOB_TOKEN
-// (JOB-TOKEN). Код выхода: 0 — целей не осталось; 1 — остаток, отказ службы
-// или неклассифицированное задание; 2 — неверный вызов.
+// (JOB-TOKEN). Код выхода: 0 — целей не осталось; 1 — остаток, отказ службы,
+// неклассифицированное задание или строка нашей формы без владельца;
+// 2 — неверный вызов.
 package main
 
 import (
