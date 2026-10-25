@@ -36,6 +36,7 @@
 | Документ | Описание |
 |----------|----------|
 | [API Reference](reference/api.md) | Полное описание полей VaultClaim, VaultSecretClaim и VaultConfig |
+| [cmfake](reference/cmfake.md) | Двойник cloud-manager службой для стенда kind: контракт, конфиг, отказы |
 
 ### Примеры
 
