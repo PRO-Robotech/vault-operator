@@ -90,7 +90,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
-	var errs []error
+	// Ёмкость — верхняя граница отказов: адрес S3, две длительности и по два
+	// файла ключей на арендатора.
+	errs := make([]error, 0, 3+2*len(fc.Clients))
 	cfg := &Config{
 		ListenAddress: orDefault(fc.ListenAddress, DefaultListenAddress),
 		S3: S3Config{
