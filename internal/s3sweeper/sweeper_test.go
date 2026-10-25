@@ -598,3 +598,137 @@ func TestSweep_NothingFinishedRemovesNothingAndCountsRows(t *testing.T) {
 	}
 	h.assertLogClean(t)
 }
+
+// ownerlessRecords — бакеты, названные журналом строками без владельца.
+func (h *harness) ownerlessRecords(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, r := range h.records(t, "row without owner, kept") {
+		out = append(out, r["bucket"].(string))
+	}
+	return out
+}
+
+// Пустой cust_login — не наш владелец: строка с именем задания не снимается
+// ни запуском, ни планом, исход красный (ErrOwnerless) и называет строку в
+// журнале и в итоге. Законный близнец — строка того же задания с нашим
+// владельцем — снимается (в плане — названа целью).
+func TestJob_OwnerlessRowIsKeptAndRed(t *testing.T) {
+	for _, dry := range []bool{false, true} {
+		h := newHarness(t)
+		ownerless := ci(prefA, loginA, "4242")
+		twin := ci(prefA, loginA, "4242-1")
+		h.srv.SeedOwnerless(&pb.Bucket{Name: ownerless, CustLogin: loginA, Status: pb.Status_RUNNING,
+			AccessKey: "AK-" + secretMark, SecretKey: "SK-" + secretMark})
+		h.seed(twin, loginA, pb.Status_RUNNING)
+		o := h.opts(loginA)
+		o.DryRun = dry
+
+		rep, err := RunJob(context.Background(), h.cloud, 4242, o)
+		if !errors.Is(err, ErrOwnerless) {
+			t.Fatalf("dry=%v: err = %v, want ErrOwnerless\nlog:\n%s", dry, err, h.log)
+		}
+		if rep.Rows != 2 {
+			t.Fatalf("dry=%v: rows = %d, want 2: the ownerless row must reach the sweeper", dry, rep.Rows)
+		}
+		if st := h.status(t, ownerless); st != pb.Status_RUNNING {
+			t.Errorf("dry=%v: ownerless %s: status %s, want RUNNING", dry, ownerless, st)
+		}
+		if got := h.ownerlessRecords(t); !slices.Equal(got, []string{ownerless}) {
+			t.Errorf("dry=%v: ownerless records = %v, want [%s]", dry, got, ownerless)
+		}
+		if len(rep.Ownerless) != 1 || rep.Ownerless[0].Name != ownerless {
+			t.Errorf("dry=%v: report ownerless = %v, want [%s]", dry, rep.Ownerless, ownerless)
+		}
+		wantRemoves, wantTwin := 1, pb.Status_REMOVED
+		if dry {
+			wantRemoves, wantTwin = 0, pb.Status_RUNNING
+		}
+		if got := h.removes(); got != wantRemoves {
+			t.Errorf("dry=%v: removeBucket calls = %d, want %d", dry, got, wantRemoves)
+		}
+		if st := h.status(t, twin); st != wantTwin {
+			t.Errorf("dry=%v: own twin %s: status %s, want %s", dry, twin, st, wantTwin)
+		}
+		h.assertLogClean(t)
+	}
+}
+
+// Пустой владелец и в sweep: строка с именем завершённого задания не снята,
+// исход красный; задание, у которого есть лишь строка без владельца, не
+// спрашивается (строка не наша); законный близнец снят.
+func TestSweep_OwnerlessRowIsKeptAndRed(t *testing.T) {
+	h := newHarness(t)
+	ownerless := ci(prefA, loginA, "100")
+	ownerlessOnly := ci(prefA, loginA, "300")
+	twin := ci(prefA, loginA, "100-1")
+	for _, n := range []string{ownerless, ownerlessOnly} {
+		h.srv.SeedOwnerless(&pb.Bucket{Name: n, CustLogin: loginA, Status: pb.Status_RUNNING})
+	}
+	h.seed(twin, loginA, pb.Status_RUNNING)
+	jobs := &fakeJobs{asked: map[uint64]int{}, status: map[uint64]string{100: "success", 300: "success"}}
+
+	rep, err := RunSweep(context.Background(), h.cloud, jobs, h.opts(loginA))
+	if !errors.Is(err, ErrOwnerless) {
+		t.Fatalf("err = %v, want ErrOwnerless\nlog:\n%s", err, h.log)
+	}
+	if rep.Rows != 3 {
+		t.Fatalf("rows = %d, want 3: the ownerless rows must reach the sweeper", rep.Rows)
+	}
+	for _, n := range []string{ownerless, ownerlessOnly} {
+		if st := h.status(t, n); st != pb.Status_RUNNING {
+			t.Errorf("ownerless %s: status %s, want RUNNING", n, st)
+		}
+	}
+	if st := h.status(t, twin); st != pb.Status_REMOVED {
+		t.Errorf("own twin %s: status %s, want REMOVED", twin, st)
+	}
+	if got := h.removes(); got != 1 {
+		t.Errorf("removeBucket calls = %d, want 1", got)
+	}
+	if jobs.asked[300] != 0 {
+		t.Errorf("job 300 asked although its only row has no owner")
+	}
+	got := h.ownerlessRecords(t)
+	slices.Sort(got)
+	if want := []string{ownerless, ownerlessOnly}; !slices.Equal(got, want) {
+		t.Errorf("ownerless records = %v, want %v", got, want)
+	}
+	if len(rep.Ownerless) != 2 {
+		t.Errorf("report ownerless = %v, want both rows", rep.Ownerless)
+	}
+	h.assertLogClean(t)
+}
+
+// sweep --dry-run печатает план — бакет завершённого задания с действием — и
+// не зовёт removeBucket ни разу.
+func TestSweep_DryRunPrintsThePlanAndRemovesNothing(t *testing.T) {
+	h := newHarness(t)
+	done := ci(prefA, loginA, "100")
+	alive := ci(prefA, loginA, "200")
+	h.seed(done, loginA, pb.Status_RUNNING)
+	h.seed(alive, loginA, pb.Status_RUNNING)
+	jobs := &fakeJobs{asked: map[uint64]int{}, status: map[uint64]string{100: "success", 200: "running"}}
+	o := h.opts(loginA)
+	o.DryRun = true
+
+	if _, err := RunSweep(context.Background(), h.cloud, jobs, o); err != nil {
+		t.Fatalf("RunSweep dry-run: %v\nlog:\n%s", err, h.log)
+	}
+	if got := h.removes(); got != 0 {
+		t.Errorf("removeBucket calls = %d, want 0 under dry-run", got)
+	}
+	for _, n := range []string{done, alive} {
+		if st := h.status(t, n); st != pb.Status_RUNNING {
+			t.Errorf("%s: status %s, want RUNNING under dry-run", n, st)
+		}
+	}
+	plan := map[string]string{}
+	for _, r := range h.records(t, "plan") {
+		plan[r["bucket"].(string)] = r["action"].(string)
+	}
+	if len(plan) != 1 || plan[done] != "remove" {
+		t.Fatalf("plan = %v, want only %s with action remove", plan, done)
+	}
+	h.assertLogClean(t)
+}

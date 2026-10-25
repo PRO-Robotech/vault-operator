@@ -446,3 +446,35 @@ func TestClient_ListByCustomerReturnsEveryRowWithoutKeys(t *testing.T) {
 		t.Fatalf("wide rows = %v, want the foreign row passed through unjudged", names(got))
 	}
 }
+
+// Строка, засеянная без владельца в ответе, находится областью своего логина
+// и доходит до вызывающего с пустым cust_login; чужая область её не находит.
+// Законный близнец — обычная строка того же логина — несёт владельца.
+func TestClient_ListByCustomerPassesAnOwnerlessRowAsIs(t *testing.T) {
+	srv := cmfake.New()
+	srv.SeedOwnerless(&pb.Bucket{Name: "aa11-k8s-c1-ci-7", CustLogin: "c1", Status: pb.Status_RUNNING})
+	seedBucket(srv, "aa11-k8s-c1-ci-8", "c1", pb.Status_RUNNING)
+	c := newTestClient(t, srv, Options{})
+
+	got, err := c.ListByCustomer(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("ListByCustomer: %v", err)
+	}
+	if strings.Join(names(got), ",") != "aa11-k8s-c1-ci-7,aa11-k8s-c1-ci-8" {
+		t.Fatalf("rows = %v, want both rows of c1", names(got))
+	}
+	if got[0].CustLogin != "" || got[1].CustLogin != "c1" {
+		t.Fatalf("owners = %q, %q; want empty for the ownerless row and c1 for its twin",
+			got[0].CustLogin, got[1].CustLogin)
+	}
+	if b := srv.Get("aa11-k8s-c1-ci-7"); b.GetCustLogin() != "c1" {
+		t.Fatalf("stored owner = %q, want c1: only the answer is blanked", b.GetCustLogin())
+	}
+	other, err := c.ListByCustomer(context.Background(), "other")
+	if err != nil {
+		t.Fatalf("ListByCustomer other: %v", err)
+	}
+	if len(other) != 0 {
+		t.Fatalf("rows of other = %v, want none", names(other))
+	}
+}

@@ -94,6 +94,9 @@ type Server struct {
 	HideNewFindAlls int
 	// hidden counts the findAll calls left before a new bucket is listed.
 	hidden map[string]int
+	// ownerless — имена строк, которые findAll отдаёт с пустым cust_login
+	// (SeedOwnerless).
+	ownerless map[string]bool
 
 	Creates  int
 	FindAlls int
@@ -104,7 +107,8 @@ type Server struct {
 
 // New returns an empty fake that completes a removal after one observation.
 func New() *Server {
-	return &Server{removing: map[string]int{}, hidden: map[string]int{}, RemovalPolls: 1}
+	return &Server{removing: map[string]int{}, hidden: map[string]int{}, ownerless: map[string]bool{},
+		RemovalPolls: 1}
 }
 
 // Prefix is the per-customer prefix the fake prepends to requested names.
@@ -119,6 +123,19 @@ func (s *Server) Seed(b *pb.Bucket) {
 	defer s.mu.Unlock()
 	cp := cloneBucket(b)
 	s.buckets = append(s.buckets, cp)
+}
+
+// SeedOwnerless вставляет бакет, который области findAll находят по его
+// владельцу b.CustLogin, а ответ отдаёт с пустым cust_login. Пустой владелец —
+// известная форма ответа службы (TestClient_FindByBucketReturnsAnEmptyOwnerAsIs
+// в internal/cloudmanager): двойник показывает её вызывающему, который судит
+// владельца строки сам. Get и Buckets возвращают строку как засеяна — с
+// владельцем.
+func (s *Server) SeedOwnerless(b *pb.Bucket) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buckets = append(s.buckets, cloneBucket(b))
+	s.ownerless[b.GetName()] = true
 }
 
 // Get returns a copy of the named bucket, or nil.
@@ -262,7 +279,11 @@ func (s *Server) FindAll(ctx context.Context, req *pb.FindAllRequest) (*pb.FindA
 			continue
 		}
 		if s.IgnoreScopes || s.matches(b, req.GetScope()) {
-			resp.Bucket = append(resp.Bucket, cloneBucket(b))
+			cp := cloneBucket(b)
+			if s.ownerless[b.GetName()] {
+				cp.CustLogin = ""
+			}
+			resp.Bucket = append(resp.Bucket, cp)
 		}
 	}
 	for name, left := range s.hidden {

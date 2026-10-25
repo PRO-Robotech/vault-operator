@@ -52,6 +52,9 @@ var (
 	ErrJobUnclassified = errors.New("s3sweeper: job status unclassified")
 	// ErrBadOptions: опции отвергнуты до первого вызова службы.
 	ErrBadOptions = errors.New("s3sweeper: bad options")
+	// ErrOwnerless: строка с именем нашей формы пришла с пустым cust_login —
+	// она не наша и не снята, исход красный.
+	ErrOwnerless = errors.New("s3sweeper: row of our name shape without owner")
 )
 
 // Cloud — то, что уборщику нужно от cloud-manager.
@@ -105,6 +108,8 @@ type Report struct {
 	Removed []string
 	// Left — остаток по сроку.
 	Left []Leftover
+	// Ownerless — строки нашей формы с пустым владельцем: не сняты.
+	Ownerless []Leftover
 }
 
 const maxLoginLen = 32
