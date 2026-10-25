@@ -233,12 +233,14 @@ func RunSweep(ctx context.Context, cloud Cloud, jobs JobStatusSource, o Options)
 	m := newMatcher(o.Logins)
 	o.Log.Info("scheduled sweep started", "logins", o.Logins, "dryRun", o.DryRun)
 	live := map[uint64]bool{}
+	read := 0
 	for _, login := range o.Logins {
 		rows, err := cloud.ListByCustomer(ctx, login)
 		if err != nil {
 			o.Log.Error("listing failed", "login", login, "reason", reason(err))
 			return Report{}, fmt.Errorf("list buckets of %s: %s", login, reason(err))
 		}
+		read += len(rows)
 		for _, b := range rows {
 			if id, ok := m.job(login, b); ok && b.Status != cloudmanager.StatusRemoved {
 				live[id] = true
@@ -250,16 +252,15 @@ func RunSweep(ctx context.Context, cloud Cloud, jobs JobStatusSource, o Options)
 		id, ok := m.job(login, b)
 		return ok && finished[id]
 	}
-	var (
-		rep Report
-		err error
-	)
-	if len(finished) > 0 {
-		if o.DryRun {
-			rep, err = plan(ctx, cloud, o, want)
-		} else {
-			rep, err = drain(ctx, cloud, o, want)
-		}
+	rep := Report{Rows: read}
+	var err error
+	switch {
+	case len(finished) == 0:
+		o.Log.Info("summary", "rows", read, "jobs", len(live), "finished", 0, "removed", 0)
+	case o.DryRun:
+		rep, err = plan(ctx, cloud, o, want)
+	default:
+		rep, err = drain(ctx, cloud, o, want)
 	}
 	if err == nil && unclassified > 0 {
 		err = fmt.Errorf("%w: %d job(s)", ErrJobUnclassified, unclassified)

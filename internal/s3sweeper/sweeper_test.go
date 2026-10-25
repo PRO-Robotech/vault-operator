@@ -576,3 +576,25 @@ func TestParseJobID(t *testing.T) {
 		}
 	}
 }
+
+// Ни одно задание не завершено: снятий ноль, исход зелёный, знаменатель
+// (строк прочитано) назван и в итоге, и в журнале.
+func TestSweep_NothingFinishedRemovesNothingAndCountsRows(t *testing.T) {
+	h := newHarness(t)
+	h.seed(ci(prefA, loginA, "200"), loginA, pb.Status_RUNNING)
+	h.seed(prefA+"-k8s-"+loginA+"-w13507", loginA, pb.Status_RUNNING)
+	jobs := &fakeJobs{asked: map[uint64]int{}, status: map[uint64]string{200: "running"}}
+
+	rep, err := RunSweep(context.Background(), h.cloud, jobs, h.opts(loginA))
+	if err != nil {
+		t.Fatalf("RunSweep: %v", err)
+	}
+	if rep.Rows != 2 || len(rep.Removed) != 0 || h.removes() != 0 {
+		t.Fatalf("report = %+v, removes = %d; want rows 2 and nothing removed", rep, h.removes())
+	}
+	sum := h.records(t, "summary")
+	if len(sum) != 1 || sum[0]["rows"] != float64(2) {
+		t.Fatalf("summary records = %v, want one with rows 2", sum)
+	}
+	h.assertLogClean(t)
+}
