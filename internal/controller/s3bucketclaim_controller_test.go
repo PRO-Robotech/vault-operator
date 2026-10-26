@@ -18,6 +18,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -767,6 +768,174 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(s3Gone("s3err")).To(BeFalse())
 			Expect(condReason(getS3("s3err").Status.Conditions, vaultv1alpha1.ConditionReady)).To(Equal("DeletionStuck"))
 			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		})
+	})
+
+	Context("a bucket name another live claim holds", func() {
+		// otherNS заводит пространство имён для заявки-соседа: держатель имени
+		// ищется во всех пространствах, а не только в пространстве снимаемой заявки.
+		otherNS := func(prefix string) string {
+			ns := prefix + "-" + nextClaimName()
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.DeleteAllOf(ctx, &vaultv1alpha1.S3BucketClaim{}, client.InNamespace(ns))
+				_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+			})
+			return ns
+		}
+		reconcileIn := func(ns, name string, n int) {
+			for i := 0; i < n; i++ {
+				_, err := recon.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+				Expect(err).NotTo(HaveOccurred())
+			}
+		}
+		getIn := func(ns, name string) *vaultv1alpha1.S3BucketClaim {
+			got := &vaultv1alpha1.S3BucketClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, got)).To(Succeed())
+			return got
+		}
+		// holder заводит в другом пространстве заявку со своим кластером и листом;
+		// hold записывает ей держание имени bucket (в spec и/или в статус).
+		holder := func(ns, name, cfgName string, finalizers []string, hold func(c *vaultv1alpha1.S3BucketClaim, bucket string), bucket string) {
+			b := newS3BucketClaim(name, cfgName)
+			b.Namespace = ns
+			b.Spec.ClusterRef.Name = name + "-holder"
+			b.Spec.Vault.SecretsPrefix = "clusters/" + name + "-holder"
+			b.Finalizers = finalizers
+			hold(b, bucket)
+			Expect(k8sClient.Create(ctx, b)).To(Succeed())
+			b = getIn(ns, name)
+			hold(b, bucket)
+			Expect(k8sClient.Status().Update(ctx, b)).To(Succeed())
+		}
+		byStatus := func(c *vaultv1alpha1.S3BucketClaim, bucket string) {
+			c.Status.BucketName = bucket
+			c.Status.BucketOwnership = vaultv1alpha1.BucketOwnershipAdopted
+		}
+		bySpec := func(c *vaultv1alpha1.S3BucketClaim, bucket string) {
+			c.Spec.Bucket.Name = bucket
+		}
+
+		DescribeTable("Purge does not remove it and holds the finalizer until it is released",
+			func(name string, hold func(c *vaultv1alpha1.S3BucketClaim, bucket string)) {
+				cfg := "s3-cfg-" + name
+				got := readyClaim(cfg, name)
+				bucket := got.Status.BucketName
+				ns := otherNS(name)
+				holder(ns, name, cfg, nil, hold, bucket)
+
+				deleteClaim(name)
+				res := reconcileN(name, 2)
+
+				Expect(srv.Removes).To(Equal(0))
+				Expect(srv.Get(bucket).GetStatus()).To(Equal(pb.Status_RUNNING))
+				Expect(s3Gone(name)).To(BeFalse())
+				left := getS3(name)
+				Expect(left.Status.Phase).To(Equal(vaultv1alpha1.PhaseDeleting))
+				c := findCond(left.Status.Conditions, vaultv1alpha1.ConditionReady)
+				Expect(c).NotTo(BeNil())
+				Expect(c.Reason).To(Equal("DeletionBlocked"))
+				Expect(c.Message).To(ContainSubstring(ns + "/" + name))
+				Expect(res.RequeueAfter).To(Equal(bucketRequeueConflict))
+				Expect(s3Leaf(fakeSV, name, s3TestDest)["accessKey"]).NotTo(BeNil())
+
+				// Законный близнец: тот же бакет без держателя — единственный владелец
+				// снимает его как прежде.
+				Expect(k8sClient.Delete(ctx, getIn(ns, name))).To(Succeed())
+				reconcileN(name, 3)
+				Expect(srv.Removes).To(Equal(1))
+				Expect(srv.Get(bucket).GetStatus()).To(Equal(pb.Status_REMOVED))
+				Expect(s3Gone(name)).To(BeTrue())
+			},
+			Entry("recorded in status.bucketName of a claim in another namespace", "s3heldst", byStatus),
+			Entry("named in spec.bucket.name of a claim in another namespace", "s3heldsp", bySpec),
+		)
+
+		It("a holder that is itself being deleted does not keep the bucket", func() {
+			const name = "s3helddel"
+			const fin = "vault-operator-test/hold"
+			got := readyClaim("s3-cfg-"+name, name)
+			bucket := got.Status.BucketName
+			ns := otherNS(name)
+			holder(ns, name, "s3-cfg-"+name, []string{fin}, byStatus, bucket)
+			DeferCleanup(func() {
+				h := &vaultv1alpha1.S3BucketClaim{}
+				if k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, h) == nil {
+					h.Finalizers = nil
+					_ = k8sClient.Update(ctx, h)
+				}
+			})
+			Expect(k8sClient.Delete(ctx, getIn(ns, name))).To(Succeed())
+			Expect(getIn(ns, name).DeletionTimestamp.IsZero()).To(BeFalse())
+
+			deleteClaim(name)
+			reconcileN(name, 3)
+			Expect(srv.Removes).To(Equal(1))
+			Expect(s3Gone(name)).To(BeTrue())
+		})
+
+		DescribeTable("a rejected create response another live claim holds is not recorded",
+			func(name, nbrCluster string, hold func(ns, cfg, served string)) {
+				cfg := "s3-cfg-" + name
+				makeHealthyVaultConfig(ctx, cfg)
+				// Снятый прежде бакет занимает имя: служба облака увеличивает хвост,
+				// и ответ create равен базе соседнего кластера nbrCluster.
+				srv.Seed(&pb.Bucket{Name: serverName(name), CustLogin: cust, Status: pb.Status_REMOVED})
+				served := serverName(nbrCluster)
+				ns := otherNS(name)
+				hold(ns, cfg, served)
+				makeS3BucketClaim(ctx, name, cfg)
+				reconcileN(name, 2)
+
+				got := getS3(name)
+				Expect(srv.Creates).To(Equal(1))
+				Expect(srv.Get(served)).NotTo(BeNil())
+				Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+				Expect(got.Status.BucketName).To(BeEmpty())
+				Expect(got.Status.PendingCreate).NotTo(BeNil())
+
+				deleteClaim(name)
+				reconcileN(name, 2)
+				Expect(s3Gone(name)).To(BeTrue())
+				Expect(srv.Removes).To(Equal(0))
+				Expect(srv.Get(served).GetStatus()).To(Equal(pb.Status_RUNNING))
+			},
+			Entry("the base name of a live neighbour cluster of the same login", "s3heldbase-11", "s3heldbase-12",
+				func(ns, cfg, _ string) {
+					nb := newS3BucketClaim("s3heldbase-12", cfg)
+					nb.Namespace = ns
+					Expect(k8sClient.Create(ctx, nb)).To(Succeed())
+				}),
+			Entry("the name another live claim records", "s3heldrec-11", "s3heldrec-12",
+				func(ns, cfg, served string) {
+					holder(ns, "s3heldrec", cfg, nil, byStatus, served)
+				}),
+		)
+
+		It("the live neighbour adopts the bucket the rejected create made and keeps it", func() {
+			const name, nbr = "s3heldnbr-11", "s3heldnbr-12"
+			cfg := "s3-cfg-" + name
+			makeHealthyVaultConfig(ctx, cfg)
+			srv.Seed(&pb.Bucket{Name: serverName(name), CustLogin: cust, Status: pb.Status_REMOVED})
+			ns := otherNS(name)
+			nb := newS3BucketClaim(nbr, cfg)
+			nb.Namespace = ns
+			Expect(k8sClient.Create(ctx, nb)).To(Succeed())
+			makeS3BucketClaim(ctx, name, cfg)
+			reconcileN(name, 2)
+			Expect(getS3(name).Status.BucketName).To(BeEmpty())
+
+			reconcileIn(ns, nbr, 2)
+			got := getIn(ns, nbr)
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(got.Status.BucketName).To(Equal(serverName(nbr)))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipAdopted))
+
+			deleteClaim(name)
+			reconcileN(name, 2)
+			Expect(s3Gone(name)).To(BeTrue())
+			Expect(srv.Removes).To(Equal(0))
+			Expect(srv.Get(serverName(nbr)).GetStatus()).To(Equal(pb.Status_RUNNING))
 		})
 	})
 
