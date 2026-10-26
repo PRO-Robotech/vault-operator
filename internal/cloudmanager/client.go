@@ -531,3 +531,22 @@ func mapCreateError(e *pb.CreateError) error {
 		return &CreateRejectedError{Code: e.GetCode().String(), Message: e.GetMessage()}
 	}
 }
+
+// ListByCustomer возвращает строки findAll по области ByCustomer как есть, в
+// порядке службы: любой статус, REMOVED тоже, и без суждения о владельце —
+// строку другого логина (служба с областью шире запрошенной) вызывающий видит
+// и судит сам. Ключей в перечне нет: перечню они не нужны, а ответ findAll
+// несёт ключи каждого бакета логина.
+func (c *Client) ListByCustomer(ctx context.Context, custLogin string) ([]*Bucket, error) {
+	resp, err := c.findAll(ctx, []*pb.FindAllRequest_SearchScope{byCustomerScope(custLogin)})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Bucket, 0, len(resp.GetBucket()))
+	for _, b := range resp.GetBucket() {
+		d := toDomain(b)
+		d.AccessKey, d.SecretKey = "", ""
+		out = append(out, d)
+	}
+	return out, nil
+}
