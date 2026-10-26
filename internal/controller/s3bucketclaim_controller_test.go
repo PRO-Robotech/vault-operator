@@ -97,6 +97,20 @@ func (b createResponseBuckets) Create(ctx context.Context, in cloudmanager.Creat
 	return b.response, err
 }
 
+// afterCommitBuckets прогоняет afterCommit между фиксацией create на сервере и
+// возвратом ответа вызывающему: так воспроизводится окно, в котором бакет уже
+// есть, а статус создавшей его заявки ещё не записан.
+type afterCommitBuckets struct {
+	cloudmanager.BucketAPI
+	afterCommit func()
+}
+
+func (b afterCommitBuckets) Create(ctx context.Context, in cloudmanager.CreateInput) (string, error) {
+	name, err := b.BucketAPI.Create(ctx, in)
+	b.afterCommit()
+	return name, err
+}
+
 var _ = Describe("S3BucketClaim Controller", func() {
 	const cust = s3Cust
 	var (
@@ -911,6 +925,53 @@ var _ = Describe("S3BucketClaim Controller", func() {
 					holder(ns, "s3heldrec", cfg, nil, byStatus, served)
 				}),
 		)
+
+		It("a neighbour that adopted the bucket before the rejected name was recorded keeps it on Purge", func() {
+			const name, nbr = "s3heldrace-11", "s3heldrace-12"
+			cfg := "s3-cfg-" + name
+			makeHealthyVaultConfig(ctx, cfg)
+			srv.Seed(&pb.Bucket{Name: serverName(name), CustLogin: cust, Status: pb.Status_REMOVED})
+			ns := otherNS(name)
+			// Сосед появляется и принимает бакет в окне между фиксацией create на
+			// сервере и записью статуса: список заявок этого прохода его не видит.
+			reconB := &S3BucketClaimReconciler{
+				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
+				VaultFactory: recon.VaultFactory, Buckets: recon.Buckets,
+				DefaultConfigurationID: recon.DefaultConfigurationID,
+			}
+			fired := false
+			recon.Buckets = afterCommitBuckets{BucketAPI: recon.Buckets, afterCommit: func() {
+				if fired {
+					return
+				}
+				fired = true
+				nb := newS3BucketClaim(nbr, cfg)
+				nb.Namespace = ns
+				Expect(k8sClient.Create(ctx, nb)).To(Succeed())
+				for range 2 {
+					_, err := reconB.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: nbr}})
+					Expect(err).NotTo(HaveOccurred())
+				}
+			}}
+			makeS3BucketClaim(ctx, name, cfg)
+			reconcileN(name, 2)
+
+			Expect(fired).To(BeTrue())
+			Expect(srv.Creates).To(Equal(1))
+			b := getIn(ns, nbr)
+			Expect(b.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+			Expect(b.Status.BucketName).To(Equal(serverName(nbr)))
+			a := getS3(name)
+			Expect(condReason(a.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+			// Список прохода снят до соседа: имя записано и у этой заявки.
+			Expect(a.Status.BucketName).To(Equal(serverName(nbr)))
+
+			deleteClaim(name)
+			reconcileN(name, 2)
+			Expect(srv.Removes).To(Equal(0))
+			Expect(srv.Get(serverName(nbr)).GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(condReason(getS3(name).Status.Conditions, vaultv1alpha1.ConditionReady)).To(Equal("DeletionBlocked"))
+		})
 
 		It("the live neighbour adopts the bucket the rejected create made and keeps it", func() {
 			const name, nbr = "s3heldnbr-11", "s3heldnbr-12"
