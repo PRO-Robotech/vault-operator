@@ -201,10 +201,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			got := getS3("s3foreignname")
 			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
 			Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
-			Expect(got.Status.BucketOwnership).To(BeEmpty())
-			Expect(got.Status.BucketName).To(BeEmpty())
-			Expect(got.Status.PendingCreate).NotTo(BeNil())
-			pending := got.Status.PendingCreate.DeepCopy()
+			// Имя, которое create выдал этой заявке и которого не было до create, — её
+			// бакет: оно записано созданным, чтобы Purge его снял, а заявка остаётся в отказе.
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.BucketName).To(Equal(base + "-1"))
+			Expect(got.Status.PendingCreate).To(BeNil())
 			Expect(s3Leaf(fakeSV, "s3foreignname", s3TestDest)).To(BeNil())
 			recon = &S3BucketClaimReconciler{
 				Client: recon.Client, Scheme: recon.Scheme, Recorder: recon.Recorder,
@@ -213,13 +214,13 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			}
 			res := reconcileN("s3foreignname", 3)
 			Expect(res.RequeueAfter).To(BeZero())
-			Expect(getS3("s3foreignname").Status.PendingCreate).To(Equal(pending))
+			Expect(getS3("s3foreignname").Status.BucketName).To(Equal(base + "-1"))
 			Expect(srv.Creates).To(Equal(1))
 			deleteClaim("s3foreignname")
 			reconcileN("s3foreignname", 3)
-			Expect(srv.Get(base + "-1").GetStatus()).To(Equal(pb.Status_RUNNING))
+			Expect(srv.Get(base + "-1").GetStatus()).To(Equal(pb.Status_REMOVED))
 			Expect(srv.Get(base).GetStatus()).To(Equal(pb.Status_RUNNING))
-			Expect(srv.Removes).To(BeZero())
+			Expect(srv.Removes).To(Equal(1))
 		})
 
 		It("creates its own exact name while another login has its distinct prefix", func() {
@@ -446,7 +447,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Expect(purgeAndLook("s3sdr", neighbour)).To(Equal(pb.Status_RUNNING))
 		})
 
-		It("rejects a create response that changed the numeric cluster suffix", func() {
+		It("rejects a create response that changed the numeric cluster suffix and purges the bucket it made", func() {
 			makeHealthyVaultConfig(ctx, "s3-cfg-number")
 			// cloud-manager увеличивает существующий числовой хвост:
 			// вместо нового суффикса s3number-11 становится s3number-12.
@@ -457,8 +458,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			got := getS3("s3number-11")
 			Expect(srv.Creates).To(Equal(1))
 			Expect(srv.Get(serverName("s3number-12"))).NotTo(BeNil())
-			Expect(got.Status.BucketName).To(BeEmpty())
-			Expect(got.Status.PendingCreate).NotTo(BeNil())
+			Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+			Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+			Expect(got.Status.BucketName).To(Equal(serverName("s3number-12")))
+			Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+			Expect(got.Status.PendingCreate).To(BeNil())
 			Expect(s3Leaf(fakeSV, "s3number-11", s3TestDest)).To(BeNil())
 			// Детерминированное несовпадение имени не создаёт новую сироту,
 			// даже когда срок незавершённого создания давно истёк.
@@ -469,7 +473,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			}
 			reconcileN("s3number-11", 3)
 			Expect(srv.Creates).To(Equal(1))
-			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_RUNNING))
+			Expect(getS3("s3number-11").Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+			// Отвергнутое имя — бакет этого create: Purge снимает его, сироты нет;
+			// снятый прежде бакет с исходным именем остаётся REMOVED.
+			Expect(purgeAndLook("s3number-11", serverName("s3number-12"))).To(Equal(pb.Status_REMOVED))
+			Expect(srv.Get(serverName("s3number-11")).GetStatus()).To(Equal(pb.Status_REMOVED))
 		})
 
 		DescribeTable("rejects a create response outside the persisted name baseline",
@@ -485,11 +493,27 @@ var _ = Describe("S3BucketClaim Controller", func() {
 				reconcileN(name, 2)
 
 				Expect(srv.Creates).To(Equal(1))
-				Expect(getS3(name).Status.BucketName).To(BeEmpty())
+				got := getS3(name)
+				Expect(condReason(got.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(Equal("CreateNameMismatch"))
+				if baseTaken {
+					// Имя из снимка до create не принадлежит этому созданию: оно не
+					// записывается, и Purge его не трогает.
+					Expect(got.Status.BucketName).To(BeEmpty())
+					Expect(got.Status.PendingCreate).NotTo(BeNil())
+				} else {
+					Expect(got.Status.BucketName).To(Equal(response))
+					Expect(got.Status.BucketOwnership).To(Equal(vaultv1alpha1.BucketOwnershipCreated))
+				}
 				Expect(s3Leaf(fakeSV, name, s3TestDest)).To(BeNil())
 				recon.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
 				reconcileN(name, 3)
 				Expect(srv.Creates).To(Equal(1))
+				if baseTaken {
+					deleteClaim(name)
+					reconcileN(name, 3)
+					Expect(s3Gone(name)).To(BeTrue())
+					Expect(srv.Removes).To(BeZero())
+				}
 			},
 			Entry("suffix without a taken base", "s3unexpected", false),
 			Entry("name already present before create", "s3existing", true),
