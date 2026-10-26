@@ -24,6 +24,10 @@ type APIError struct {
 	Path       string
 	StatusCode int
 	Errors     []string
+	// Body is the raw response body. Some non-2xx answers carry data (a KV-v2
+	// read of a soft-deleted leaf: 404 with its metadata). It is never part
+	// of Error().
+	Body []byte
 }
 
 func (e *APIError) Error() string {

@@ -297,7 +297,7 @@ var _ = Describe("Manager", Ordered, func() {
 		BeforeAll(func() {
 			By("deploying Vault dev to the Kind cluster")
 			Expect(ApplyVaultManifests()).To(Succeed(), "apply Vault manifests")
-			Expect(WaitVaultReady(2 * time.Minute)).To(Succeed(), "wait for Vault Deployment")
+			Expect(WaitVaultReady(2*time.Minute)).To(Succeed(), "wait for Vault Deployment")
 
 			By("starting kubectl port-forward to the Vault Service")
 			pfCtx, cancel := context.WithCancel(context.Background())

@@ -11,6 +11,8 @@ You may obtain a copy of the License at
 package v1alpha1
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -34,6 +36,10 @@ const (
 	ConditionRolesApplied          = "RolesApplied"
 	ConditionTokenReviewerJWTFresh = "TokenReviewerJWTFresh"
 	ConditionTransitKeysReady      = "TransitKeysReady"
+	// ConditionDegraded is True while the last pass failed on a step error;
+	// its reason is the failure cause. Ready keeps the outcome of the last
+	// completed pass.
+	ConditionDegraded = "Degraded"
 )
 
 // DeletionPolicy values are shared with VaultSecretClaim. Neither ever deletes a Transit key.
@@ -64,7 +70,20 @@ type ClusterRef struct {
 	KubeconfigSecret string `json:"kubeconfigSecret,omitempty"`
 }
 
+// RolePruning values select which roles on the auth mount a claim may delete.
+const (
+	// RolePruningExclusive deletes every role on the mount that spec.roles does
+	// not declare. It applies only while the claim provably owns the mount;
+	// otherwise the claim behaves as Owned.
+	RolePruningExclusive = "Exclusive"
+	// RolePruningOwned deletes only roles the claim itself recorded as written.
+	RolePruningOwned = "Owned"
+)
+
 // AuthSpec configures the per-cluster Vault Kubernetes Auth Method.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.manageConfig) || self.manageConfig || (has(self.autoCreate) && !self.autoCreate && has(self.rolePruning) && self.rolePruning == 'Owned')",message="spec.auth.manageConfig=false requires autoCreate=false and rolePruning=Owned"
+// +kubebuilder:validation:XValidation:rule="(has(self.manageConfig) && !self.manageConfig) || has(self.tokenReviewer)",message="spec.auth.tokenReviewer is required unless spec.auth.manageConfig=false"
 type AuthSpec struct {
 	// MountPath of the per-cluster auth method (convention:
 	// "kubernetes-{metadata.name}"). Immutable.
@@ -72,9 +91,27 @@ type AuthSpec struct {
 	MountPath string `json:"mountPath"`
 
 	// AutoCreate enables the operator to POST sys/auth; when false only
-	// auth/{path}/config is written, assuming the mount already exists.
+	// auth/{path}/config is written, assuming the mount already exists and
+	// carries this claim's description.
 	// +kubebuilder:default=true
-	AutoCreate bool `json:"autoCreate,omitempty"`
+	// +optional
+	AutoCreate *bool `json:"autoCreate,omitempty"`
+
+	// ManageConfig makes the claim the owner of the mount: it writes
+	// auth/{path}/config, rotates the reviewer JWT and manages the reviewer SA.
+	// False makes the claim a guest that only adds its own roles and policies
+	// to a mount configured by someone else (an operator mount from a
+	// VaultConfig or an allow-listed one). Immutable.
+	// +kubebuilder:default=true
+	// +optional
+	ManageConfig *bool `json:"manageConfig,omitempty"`
+
+	// RolePruning selects which roles on the mount the claim deletes when they
+	// leave spec.roles. Empty means Exclusive for an owner claim and Owned for
+	// a guest. Exclusive applies only while the claim provably owns the mount.
+	// +kubebuilder:validation:Enum=Exclusive;Owned
+	// +optional
+	RolePruning string `json:"rolePruning,omitempty"`
 
 	// Issuer is the OIDC issuer URL of the infra cluster; empty triggers
 	// auto-discovery via /.well-known/openid-configuration.
@@ -82,8 +119,27 @@ type AuthSpec struct {
 	Issuer string `json:"issuer,omitempty"`
 
 	// TokenReviewer identifies the SA whose JWT Vault uses for TokenReview.
-	// +required
-	TokenReviewer TokenReviewerSpec `json:"tokenReviewer"`
+	// Required unless manageConfig is false.
+	// +optional
+	TokenReviewer TokenReviewerSpec `json:"tokenReviewer,omitzero"`
+}
+
+// AutoCreateEnabled reports spec.auth.autoCreate with its CRD default applied.
+func (a AuthSpec) AutoCreateEnabled() bool { return a.AutoCreate == nil || *a.AutoCreate }
+
+// ManagesConfig reports spec.auth.manageConfig with its CRD default applied.
+func (a AuthSpec) ManagesConfig() bool { return a.ManageConfig == nil || *a.ManageConfig }
+
+// RolePruningMode resolves an empty rolePruning: Exclusive for an owner
+// claim, Owned for a guest.
+func (a AuthSpec) RolePruningMode() string {
+	if a.RolePruning != "" {
+		return a.RolePruning
+	}
+	if a.ManagesConfig() {
+		return RolePruningExclusive
+	}
+	return RolePruningOwned
 }
 
 // TokenReviewerSpec describes the reviewer SA and its JWT TTL.
@@ -111,27 +167,65 @@ type ServiceAccountRef struct {
 	AutoCreate bool `json:"autoCreate,omitempty"`
 }
 
-// BoundServiceAccounts identifies the single ServiceAccount allowed to log
-// in through this role.
+// BoundServiceAccounts identifies the ServiceAccounts allowed to log in
+// through this role: one name, or a set of names, all in one namespace.
 //
-// This CRD intentionally binds ONE SA per role — unlike Vault's native
-// bound_service_account_names / bound_service_account_namespaces which take
-// arrays and produce a Cartesian product. Reasons:
+// A role still maps to one namespace and one list of policies: TTLs,
+// policies and bound CIDRs stay per role. The ServiceAccount that logged in is
+// visible in the token's metadata (service_account_name,
+// service_account_namespace) and in the audit log, so a role with several
+// names does not hide who logged in. Several namespaces need several roles.
 //
-//   - Audit clarity: a Vault login event names a role that maps 1:1 to a
-//     specific SA. Multi-SA roles obscure who logged in.
-//   - Per-SA tuning: TTLs, policies, and bound CIDRs can differ per role —
-//     impossible to express on a shared multi-SA role.
-//   - Identity mapping: Vault entity ↔ SA stays unambiguous.
+// Name and namespace refuse the glob characters Vault reads (*, ?, [): a glob
+// binds ServiceAccounts nobody named. The rule ratchets — a stored value that
+// does not change keeps validating, so claims written before the rule are
+// still updated; a new or changed value is judged.
 //
-// To share a policy across SAs, declare N roles with the same `policies` —
-// policy objects are independent, only roles are scoped.
+// +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.names)",message="exactly one of boundServiceAccounts.name and boundServiceAccounts.names is required"
 type BoundServiceAccounts struct {
+	// Name of the single ServiceAccount.
 	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Names of the ServiceAccounts, without globs. The operator writes them
+	// sorted, so their order here is not drift.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	Names []string `json:"names,omitempty"`
+
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[^*?\[]+$`
 	Namespace string `json:"namespace"`
 }
+
+// ServiceAccountNames is the names the role binds, sorted: names, or name
+// alone.
+func (b BoundServiceAccounts) ServiceAccountNames() []string {
+	if len(b.Names) == 0 {
+		return []string{b.Name}
+	}
+	out := append([]string(nil), b.Names...)
+	slices.Sort(out)
+	return out
+}
+
+// AliasNameSource values select how Vault names the entity alias of a login.
+const (
+	// AliasNameSourceUID names the alias by the ServiceAccount UID (Vault's
+	// default): a recreated ServiceAccount is a new entity.
+	AliasNameSourceUID = "serviceaccount_uid"
+	// AliasNameSourceName names it "<namespace>/<name>": a ServiceAccount
+	// recreated under the same name in the same namespace is the same entity.
+	AliasNameSourceName = "serviceaccount_name"
+)
 
 // RoleSpec binds {SA, namespace} to a list of policies inside the
 // per-cluster auth mount.
@@ -171,6 +265,13 @@ type RoleSpec struct {
 	// TokenExplicitMaxTTL is a hard cap that renewal cannot extend past.
 	// +optional
 	TokenExplicitMaxTTL *metav1.Duration `json:"tokenExplicitMaxTTL,omitempty"`
+
+	// AliasNameSource selects how Vault names the entity alias of a login.
+	// Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
+	// an existing one keeps what it has.
+	// +kubebuilder:validation:Enum=serviceaccount_uid;serviceaccount_name
+	// +optional
+	AliasNameSource string `json:"aliasNameSource,omitempty"`
 }
 
 // TransitKeySpec declares one encryption key. Hardening fields default to their
@@ -226,24 +327,78 @@ type TransitSpec struct {
 	Keys []TransitKeySpec `json:"keys,omitempty"`
 }
 
+// Placeholders of an identity path. The operator renders each into the Vault
+// template naming the alias metadata of the auth mount the claim logs in
+// through; single braces pass the operator's own Go template and the
+// templates that render claims untouched. {meta.<key>} is reserved.
+const (
+	PlaceholderServiceAccountName      = "{serviceAccountName}"
+	PlaceholderServiceAccountNamespace = "{serviceAccountNamespace}"
+)
+
+// IdentityPathPattern is the schema pattern of identityPaths[].path, for the
+// operator to judge a path the same way when it renders one.
+const IdentityPathPattern = `^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
+
+// MaxRulesLength is the schema limit of policies[].rules in bytes, for the
+// operator to refuse a longer body the same way when it renders one.
+const MaxRulesLength = 16384
+
+// IdentityPath grants capabilities on a Vault path that names the logged-in
+// ServiceAccount.
+type IdentityPath struct {
+	// Path is a Vault ACL path, without a leading "/", made of segments of
+	// [a-z0-9._-] and the placeholders {serviceAccountName} and
+	// {serviceAccountNamespace}; at least one placeholder, no globs, no
+	// segment made of dots only. The pattern carries every rule: CEL here
+	// would be costed per item of two unbounded lists.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$`
+	Path string `json:"path"`
+
+	// Capabilities granted on the path. sudo and deny are not offered.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Enum=create;read;update;patch;delete;list
+	Capabilities []string `json:"capabilities"`
+}
+
 // PolicySpec defines an ACL policy written as HCL into Vault. Names should
 // be prefixed with "{metadata.name}-" because Vault OSS policies live in a
 // global namespace.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.rules) || has(self.identityPaths)",message="a policy needs rules, identityPaths or both"
 type PolicySpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-	// templating.
+	// Rules is HCL ACL content rendered as a Go template. {{ .AuthMountAccessor }}
+	// is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
+	// {{ vaultSANamespace }} write the Vault templates naming the logged-in
+	// ServiceAccount. A Vault template written directly must be escaped:
+	// {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+	// 16384 bytes (MaxRulesLength).
 	// +kubebuilder:validation:MinLength=1
-	Rules string `json:"rules"`
+	// +kubebuilder:validation:MaxLength=16384
+	// +optional
+	Rules string `json:"rules,omitempty"`
+
+	// IdentityPaths are appended to the rules, one path stanza each.
+	// +listType=map
+	// +listMapKey=path
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	IdentityPaths []IdentityPath `json:"identityPaths,omitempty"`
 }
 
 // VaultClaimSpec is the desired state of a VaultClaim. One VaultClaim per
 // infra cluster (1:1 with ClusterClaim).
 //
 // +kubebuilder:validation:XValidation:rule="self.secretsPrefix == oldSelf.secretsPrefix",message="spec.secretsPrefix is immutable"
-// +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="spec.clusterRef.name is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.clusterRef) == has(oldSelf.clusterRef) && (!has(self.clusterRef) || self.clusterRef.name == oldSelf.clusterRef.name)",message="spec.clusterRef.name is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.auth.manageConfig) && !self.auth.manageConfig) || has(self.clusterRef)",message="spec.clusterRef is required unless spec.auth.manageConfig=false"
+// +kubebuilder:validation:XValidation:rule="(!has(self.auth.manageConfig) || self.auth.manageConfig) == (!has(oldSelf.auth.manageConfig) || oldSelf.auth.manageConfig)",message="spec.auth.manageConfig is immutable"
 // +kubebuilder:validation:XValidation:rule="self.auth.mountPath == oldSelf.auth.mountPath",message="spec.auth.mountPath is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.transit) || !has(oldSelf.transit) || self.transit.mountPath == oldSelf.transit.mountPath",message="spec.transit.mountPath is immutable"
 type VaultClaimSpec struct {
@@ -252,8 +407,11 @@ type VaultClaimSpec struct {
 	// +required
 	VaultConfigRef VaultConfigRef `json:"vaultConfigRef"`
 
-	// +required
-	ClusterRef ClusterRef `json:"clusterRef"`
+	// ClusterRef references the ClusterClaim and its kubeconfig Secret; its
+	// name is immutable. Required unless spec.auth.manageConfig is false: a
+	// guest claim has no cluster of its own.
+	// +optional
+	ClusterRef ClusterRef `json:"clusterRef,omitzero"`
 
 	// SecretsPrefix is the path prefix under the shared KV-v2 mount used in
 	// policies. Convention: "clusters/{metadata.name}". Immutable.
@@ -307,7 +465,10 @@ type TransitKeyStatus struct {
 	// +optional
 	LatestVersion int `json:"latestVersion,omitempty"`
 
-	// CreatedByClaim distinguishes a key this operator created from an adopted one.
+	// CreatedByClaim distinguishes a key this operator created from an adopted
+	// one. An entry with CreatedByClaim and LatestVersion 0 is an intent: it is
+	// recorded before the key is created, so a crash between the create and the
+	// status write cannot turn the claim's own key into an adopted one.
 	// +optional
 	CreatedByClaim bool `json:"createdByClaim,omitempty"`
 }
@@ -317,20 +478,50 @@ type VaultStatusSummary struct {
 	// +optional
 	ConfigName string `json:"configName,omitempty"`
 
+	// Issuer is the service account issuer last discovered in the target
+	// cluster. A pass whose discovery fails configures the mount with it, but
+	// only while the kubeconfig still points at IssuerHost.
+	// +optional
+	Issuer string `json:"issuer,omitempty"`
+
+	// IssuerHost is the target API server Issuer was discovered on. A pass
+	// that finds another host and cannot discover drops Issuer.
+	// +optional
+	IssuerHost string `json:"issuerHost,omitempty"`
+
+	// AuthMountPath is the auth mount this claim was accepted on. It is written
+	// only once the mount is accepted, never before, so a claim that waited
+	// or was refused does not hold it; a claim whose record names its mount
+	// keeps that mount whatever its description (releases before ownership
+	// checks recorded it for every claim and have configured the mount since).
 	// +optional
 	AuthMountPath string `json:"authMountPath,omitempty"`
 
 	// +optional
 	SecretsPrefix string `json:"secretsPrefix,omitempty"`
 
-	// AuthMountAccessor is cached from Vault, populated lazily on first
-	// render of a policy that uses {{ .AuthMountAccessor }}.
+	// AuthMountAccessor is the accessor the claim's templated policies were
+	// last rendered with, read from sys/auth on a pass that renders one. A
+	// different accessor in sys/auth means the mount was recreated: the
+	// policies are rendered again.
 	// +optional
 	AuthMountAccessor string `json:"authMountAccessor,omitempty"`
 
+	// AuthMountOwned records a fact, never an intent: the mount answered 2xx
+	// to this claim's POST sys/auth, sys/auth reports it as a kubernetes
+	// mount carrying this claim's description, or authMountPath already
+	// named it.
+	// +optional
+	AuthMountOwned bool `json:"authMountOwned,omitempty"`
+
+	// AppliedRoles is the ledger of roles this claim may have written: a name
+	// enters it before the write and leaves it after the role is deleted.
 	// +optional
 	AppliedRoles []string `json:"appliedRoles,omitempty"`
 
+	// AppliedPolicies is the ledger of policies this claim may have written:
+	// a name enters it before the write and leaves it after the policy is
+	// deleted.
 	// +optional
 	AppliedPolicies []string `json:"appliedPolicies,omitempty"`
 

@@ -14,9 +14,11 @@ You may obtain a copy of the License at
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -24,19 +26,23 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
 	"github.com/PRO-Robotech/vault-operator/internal/controller"
+	"github.com/PRO-Robotech/vault-operator/internal/operator"
 )
 
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+// tokenRevokeTimeout bounds the revoke of the Vault tokens at shutdown.
+const tokenRevokeTimeout = 10 * time.Second
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -52,6 +58,10 @@ func main() {
 	var enableHTTP2 bool
 	var pprofAddr string
 	var tlsOpts []func(*tls.Config)
+	var concurrentReconciles int
+	var kubeQPS float64
+	var kubeBurst int
+	var run operator.Flags
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -69,7 +79,12 @@ func main() {
 		"Address for the pprof/diagnostics endpoint. Empty (default) disables it. "+
 			"Set e.g. 127.0.0.1:8082 to enable, binding to loopback so it is reachable only via "+
 			"`kubectl port-forward` (access gated by pods/portforward RBAC).")
-	opts := zap.Options{Development: true}
+	run.Bind(flag.CommandLine)
+	opts := operator.LogOptions()
+	flag.IntVar(&concurrentReconciles, "vaultsecretclaim-concurrent-reconciles", 1,
+		"VaultSecretClaims reconciled in parallel; one claim is never reconciled twice at once.")
+	flag.Float64Var(&kubeQPS, "kube-api-qps", 0, "Kubernetes API client QPS; 0 keeps the library default.")
+	flag.IntVar(&kubeBurst, "kube-api-burst", 0, "Kubernetes API client burst; 0 keeps the library default.")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -101,24 +116,41 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg := ctrl.GetConfigOrDie()
+	if kubeQPS > 0 {
+		restCfg.QPS = float32(kubeQPS)
+	}
+	if kubeBurst > 0 {
+		restCfg.Burst = kubeBurst
+	}
+	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "vault-secret-operator.in-cloud.io",
 		PprofBindAddress:       pprofAddr,
-	})
+	}
+	run.Apply(&mgrOpts)
+	mgr, err := ctrl.NewManager(restCfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
+	// One client cache for both controllers: one Vault token per VaultConfig.
+	vaultClients := &controller.DefaultVaultClientFactory{Options: run.VaultOptions(concurrentReconciles)}
+	progress := run.NewWatchdog()
+	rt := run.Runtime(progress)
+
 	if err := (&controller.VaultSecretClaimReconciler{
 		Client:       mgr.GetClient(),
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorderFor("vaultsecretclaim-controller"),
-		VaultFactory: &controller.DefaultSecretVaultClientFactory{},
+		VaultFactory: &controller.DefaultSecretVaultClientFactory{Shared: vaultClients},
+
+		MaxConcurrentReconciles: concurrentReconciles,
+		Runtime:                 rt,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultSecretClaim")
 		os.Exit(1)
@@ -129,24 +161,31 @@ func main() {
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
 		Recorder:         mgr.GetEventRecorderFor("vaultconfig-controller"),
-		VaultFactory:     &controller.DefaultVaultClientFactory{},
+		VaultFactory:     vaultClients,
 		VaultConfigOwner: vaultv1alpha1.OwnerVaultSecretOperator,
+		Runtime:          rt,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VaultConfig")
 		os.Exit(1)
 	}
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+	if err := operator.AddProbes(mgr, progress); err != nil {
+		setupLog.Error(err, "unable to set up probes")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+	err = controller.RegisterInventory(ctrlmetrics.Registry, mgr.GetClient(), controller.KindVaultSecretClaim)
+	if err != nil {
+		setupLog.Error(err, "unable to register the claim inventory metrics")
 		os.Exit(1)
 	}
 
 	setupLog.Info("starting vault-secret-manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	err = mgr.Start(ctrl.SetupSignalHandler())
+	// The controllers have stopped: give the Vault tokens back.
+	revokeCtx, cancel := context.WithTimeout(context.Background(), tokenRevokeTimeout)
+	vaultClients.RevokeAll(revokeCtx)
+	cancel()
+	if err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

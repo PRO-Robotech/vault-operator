@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    name: Run on Ubuntu
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -17,7 +17,21 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Running Tests
+      - name: go.mod and go.sum are tidy
         run: |
           go mod tidy
-          make test
+          git diff --exit-code go.mod go.sum
+
+      - name: Running Tests
+        run: make test
+
+      - name: Race detector on the packages with shared state
+        run: make test-race
+
+      # make test regenerates CRDs, RBAC, deepcopy and formatting; anything
+      # it changed was not committed.
+      - name: Generated files match the tree
+        run: make verify-generated
+
+      - name: Images are pinned by digest
+        run: make verify-images

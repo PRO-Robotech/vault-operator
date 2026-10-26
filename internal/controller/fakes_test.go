@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -88,8 +89,19 @@ type fakeVaultClient struct {
 	CreateTransitKeyCalls int
 	UpdateTransitCfgCalls int
 
+	// Ops logs every write in call order ("put-policy:x", "delete-role:y", …)
+	// so tests can assert the order of a pass.
+	Ops []string
+	// OnEnableAuth runs inside EnableAuthMethod before its result is returned;
+	// tests use it to model a mount appearing between list and create.
+	OnEnableAuth func(f *fakeVaultClient)
+
+	LookupSelfErr error
+
 	SealCalls           int
 	LoginCalls          int
+	LookupSelfCalls     int
+	ReadAuthMountCalls  int
 	MountCalls          int
 	ClearCalls          int
 	EnableAuthCalls     int
@@ -117,7 +129,9 @@ func (f *fakeVaultClient) SealStatus(_ context.Context) (*vault.SealStatus, erro
 	return f.SealResp, nil
 }
 
-func (f *fakeVaultClient) Login(_ context.Context) error {
+// EnsureLoggedIn counts every call in LoginCalls: tests read it as "passes
+// that reached the login step".
+func (f *fakeVaultClient) EnsureLoggedIn(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.LoginCalls++
@@ -126,6 +140,25 @@ func (f *fakeVaultClient) Login(_ context.Context) error {
 	}
 	f.tokenString = "stub-token"
 	return nil
+}
+
+func (f *fakeVaultClient) LookupSelf(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.LookupSelfCalls++
+	return f.LookupSelfErr
+}
+
+// ReadAuthMount answers from ListAuthMountsResp, the fake's sys/auth.
+func (f *fakeVaultClient) ReadAuthMount(_ context.Context, mount string) (vault.AuthMountInfo, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ReadAuthMountCalls++
+	if f.ListAuthMountsErr != nil {
+		return vault.AuthMountInfo{}, false, f.ListAuthMountsErr
+	}
+	info, ok := f.ListAuthMountsResp[strings.Trim(mount, "/")+"/"]
+	return info, ok, nil
 }
 
 func (f *fakeVaultClient) SharedMountExists(_ context.Context, _ string) (bool, error) {
@@ -148,14 +181,24 @@ func (f *fakeVaultClient) ClearToken() {
 	f.tokenString = ""
 }
 
-func (f *fakeVaultClient) EnableAuthMethod(_ context.Context, path string, _ vault.EnableAuthRequest) error {
+// EnableAuthMethod models sys/auth: a created mount appears in the
+// ListAuthMounts answer with the type and description it was created with.
+func (f *fakeVaultClient) EnableAuthMethod(_ context.Context, path string, req vault.EnableAuthRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.EnableAuthCalls++
+	f.Ops = append(f.Ops, "enable-auth:"+path)
+	if f.OnEnableAuth != nil {
+		f.OnEnableAuth(f)
+	}
 	if f.EnableAuthErr != nil {
 		return f.EnableAuthErr
 	}
 	f.EnabledAuthPaths = append(f.EnabledAuthPaths, path)
+	if f.ListAuthMountsResp == nil {
+		f.ListAuthMountsResp = map[string]vault.AuthMountInfo{}
+	}
+	f.ListAuthMountsResp[path+"/"] = vault.AuthMountInfo{Type: req.Type, Description: req.Description, Accessor: "auth_kubernetes_" + path}
 	return nil
 }
 
@@ -163,10 +206,12 @@ func (f *fakeVaultClient) DisableAuthMethod(_ context.Context, path string) erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.DisableAuthCalls++
+	f.Ops = append(f.Ops, "disable-auth:"+path)
 	if f.DisableAuthErr != nil {
 		return f.DisableAuthErr
 	}
 	f.DisabledAuthPaths = append(f.DisabledAuthPaths, path)
+	delete(f.ListAuthMountsResp, path+"/")
 	return nil
 }
 
@@ -174,6 +219,7 @@ func (f *fakeVaultClient) WriteKubernetesAuthConfig(_ context.Context, mount str
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.WriteConfigCalls++
+	f.Ops = append(f.Ops, "write-config:"+mount)
 	if f.WriteConfigErr != nil {
 		return f.WriteConfigErr
 	}
@@ -219,13 +265,31 @@ func (f *fakeVaultClient) ListAuthMounts(_ context.Context) (map[string]vault.Au
 	if f.ListAuthMountsErr != nil {
 		return nil, f.ListAuthMountsErr
 	}
-	return f.ListAuthMountsResp, nil
+	out := make(map[string]vault.AuthMountInfo, len(f.ListAuthMountsResp))
+	for k, v := range f.ListAuthMountsResp {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// opsWithPrefix filters the write log.
+func (f *fakeVaultClient) opsWithPrefix(prefix string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, op := range f.Ops {
+		if len(op) >= len(prefix) && op[:len(prefix)] == prefix {
+			out = append(out, op)
+		}
+	}
+	return out
 }
 
 func (f *fakeVaultClient) PutPolicy(_ context.Context, name, hcl string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.PutPolicyCalls++
+	f.Ops = append(f.Ops, "put-policy:"+name)
 	if f.PutPolicyErr != nil {
 		return f.PutPolicyErr
 	}
@@ -239,10 +303,12 @@ func (f *fakeVaultClient) PutPolicy(_ context.Context, name, hcl string) error {
 func (f *fakeVaultClient) DeletePolicy(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.Ops = append(f.Ops, "delete-policy:"+name)
 	if f.DeletePolicyErr != nil {
 		return f.DeletePolicyErr
 	}
 	f.DeletedPolicies = append(f.DeletedPolicies, name)
+	delete(f.WrittenPolicies, name)
 	return nil
 }
 
@@ -260,6 +326,7 @@ func (f *fakeVaultClient) PutKubernetesRole(_ context.Context, _, name string, r
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.PutRoleCalls++
+	f.Ops = append(f.Ops, "put-role:"+name)
 	if f.PutRoleErr != nil {
 		return f.PutRoleErr
 	}
@@ -273,10 +340,12 @@ func (f *fakeVaultClient) PutKubernetesRole(_ context.Context, _, name string, r
 func (f *fakeVaultClient) DeleteKubernetesRole(_ context.Context, _, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.Ops = append(f.Ops, "delete-role:"+name)
 	if f.DeleteRoleErr != nil {
 		return f.DeleteRoleErr
 	}
 	f.DeletedRoles = append(f.DeletedRoles, name)
+	delete(f.WrittenRoles, name)
 	return nil
 }
 
@@ -361,6 +430,7 @@ func (f *fakeVaultClient) CreateTransitKey(_ context.Context, mount, name string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.CreateTransitKeyCalls++
+	f.Ops = append(f.Ops, "create-transit-key:"+mount+"/"+name)
 	if f.CreateTransitKeyErr != nil {
 		return f.CreateTransitKeyErr
 	}
@@ -387,6 +457,7 @@ func (f *fakeVaultClient) UpdateTransitKeyConfig(_ context.Context, mount, name 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.UpdateTransitCfgCalls++
+	f.Ops = append(f.Ops, "update-transit-config:"+mount+"/"+name)
 	if f.UpdateTransitCfgErr != nil {
 		return f.UpdateTransitCfgErr
 	}

@@ -29,12 +29,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/policyguard"
 	"github.com/PRO-Robotech/vault-operator/internal/target"
 )
 
@@ -55,7 +56,18 @@ type VaultClaimReconciler struct {
 	// Now is an injectable clock for tests. nil → time.Now.
 	Now func() time.Time
 
-	backoff stepBackoff
+	// Ownership holds the deployment's reserved and external names.
+	Ownership OwnershipPolicy
+
+	// PolicyGuard selects what a policy outside the claim's classes does;
+	// empty means audit.
+	PolicyGuard policyguard.Mode
+
+	// Runtime carries the process-wide reconcile settings.
+	Runtime Runtime
+
+	backoff        stepBackoff
+	renderRefusals renderRefusals
 }
 
 const defaultMaxConcurrentReconciles = 4
@@ -75,6 +87,7 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.backoff.Reset(req.NamespacedName)
+			r.renderRefusals.forget(req.NamespacedName)
 			reviewerJWTExpirySeconds.DeleteLabelValues(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
@@ -98,11 +111,28 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	// Rules this generation was refused for do not render on a second pass:
+	// the claim waits for an edit of spec or for the recheck to come due.
+	if wait, ok := r.renderRefusals.pending(req.NamespacedName, claim, r.now()); ok {
+		logger.V(1).Info("rules of this generation do not render; pass skipped until the recheck", "requeueAfter", wait.String())
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
+
 	oldStatus := claim.Status.DeepCopy()
+	// The generation this pass admits. A pass an edit cut short leaves the
+	// edit unobserved, so the next pass treats the spec as changed.
+	observed := claim.Generation
 
-	result := r.executePipeline(ctx, claim)
+	// executePipeline advances oldStatus each time it persists an intent, so
+	// the final patch is computed against what the API server already holds.
+	result, completed := r.executePipeline(ctx, claim, oldStatus)
 
-	claim.Status.ObservedGeneration = claim.Generation
+	// Only a pass that brought Vault to the spec observed it: after a failed,
+	// waiting or refused pass the generation stays unobserved, and the next
+	// pass does not take the drift-check shortcut.
+	if completed {
+		claim.Status.ObservedGeneration = observed
+	}
 	if claim.Status.Vault == nil {
 		claim.Status.Vault = &vaultv1alpha1.VaultStatusSummary{}
 	}
@@ -114,7 +144,13 @@ func (r *VaultClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if err := r.updateStatusIfChanged(ctx, claim, oldStatus); err != nil {
-		logger.V(1).Info("status update conflict (will retry)", "err", err.Error())
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		// The ledger is what deletion trusts; a pass whose ledger was not
+		// persisted must be retried, not reported as done.
+		logger.V(1).Info("status update failed (will retry)", "err", err.Error())
+		return ctrl.Result{}, fmt.Errorf("update VaultClaim status: %w", err)
 	}
 
 	return result, nil
@@ -159,23 +195,44 @@ func (r *VaultClaimReconciler) now() time.Time {
 	return time.Now()
 }
 
+// claimChangedPredicate passes the changes a claim acts on: its spec
+// (generation, which deletion bumps too), its labels and its annotations. A
+// status or finalizer write passes nothing.
+func claimChangedPredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.LabelChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+	)
+}
+
 func (r *VaultClaimReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	workers := r.MaxConcurrentReconciles
 	if workers <= 0 {
 		workers = defaultMaxConcurrentReconciles
 	}
+	if err := indexConfigRef(mgr, &vaultv1alpha1.VaultClaim{}, vaultClaimConfigRef); err != nil {
+		return fmt.Errorf("index VaultClaims by VaultConfig: %w", err)
+	}
+	// Status patches (every pass writes one when anything changed) must not
+	// re-trigger the claim: the pipeline's own RequeueAfter paces it. Deletion
+	// bumps generation, so the reverse pipeline still starts at once. A
+	// VaultConfig reaches its claims only when what they read of it changes.
+	// Secrets are watched by metadata: the kubeconfig is read live when a pass
+	// needs it, so no Secret body is held in memory.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&vaultv1alpha1.VaultClaim{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: workers}).
+		For(&vaultv1alpha1.VaultClaim{}, builder.WithPredicates(claimChangedPredicate())).
+		WithOptions(r.Runtime.controllerOptions(workers)).
 		Watches(
 			&vaultv1alpha1.VaultConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.findClaimsForVaultConfig),
+			builder.WithPredicates(vaultConfigFanOutPredicate()),
 		).
-		Watches(
+		WatchesMetadata(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.findClaimsForSecret),
 			builder.WithPredicates(kubeconfigSecretPredicate()),
 		).
 		Named("vaultclaim").
-		Complete(r)
+		Complete(r.Runtime.wrap(r))
 }

@@ -11,7 +11,6 @@ You may obtain a copy of the License at
 package cloudmanager
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -54,49 +53,47 @@ func TestManagedByEnum(t *testing.T) {
 	}
 }
 
-func TestFakeBucketAPIRoundtrip(t *testing.T) {
-	ctx := context.Background()
-	f := NewFakeBucketAPI()
-
-	realName, err := f.Create(ctx, CreateInput{CustomerLogin: "c1", BucketName: "b1"})
-	if err != nil {
-		t.Fatalf("create: %v", err)
+func TestRequestedNameRe(t *testing.T) {
+	cases := []struct {
+		name   string
+		suffix bool
+		want   bool
+	}{
+		{"c942bd41757d-k8s-dkolbin-ipam-3", false, true},
+		{"c942bd41757d-k8s-dkolbin-ipam-3-1", false, false},
+		{"c942bd41757d-k8s-dkolbin-ipam-3-1", true, true},
+		{"c942bd41757d-k8s-dkolbin-ipam-3-x", true, false},
+		{"k8s-dkolbin-ipam-3", true, false},    // no prefix
+		{"zz-k8s-dkolbin-ipam-3", true, false}, // prefix is not hex
+		{"c942bd41757d-k8s-dkolbin-ipam", true, false},
 	}
-	if realName == "b1" || stripBucketPrefix(realName) != "b1" {
-		t.Fatalf("expected prefixed real name for b1, got %q", realName)
-	}
-	// Exact lookup works by real name, not the requested one.
-	if _, err := f.FindByCustomerBucket(ctx, "c1", "b1"); !errors.Is(err, ErrBucketNotFound) {
-		t.Errorf("exact lookup by requested name should miss, got %v", err)
-	}
-	b, err := f.FindByCustomerBucket(ctx, "c1", realName)
-	if err != nil {
-		t.Fatalf("find by real name: %v", err)
-	}
-	if b.Status != StatusRunning || b.AccessKey == "" || b.SecretKey == "" || b.ManagedBy != ManagedBySystem {
-		t.Errorf("unexpected bucket: %+v", b)
-	}
-	// Requested-name lookup finds it despite the prefix.
-	if _, err := f.FindByCustomerRequested(ctx, "c1", "b1"); err != nil {
-		t.Errorf("requested lookup should find prefixed bucket: %v", err)
-	}
-	if err := f.Remove(ctx, realName); err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if _, err := f.FindByCustomerRequested(ctx, "c1", "b1"); !errors.Is(err, ErrBucketNotFound) {
-		t.Errorf("after remove, want ErrBucketNotFound, got %v", err)
+	re := requestedNameRe("k8s-dkolbin-ipam-3", false)
+	reS := requestedNameRe("k8s-dkolbin-ipam-3", true)
+	for _, c := range cases {
+		r := re
+		if c.suffix {
+			r = reS
+		}
+		if got := r.MatchString(c.name); got != c.want {
+			t.Errorf("match(%q, suffix=%v) = %v, want %v", c.name, c.suffix, got, c.want)
+		}
 	}
 }
 
-func TestStripBucketPrefix(t *testing.T) {
-	cases := map[string]string{
-		"c942bd41757d-k8s-dkolbin-ipam-3": "k8s-dkolbin-ipam-3",
-		"k8s-dkolbin-ipam-3":              "dkolbin-ipam-3", // no hex prefix: strips first segment
-		"nodash":                          "nodash",
+func TestClassifyRemove(t *testing.T) {
+	if err := classifyRemove(""); err != nil {
+		t.Errorf("empty: %v", err)
 	}
-	for in, want := range cases {
-		if got := stripBucketPrefix(in); got != want {
-			t.Errorf("stripBucketPrefix(%q)=%q, want %q", in, got, want)
+	if err := classifyRemove("Not found"); !errors.Is(err, ErrBucketNotFound) {
+		t.Errorf("Not found: %v", err)
+	}
+	if err := classifyRemove("Already removed"); !errors.Is(err, ErrAlreadyRemoved) {
+		t.Errorf("Already removed: %v", err)
+	}
+	// Near misses are not the vocabulary.
+	for _, msg := range []string{"not found", "Already removed.", "Not found: x"} {
+		if err := classifyRemove(msg); !errors.Is(err, ErrRemoveFailed) {
+			t.Errorf("%q: %v, want ErrRemoveFailed", msg, err)
 		}
 	}
 }

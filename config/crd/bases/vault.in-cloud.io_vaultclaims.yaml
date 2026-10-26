@@ -66,22 +66,42 @@ spec:
                     default: true
                     description: |-
                       AutoCreate enables the operator to POST sys/auth; when false only
-                      auth/{path}/config is written, assuming the mount already exists.
+                      auth/{path}/config is written, assuming the mount already exists and
+                      carries this claim's description.
                     type: boolean
                   issuer:
                     description: |-
                       Issuer is the OIDC issuer URL of the infra cluster; empty triggers
                       auto-discovery via /.well-known/openid-configuration.
                     type: string
+                  manageConfig:
+                    default: true
+                    description: |-
+                      ManageConfig makes the claim the owner of the mount: it writes
+                      auth/{path}/config, rotates the reviewer JWT and manages the reviewer SA.
+                      False makes the claim a guest that only adds its own roles and policies
+                      to a mount configured by someone else (an operator mount from a
+                      VaultConfig or an allow-listed one). Immutable.
+                    type: boolean
                   mountPath:
                     description: |-
                       MountPath of the per-cluster auth method (convention:
                       "kubernetes-{metadata.name}"). Immutable.
                     minLength: 1
                     type: string
+                  rolePruning:
+                    description: |-
+                      RolePruning selects which roles on the mount the claim deletes when they
+                      leave spec.roles. Empty means Exclusive for an owner claim and Owned for
+                      a guest. Exclusive applies only while the claim provably owns the mount.
+                    enum:
+                    - Exclusive
+                    - Owned
+                    type: string
                   tokenReviewer:
-                    description: TokenReviewer identifies the SA whose JWT Vault uses
-                      for TokenReview.
+                    description: |-
+                      TokenReviewer identifies the SA whose JWT Vault uses for TokenReview.
+                      Required unless manageConfig is false.
                     properties:
                       serviceAccount:
                         description: |-
@@ -115,13 +135,20 @@ spec:
                     type: object
                 required:
                 - mountPath
-                - tokenReviewer
                 type: object
+                x-kubernetes-validations:
+                - message: spec.auth.manageConfig=false requires autoCreate=false
+                    and rolePruning=Owned
+                  rule: '!has(self.manageConfig) || self.manageConfig || (has(self.autoCreate)
+                    && !self.autoCreate && has(self.rolePruning) && self.rolePruning
+                    == ''Owned'')'
+                - message: spec.auth.tokenReviewer is required unless spec.auth.manageConfig=false
+                  rule: (has(self.manageConfig) && !self.manageConfig) || has(self.tokenReviewer)
               clusterRef:
                 description: |-
-                  ClusterRef references the ClusterClaim and its kubeconfig Secret. Both
-                  fields are immutable — changing them would re-target this VaultClaim to a
-                  different cluster.
+                  ClusterRef references the ClusterClaim and its kubeconfig Secret; its
+                  name is immutable. Required unless spec.auth.manageConfig is false: a
+                  guest claim has no cluster of its own.
                 properties:
                   kubeconfigSecret:
                     description: KubeconfigSecret is the Secret name; defaults to
@@ -152,19 +179,69 @@ spec:
                     be prefixed with "{metadata.name}-" because Vault OSS policies live in a
                     global namespace.
                   properties:
+                    identityPaths:
+                      description: IdentityPaths are appended to the rules, one path
+                        stanza each.
+                      items:
+                        description: |-
+                          IdentityPath grants capabilities on a Vault path that names the logged-in
+                          ServiceAccount.
+                        properties:
+                          capabilities:
+                            description: Capabilities granted on the path. sudo and
+                              deny are not offered.
+                            items:
+                              enum:
+                              - create
+                              - read
+                              - update
+                              - patch
+                              - delete
+                              - list
+                              type: string
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-type: set
+                          path:
+                            description: |-
+                              Path is a Vault ACL path, without a leading "/", made of segments of
+                              [a-z0-9._-] and the placeholders {serviceAccountName} and
+                              {serviceAccountNamespace}; at least one placeholder, no globs, no
+                              segment made of dots only. The pattern carries every rule: CEL here
+                              would be costed per item of two unbounded lists.
+                            maxLength: 512
+                            minLength: 1
+                            pattern: ^(?:(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*)/)*[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*(?:/(?:[a-z0-9._-]*[a-z0-9_-][a-z0-9._-]*|[a-z0-9._-]*(?:\{serviceAccountName\}|\{serviceAccountNamespace\})(?:[a-z0-9._-]|\{serviceAccountName\}|\{serviceAccountNamespace\})*))*$
+                            type: string
+                        required:
+                        - capabilities
+                        - path
+                        type: object
+                      maxItems: 32
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - path
+                      x-kubernetes-list-type: map
                     name:
                       minLength: 1
                       type: string
                     rules:
                       description: |-
-                        Rules is HCL ACL content; may use {{ .AuthMountAccessor }} for identity
-                        templating.
+                        Rules is HCL ACL content rendered as a Go template. {{ .AuthMountAccessor }}
+                        is the accessor of spec.auth.mountPath; {{ vaultSAName }} and
+                        {{ vaultSANamespace }} write the Vault templates naming the logged-in
+                        ServiceAccount. A Vault template written directly must be escaped:
+                        {{`{{`}} … {{`}}`}}. No other template construct is admitted; at most
+                        16384 bytes (MaxRulesLength).
+                      maxLength: 16384
                       minLength: 1
                       type: string
                   required:
                   - name
-                  - rules
                   type: object
+                  x-kubernetes-validations:
+                  - message: a policy needs rules, identityPaths or both
+                    rule: has(self.rules) || has(self.identityPaths)
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -175,6 +252,15 @@ spec:
                     RoleSpec binds {SA, namespace} to a list of policies inside the
                     per-cluster auth mount.
                   properties:
+                    aliasNameSource:
+                      description: |-
+                        AliasNameSource selects how Vault names the entity alias of a login.
+                        Empty sends nothing: a new role gets Vault's default (serviceaccount_uid),
+                        an existing one keeps what it has.
+                      enum:
+                      - serviceaccount_uid
+                      - serviceaccount_name
+                      type: string
                     audience:
                       description: |-
                         Audience is the `aud` claim Vault verifies in the login JWT. Without it the
@@ -182,32 +268,50 @@ spec:
                       type: string
                     boundServiceAccounts:
                       description: |-
-                        BoundServiceAccounts identifies the single ServiceAccount allowed to log
-                        in through this role.
+                        BoundServiceAccounts identifies the ServiceAccounts allowed to log in
+                        through this role: one name, or a set of names, all in one namespace.
 
-                        This CRD intentionally binds ONE SA per role — unlike Vault's native
-                        bound_service_account_names / bound_service_account_namespaces which take
-                        arrays and produce a Cartesian product. Reasons:
+                        A role still maps to one namespace and one list of policies: TTLs,
+                        policies and bound CIDRs stay per role. The ServiceAccount that logged in is
+                        visible in the token's metadata (service_account_name,
+                        service_account_namespace) and in the audit log, so a role with several
+                        names does not hide who logged in. Several namespaces need several roles.
 
-                          - Audit clarity: a Vault login event names a role that maps 1:1 to a
-                            specific SA. Multi-SA roles obscure who logged in.
-                          - Per-SA tuning: TTLs, policies, and bound CIDRs can differ per role —
-                            impossible to express on a shared multi-SA role.
-                          - Identity mapping: Vault entity ↔ SA stays unambiguous.
-
-                        To share a policy across SAs, declare N roles with the same `policies` —
-                        policy objects are independent, only roles are scoped.
+                        Name and namespace refuse the glob characters Vault reads (*, ?, [): a glob
+                        binds ServiceAccounts nobody named. The rule ratchets — a stored value that
+                        does not change keeps validating, so claims written before the rule are
+                        still updated; a new or changed value is judged.
                       properties:
                         name:
+                          description: Name of the single ServiceAccount.
+                          maxLength: 253
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
+                        names:
+                          description: |-
+                            Names of the ServiceAccounts, without globs. The operator writes them
+                            sorted, so their order here is not drift.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
                         namespace:
+                          maxLength: 63
                           minLength: 1
+                          pattern: ^[^*?\[]+$
                           type: string
                       required:
-                      - name
                       - namespace
                       type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of boundServiceAccounts.name and boundServiceAccounts.names
+                          is required
+                        rule: has(self.name) != has(self.names)
                     name:
                       description: Uniqueness scoped to auth/{mountPath}/role/.
                       minLength: 1
@@ -322,7 +426,6 @@ spec:
                 type: object
             required:
             - auth
-            - clusterRef
             - secretsPrefix
             - vaultConfigRef
             type: object
@@ -330,7 +433,13 @@ spec:
             - message: spec.secretsPrefix is immutable
               rule: self.secretsPrefix == oldSelf.secretsPrefix
             - message: spec.clusterRef.name is immutable
-              rule: self.clusterRef.name == oldSelf.clusterRef.name
+              rule: has(self.clusterRef) == has(oldSelf.clusterRef) && (!has(self.clusterRef)
+                || self.clusterRef.name == oldSelf.clusterRef.name)
+            - message: spec.clusterRef is required unless spec.auth.manageConfig=false
+              rule: (has(self.auth.manageConfig) && !self.auth.manageConfig) || has(self.clusterRef)
+            - message: spec.auth.manageConfig is immutable
+              rule: (!has(self.auth.manageConfig) || self.auth.manageConfig) == (!has(oldSelf.auth.manageConfig)
+                || oldSelf.auth.manageConfig)
             - message: spec.auth.mountPath is immutable
               rule: self.auth.mountPath == oldSelf.auth.mountPath
             - message: spec.transit.mountPath is immutable
@@ -414,21 +523,54 @@ spec:
                   state.
                 properties:
                   appliedPolicies:
+                    description: |-
+                      AppliedPolicies is the ledger of policies this claim may have written:
+                      a name enters it before the write and leaves it after the policy is
+                      deleted.
                     items:
                       type: string
                     type: array
                   appliedRoles:
+                    description: |-
+                      AppliedRoles is the ledger of roles this claim may have written: a name
+                      enters it before the write and leaves it after the role is deleted.
                     items:
                       type: string
                     type: array
                   authMountAccessor:
                     description: |-
-                      AuthMountAccessor is cached from Vault, populated lazily on first
-                      render of a policy that uses {{ .AuthMountAccessor }}.
+                      AuthMountAccessor is the accessor the claim's templated policies were
+                      last rendered with, read from sys/auth on a pass that renders one. A
+                      different accessor in sys/auth means the mount was recreated: the
+                      policies are rendered again.
                     type: string
+                  authMountOwned:
+                    description: |-
+                      AuthMountOwned records a fact, never an intent: the mount answered 2xx
+                      to this claim's POST sys/auth, sys/auth reports it as a kubernetes
+                      mount carrying this claim's description, or authMountPath already
+                      named it.
+                    type: boolean
                   authMountPath:
+                    description: |-
+                      AuthMountPath is the auth mount this claim was accepted on. It is written
+                      only once the mount is accepted, never before, so a claim that waited
+                      or was refused does not hold it; a claim whose record names its mount
+                      keeps that mount whatever its description (releases before ownership
+                      checks recorded it for every claim and have configured the mount since).
                     type: string
                   configName:
+                    type: string
+                  issuer:
+                    description: |-
+                      Issuer is the service account issuer last discovered in the target
+                      cluster. A pass whose discovery fails configures the mount with it, but
+                      only while the kubeconfig still points at IssuerHost.
+                    type: string
+                  issuerHost:
+                    description: |-
+                      IssuerHost is the target API server Issuer was discovered on. A pass
+                      that finds another host and cannot discover drops Issuer.
                     type: string
                   lastDriftCheckAt:
                     description: |-
@@ -468,8 +610,11 @@ spec:
                         key, read back from Vault.
                       properties:
                         createdByClaim:
-                          description: CreatedByClaim distinguishes a key this operator
-                            created from an adopted one.
+                          description: |-
+                            CreatedByClaim distinguishes a key this operator created from an adopted
+                            one. An entry with CreatedByClaim and LatestVersion 0 is an intent: it is
+                            recorded before the key is created, so a crash between the create and the
+                            status write cannot turn the claim's own key into an adopted one.
                           type: boolean
                         latestVersion:
                           type: integer

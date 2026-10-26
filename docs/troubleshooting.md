@@ -53,6 +53,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 |---|---|---|
 | `TargetClientError` | kubeconfig не парсится / target apiserver unreachable | проверить, что kubeconfig валиден и infra-кластер запущен |
 | `TargetSAFailed` | SSA на namespace/SA/CRB провалилась | проверить RBAC kubeconfig'а в infra-кластере (нужны права на `serviceaccounts`, `clusterrolebindings`, `namespaces`) |
+| `ForeignReviewer` | SA ревьюера или его ClusterRoleBinding уже есть в infra-кластере без меток `vault.in-cloud.io/claim-name`/`claim-namespace` этой заявки; оператор их не трогает, заявка `Failed` | выяснить, чей это объект: свой без меток — проставить метки этой заявки; чужой — выбрать другое `tokenReviewer.serviceAccount.name` |
 | `TokenRequestFailed` | TokenRequest API провалился | k8s ≥ 1.20 в infra-кластере; проверить, что SA существует |
 
 ### AuthMountReady=False
@@ -67,7 +68,7 @@ Pipeline остановился на каком-то шаге. Смотрите 
 | reason | причина | действие |
 |---|---|---|
 | `AccessorLookupFailed` | не удалось получить accessor для `{{ .AuthMountAccessor }}` шаблона | сначала должен быть `AuthMountReady=True` — если auth method не создан, шаг 5 неуспешен |
-| `RenderFailed` | template error в HCL | проверить `spec.policies[].rules` — синтаксис Go template, доступная переменная: `.AuthMountAccessor` |
+| `RenderFailed` | `rules` не рендерятся: ошибка разбора шаблона, форма вне закрытого набора, неэкранированный шаблон Vault, `rules` длиннее 16384 байт, отрендеренное тело больше 262144 байт. Это отказ, а не транзиентная ошибка: `Phase=Failed`, `Ready=False reason=RenderFailed`, `Degraded` не меняется, `StepRetrying` нет; повтор — при правке spec либо раз в 10 минут | исправить `spec.policies[].rules`: допустимы текст, `{{ .AuthMountAccessor }}`, `{{ vaultSAName }}`, `{{ vaultSANamespace }}` и строковые константы. Сообщение называет причину: отвергнутую конструкцию и её позицию (`range at policy:<строка>:<байт>`), длину и предел (`16385 bytes, the limit is 16384`), размер и предел (`at least … bytes, the limit is 262144`) |
 | `PutPolicyFailed` | Vault отверг policy (часто 400 — invalid HCL) | смотреть message — обычно невалидный HCL |
 
 ### RolesApplied=False
@@ -291,7 +292,7 @@ kubectl get vaultsecretclaim <name> -n <ns> \
 
 | condition (False) | reason | причина | действие |
 |---|---|---|---|
-| `SourcesResolved` | `MissingSource` | для `copy` источник `source.path#source.key` отсутствует в Vault | завести источник (`vault kv put …`); до этого **ни один** элемент не пишется (all-or-nothing на pre-validate) |
+| `SourcesResolved` | `MissingSource` | для `copy` источник `source.path#source.key` отсутствует в Vault (`… not found`) либо Vault не дал его прочесть (`reading source … failed: <класс сбоя>`, полный текст — в логе оператора на V(1)) | завести источник (`vault kv put …`) или устранить сбой чтения; до этого **ни один** элемент не пишется (all-or-nothing на pre-validate) |
 | `ItemsApplied` | `DuplicateDestination` | два элемента пишут в один `destination.path + key` | поправить spec — пара path+key уникальна в пределах CR |
 | `ItemsApplied` | `ApplyFailed` | хотя бы один элемент не записался | смотреть `status.items[].message` (часто 403 — недостаточно прав в `vault-secret-operator-admin`) |
 
@@ -327,7 +328,7 @@ kubectl patch vaultsecretclaim -n <ns> <name> --type=merge -p '{"metadata":{"fin
 
 #### Значение не обновляется, хотя я поменял источник для copy
 
-`copy` перекопирует только при смене **значения** источника (детект по `hash(path+key+value)`). Сверьте `status.items[].sourceHash` — он должен поменяться. Изменение `destination` — это изменение spec, применяется по событию обновления CR.
+`copy` на каждом проходе сравнивает значение назначения со значением источника и перезаписывает при расхождении. Reconcile событийный: смена источника в Vault сама проход не вызывает — тригерните его (`kubectl annotate vaultsecretclaim <name> -n <ns> reconcile=$(date +%s) --overwrite`). Изменение `destination` — изменение spec: ключ записывается по новому месту, со старого снимается (журнал `status.items[].destination`).
 
 #### Сгенерированный пароль не меняется после редактирования CR
 
@@ -338,11 +339,58 @@ kubectl patch vaultsecretclaim -n <ns> <name> --type=merge -p '{"metadata":{"fin
 By design: reconcile событийный, без поллинга значений. Восстановление зависит от типа:
 
 - **generate** — тригерните reconcile (`kubectl annotate vaultsecretclaim <name> -n <ns> reconcile=$(date +%s) --overwrite`): ключа нет → перегенерируется, но **новым** значением (старое было случайным и невосстановимо — consumer'ы должны перечитать).
-- **copy** — обычный reconcile НЕ восстановит (источник не менялся → no-op по `sourceHash`). Восстановить: пересоздать CR (пустой статус → copy перекопирует) либо сменить значение источника.
+- **copy** — восстанавливается тем же reconcile: значение назначения сверяется с источником.
+
+#### Убрал элемент из spec — ключ из Vault пропал
+
+Так и задумано: ключ элемента, убранного из `secretList` (или сменившего `destination`), снимается по журналу `status.items[].destination`; соседние ключи листа остаются. Ключ не снимается, если тот же `(mount, path, key)` пишет другая `VaultSecretClaim`. Неудавшееся снятие остаётся в `status.orphans` и повторяется. Заявка, записанная прежним выпуском, на первом проходе только заполняет журнал.
+
+#### Генерация отказывает: «gives N bits, need >= 64»
+
+Новое значение должно нести не меньше 64 бит: `length × log2(число различных символов charset)`. Для алфавита по умолчанию (62 символа) это от 11 символов. Увеличьте `length` или алфавит.
 
 #### Consumer получает 403 на чтение записанного секрета
 
 Путь `destination` не покрыт consumer-policy. Эти policy пишет `VaultClaim` (`vault-operator`), а не секрет-оператор. Проверьте, что `secretsPrefix` у `VaultSecretClaim` совпадает с `VaultClaim.secretsPrefix`, и что в `VaultClaim` есть policy на `secret/data/clusters/{cluster}/{app}/*`.
+
+---
+
+## S3BucketClaim
+
+`bucket-operator` — отдельный контроллер: бакет кластера в cloud-manager и его ключи в Vault.
+
+```bash
+kubectl get s3bc -n <ns> <name> -o jsonpath='{.status.phase} {.status.bucketName} {.status.bucketOwnership}{"\n"}'
+kubectl get s3bc -n <ns> <name> \
+  -o jsonpath='{range .status.conditions[?(@.status=="False")]}{.type}: {.reason} — {.message}{"\n"}{end}'
+```
+
+### Phase=Failed
+
+| reason | причина | действие |
+|---|---|---|
+| `Conflict` | более старая заявка уже держит тот же (`customerLogin`, `clusterRef.name`), тот же лист KV или тот же бакет (в сообщении — её `ns/name`) | удалить дубль; заявка сама продолжит после ухода старшей |
+| `ForeignBucket` | бакет с этим именем принадлежит другому логину | проверить `customerLogin` / `spec.bucket.name` |
+| `AmbiguousBucket` | под логином несколько живых бакетов с подходящим именем | указать нужный в `spec.bucket.name` |
+| `BucketNotFound` | `spec.bucket.name` не найден у этого логина | исправить имя |
+| `ConfigurationMissing`, `InvalidBucketName` | отказ cloud-manager по входу | исправить spec / каталог cloud-manager |
+| `BadStatus`, `NoKeys`, `BucketMissing` | бакет не `RUNNING`, без ключей или пропал | сам повторяет 1m…30m; при `RUNNING` с ключами возвращается в `Ready` |
+
+Ошибки spec повторяются раз в 30m; правка заявки пересчитывает сразу.
+
+### Phase=Deleting бесконечно
+
+| reason (`Ready=False`) | причина | действие |
+|---|---|---|
+| `BucketRemoving` | cloud-manager ещё удаляет бакет | ждать `REMOVED` (опрос 15s) |
+| `DeletionStuck` | бакет в `ERROR` или `removeBucket` ответил незнакомым текстом | смотреть cloud-manager; метрика `vault_operator_cloudmanager_remove_unknown_response_total` |
+| `DeletionBlocked` | бакет не доказуемо свой: другой или пустой владелец, другой `managedBy`, либо `bucketOwnership=Adopted` без `spec.bucket.purgeAdopted` | если бакет можно удалить — `spec.bucket.purgeAdopted: true`; если нужно сохранить — `deletionPolicy: Retain` |
+
+Событие `BucketNotRecorded` при удалении: в момент удаления создание было в полёте и имя бакета не записано — бакет не удаляется, проверьте его в cloud-manager вручную.
+
+### Ключи в Vault
+
+Лист сверяется с Vault на каждом проходе (раз в 10 минут): удалённый или изменённый свой ключ восстанавливается, чужие ключи листа не трогаются. При смене `destinationPath` свои ключи снимаются со старого листа, только если он называет тот же бакет.
 
 ---
 

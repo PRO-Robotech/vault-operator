@@ -48,7 +48,8 @@ spec:
         ├─────────┬──────────┤
         │ sealed?           │── да  → VaultUnsealed=False, requeue 1 min, очистить кэш токена
         ├─────────┴──────────┤
-        │ POST auth/.../login│
+        │ токен процесса     │ ← вход только без токена;
+        │ GET lookup-self    │   отозванный токен заменяется
         └─────────┬──────────┘
                   │
                   ▼
@@ -66,6 +67,8 @@ spec:
 | Здоров (все 5 условий True) | 5 min |
 | Sealed/uninitialized | 1 min |
 | Сеть/login сломан | 30 sec |
+
+Перед пробой заново читается CA bundle (`tls.caBundleSecretRef`, `caBundleConfigMapRef`, `caBundleFile`). Изменившийся bundle пересобирает клиент без рестарта, токен сохраняется. vault-operator, кроме того, следит за метаданными Secret'а с bundle и пробует VaultConfig сразу после его изменения. Не читающийся bundle оставляет работающий клиент и даёт событие `CABundleUnreadable`. `lastHealthCheckAt` пишется не чаще раза в 5 минут, если остальное в status не изменилось.
 
 ## Immutable поля
 

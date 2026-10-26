@@ -108,10 +108,10 @@ status:
     - { type: ItemsApplied,    status: "True" }
     - { type: Ready,           status: "True" }
   items:
-    - { name: argocd-admin,   state: Applied, sourceHash: "9f2c…", lastAppliedAt: "2026-06-16T10:00:00Z" }
-    - { name: vmagent,        state: Applied, sourceHash: "1ab4…", lastAppliedAt: "2026-06-16T10:00:00Z" }
-    - { name: grafana-oidc,   state: Applied, sourceHash: "77de…", lastAppliedAt: "2026-06-16T10:00:00Z" }
-    - { name: etcd-backup-s3, state: Applied, sourceHash: "c310…", lastAppliedAt: "2026-06-16T10:00:00Z" }
+    - { name: argocd-admin, state: Applied, sourceHash: "9f2c…", lastAppliedAt: "2026-06-16T10:00:00Z",
+        destination: { mount: secret, path: argocd, key: admin.password, hashedKey: admin.passwordBcrypt } }
+    - { name: grafana-oidc, state: Applied, lastAppliedAt: "2026-06-16T10:00:00Z",   # copy: без хеша значения
+        destination: { mount: secret, path: grafana, key: staticClient } }
   observedGeneration: 3
 ```
 
@@ -184,6 +184,7 @@ path "secret/metadata/<source-prefix>/*" { capabilities = ["read", "list"] }
 # Ротация собственного токена.
 path "auth/token/renew-self"             { capabilities = ["update"] }
 path "auth/token/lookup-self"            { capabilities = ["read"] }
+path "auth/token/revoke-self"            { capabilities = ["update"] }
 ```
 
 Не выдаются `sys/auth/*`, `sys/policies/*`, `auth/+/role/*` — настройка доступа остаётся за `vault-operator`. Разделение прав: один контроллер пишет конфигурацию доступа и не может писать данные, второй пишет данные и не может изменять конфигурацию доступа.
@@ -224,11 +225,11 @@ Step 4  Ready → Phase=Ready
 
 Значение перезаписывается только при реальном изменении входа, а не на каждом reconcile.
 
-**copy** — перекопировать, когда изменился источник (путь, ключ или значение):
+**copy** — перекопировать, когда значение назначения отличается от значения источника:
 
-- контроллер вычисляет `hash(source.path + source.key + source.value)` и сравнивает с `status.items[].sourceHash`;
-- совпало — действий нет; иначе — перекопировать значение в `destination` и обновить `sourceHash`;
-- перекопирование идемпотентно: после пересоздания CR (статус пуст) копируется то же значение, без побочных эффектов.
+- контроллер читает источник и назначение и сравнивает значения; совпало — действий нет, иначе — запись слиянием в `destination`;
+- так исправляются и смена источника, и правка назначения извне; хеш значения секрета в status не хранится (status читает любой, у кого есть `get` на заявку);
+- перекопирование идемпотентно: после пересоздания CR копируется то же значение, без побочных эффектов.
 
 **generate** — регенерировать, когда:
 
@@ -277,7 +278,7 @@ Finalizer: `vault.in-cloud.io/vaultsecretclaim-finalizer`. Поведение з
 | `deletionPolicy` | При удалении CR |
 |---|---|
 | `Retain` (дефолт) | секреты остаются в Vault; пересоздание CR восстановит состояние (generate — create-once, copy — перекопирует из источника) |
-| `Purge` | контроллер удаляет записанные ключи из Vault (требует `delete` в policy, §3.2) |
+| `Purge` | контроллер удаляет записанные ключи из Vault по журналу `status.items[].destination` и `status.orphans` (элементы без журнала — по spec), кроме ключей, которые пишет другая заявка; соседние ключи листа остаются, опустевший лист удаляется (требует `delete` в policy, §3.2) |
 
 kubeconfig для cleanup не требуется (контроллер ничего не создаёт в target-кластерах).
 
@@ -326,9 +327,11 @@ secret/                                         общий KV-v2 mount (плат
 
 ### 9.3. Per-item status
 
-`status.items[]` (map by `name`): `{ name, state: Applied|Pending|Failed, sourceHash, lastAppliedAt, message }`.
+`status.items[]` (map by `name`): `{ name, state: Applied|Pending|Failed, sourceHash, destination, lastAppliedAt, message }`.
 
-`sourceHash` — хеш входа для детекта изменений (copy: `hash(source.path + source.key + source.value)`; generate: хеш критериев `length/charset/hash`), отдельное поле, не condition. Даёт точечную диагностику, какой элемент не применился и почему.
+`sourceHash` — только для generate: хеш критериев `length/charset/hash`. Для copy не заполняется (сравнение со значением источника, §4.2).
+
+`destination` — журнал: куда элемент записал (`mount`, `path` относительно неизменяемого `secretsPrefix`, `key`, `hashedKey`). Когда элемент уходит из spec или меняет назначение, его ключи снимаются из Vault — если тот же `(mount, path, key)` не пишет другая заявка; неудавшееся снятие остаётся в `status.orphans[]` и повторяется. Первый проход заявки, записанной прежним выпуском (журнала нет), только заполняет журнал, ничего не удаляя.
 
 ---
 
@@ -344,6 +347,7 @@ generate:
 ```
 
 - генерация — `crypto/rand` + rejection sampling (без modulo-bias);
+- новое значение — не меньше 64 бит: `length × log2(число различных символов алфавита)` (алфавит считается после удаления повторов); для алфавита по умолчанию — от 11 символов. Существующее значение ради этого не перегенерируется;
 - при `hash != none` в secret пишутся оба ключа: `destination.key` (raw) и `destination.hashedKey` (hash);
 - регенерация — только при изменении критериев (§4.2), иначе create-once.
 

@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -160,7 +161,7 @@ func makeVaultClaim(ctx context.Context, name, configName, secretName string) *v
 			SecretsPrefix:  "clusters/" + name,
 			Auth: vaultv1alpha1.AuthSpec{
 				MountPath:  "kubernetes-" + name,
-				AutoCreate: true,
+				AutoCreate: ptr.To(true),
 				TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 					ServiceAccount: vaultv1alpha1.ServiceAccountRef{
 						Namespace:  "beget-vault-system",
@@ -265,7 +266,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(got.Status.Vault.TokenReviewerJWT.LastRotated).NotTo(BeNil())
 		Expect(got.Status.Vault.LastReconcileAt).NotTo(BeNil())
 
-		// Vault.Login was called (Step 1 verifies token).
+		// Step 1 made sure the client holds a token.
 		Expect(fakeVC.LoginCalls).To(Equal(1))
 
 		// Target SA + CRB were created in the (fake) target cluster.
@@ -310,7 +311,9 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 			}
 		})
 
-		fakeVC.EnableAuthErr = &vault.APIError{Method: "POST", Path: "/v1/sys/auth/kubernetes-" + name, StatusCode: 400, Errors: []string{"path is already in use"}}
+		// Vault reports the mount with this claim's description, as it does for
+		// every mount an operator version created: no POST, config rewritten.
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
 
 		_, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
@@ -318,7 +321,45 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		got := getClaim(name)
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		Expect(isConditionTrue(got.Status.Conditions, vaultv1alpha1.ConditionAuthMountReady)).To(BeTrue())
-		Expect(fakeVC.WriteConfigCalls).To(Equal(1), "config write must still happen after 'already exists'")
+		Expect(got.Status.Vault.AuthMountOwned).To(BeTrue())
+		Expect(fakeVC.EnableAuthCalls).To(Equal(0), "an existing own mount is not re-created")
+		Expect(fakeVC.WriteConfigCalls).To(Equal(1), "config write must still happen for an existing mount")
+	})
+
+	It("Step 5: a 400 from POST sys/auth is ownership only when sys/auth then shows the claim's mount", func() {
+		name := nextClaimName()
+		configName := "cfg-" + name
+		secretName := name + "-kc"
+
+		makeHealthyVaultConfig(context.Background(), configName)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &vaultv1alpha1.VaultConfig{ObjectMeta: metav1.ObjectMeta{Name: configName}})
+		})
+		makeKubeconfigSecret(context.Background(), secretName, true)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: vcNS}})
+		})
+		claim := makeVaultClaim(context.Background(), name, configName, secretName)
+		DeferCleanup(func() {
+			fresh := &vaultv1alpha1.VaultClaim{}
+			if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, fresh); err == nil {
+				fresh.Finalizers = nil
+				_ = k8sClient.Update(context.Background(), fresh)
+				_ = k8sClient.Delete(context.Background(), fresh)
+			}
+		})
+
+		// The mount appears between our read and our POST (another replica).
+		fakeVC.EnableAuthErr = &vault.APIError{Method: "POST", Path: "/v1/sys/auth/kubernetes-" + name, StatusCode: 400, Errors: []string{"path is already in use"}}
+		fakeVC.OnEnableAuth = func(f *fakeVaultClient) {
+			f.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
+		}
+
+		_, err := reconcileClaim(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		got := getClaim(name)
+		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(fakeVC.WriteConfigCalls).To(Equal(1))
 	})
 
 	It("Step 5: every auth config write carries the reviewer JWT, even when the recorded one is fresh", func() {
@@ -388,7 +429,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
 					MountPath:  "kubernetes-" + name,
-					AutoCreate: true,
+					AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{
 							Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true,
@@ -450,7 +491,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				ClusterRef:     vaultv1alpha1.ClusterRef{Name: name, KubeconfigSecret: secretName},
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
-					MountPath: "kubernetes-" + name, AutoCreate: true,
+					MountPath: "kubernetes-" + name, AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
@@ -498,7 +539,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				ClusterRef:     vaultv1alpha1.ClusterRef{Name: name, KubeconfigSecret: secretName},
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
-					MountPath: "kubernetes-" + name, AutoCreate: true,
+					MountPath: "kubernetes-" + name, AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
@@ -781,10 +822,13 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		fakeVC.mu.Lock()
 		beforeWriteConfig := fakeVC.WriteConfigCalls
 		beforePutRole := fakeVC.PutRoleCalls
+		// The drift pass reads the claim's own mount once and lists nothing.
+		beforeListAuth := fakeVC.ListAuthMountsCalls
+		beforeReadAuth := fakeVC.ReadAuthMountCalls
 		fakeVC.mu.Unlock()
 
 		// Prime Vault to report "no drift".
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
 		fakeVC.ListPoliciesResp = nil // spec has no policies
 		fakeVC.ListRolesResp = nil    // spec has no roles
 
@@ -803,7 +847,8 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		// Steps 5-7 were skipped → write counters unchanged.
 		Expect(fakeVC.WriteConfigCalls).To(Equal(beforeWriteConfig), "Step 5 must be skipped on no-drift")
 		Expect(fakeVC.PutRoleCalls).To(Equal(beforePutRole), "Step 7 must be skipped on no-drift")
-		Expect(fakeVC.ListAuthMountsCalls).To(Equal(1))
+		Expect(fakeVC.ListAuthMountsCalls).To(Equal(beforeListAuth), "the drift check does not list sys/auth")
+		Expect(fakeVC.ReadAuthMountCalls).To(Equal(beforeReadAuth+1), "the drift check reads the claim's mount once")
 		Expect(fakeVC.ReadAuthCfgCalls).To(Equal(1), "drift check must read auth config")
 	})
 
@@ -836,7 +881,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 
 		// Prime Vault to report "no structural drift" — mount/policies/roles intact.
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
 		fakeVC.ListPoliciesResp = nil
 		fakeVC.ListRolesResp = nil
 
@@ -948,7 +993,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(issuedToken))
 
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": ownMountInfo(name)}
 		fakeVC.ListPoliciesResp = nil
 		fakeVC.ListRolesResp = nil
 
@@ -1058,7 +1103,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		Expect(fakeVC.AuthConfigs[mount].TokenReviewerJWT).To(Equal(issuedToken))
 
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{mount + "/": ownMountInfo(name)}
 		fakeVC.ListPoliciesResp = nil
 		fakeVC.ListRolesResp = nil
 
@@ -1100,7 +1145,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				ClusterRef:     vaultv1alpha1.ClusterRef{Name: name, KubeconfigSecret: secretName},
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
-					MountPath: "kubernetes-" + name, AutoCreate: true,
+					MountPath: "kubernetes-" + name, AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
@@ -1180,7 +1225,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				ClusterRef:     vaultv1alpha1.ClusterRef{Name: name, KubeconfigSecret: secretName},
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
-					MountPath: "kubernetes-" + name, AutoCreate: true,
+					MountPath: "kubernetes-" + name, AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
@@ -1335,7 +1380,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 				ClusterRef:     vaultv1alpha1.ClusterRef{Name: name, KubeconfigSecret: secretName},
 				SecretsPrefix:  "clusters/" + name,
 				Auth: vaultv1alpha1.AuthSpec{
-					MountPath: "kubernetes-" + name, AutoCreate: true,
+					MountPath: "kubernetes-" + name, AutoCreate: ptr.To(true),
 					TokenReviewer: vaultv1alpha1.TokenReviewerSpec{
 						ServiceAccount: vaultv1alpha1.ServiceAccountRef{Namespace: "beget-vault-system", Name: "vault-token-reviewer", AutoCreate: true},
 						TTL:            metav1.Duration{Duration: 24 * time.Hour},
@@ -1367,7 +1412,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 
 		// Simulate someone adding a rogue role directly in Vault.
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
 		fakeVC.ListRolesResp = []string{"wanted-role", "rogue-role"}
 
 		_, err = reconcileClaim(recon, name)
@@ -1404,7 +1449,7 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		// Drive to Ready, then prime "no drift" so later passes short-circuit.
 		_, err := reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())
-		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": {Type: "kubernetes"}}
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{"kubernetes-" + name + "/": ownMountInfo(name)}
 
 		// Within the heartbeat interval: nothing material changed → no write,
 		// no ResourceVersion churn, no watch echo.
@@ -1473,7 +1518,10 @@ var _ = Describe("VaultClaim Controller — Steps 1-4", func() {
 		Expect(res.RequeueAfter).To(Equal(RequeueClaimDriftReady))
 		Expect(getClaim(name).Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 
-		// A fresh failure starts over from the base interval.
+		// A fresh failure starts over from the base interval. The mount is
+		// removed so the drift check falls through to Step 3: the fake now
+		// reports the mount Step 5 created, as Vault does.
+		fakeVC.ListAuthMountsResp = map[string]vault.AuthMountInfo{}
 		fakeTarget.Err = errors.New("dial tcp 89.0.0.1:6443: i/o timeout")
 		res, err = reconcileClaim(recon, name)
 		Expect(err).NotTo(HaveOccurred())

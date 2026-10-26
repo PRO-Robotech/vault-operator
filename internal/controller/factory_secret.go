@@ -12,8 +12,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -22,14 +20,17 @@ import (
 )
 
 // SecretVaultClient is the subset of *vault.Client consumed by the
-// VaultSecretClaim reconciler — login plus KV-v2 read/write/delete.
+// VaultSecretClaim and S3BucketClaim reconcilers — login plus KV-v2
+// read/write/delete.
 type SecretVaultClient interface {
-	Login(ctx context.Context) error
+	EnsureLoggedIn(ctx context.Context) error
 	Token() string
 	ClearToken()
 
 	ReadKV(ctx context.Context, mount, path string) (map[string]any, bool, error)
 	WriteKV(ctx context.Context, mount, path string, data map[string]any) error
+	ReadKVVersioned(ctx context.Context, mount, path string) (map[string]any, int, bool, error)
+	WriteKVCAS(ctx context.Context, mount, path string, data map[string]any, cas int) error
 	KVMetadataExists(ctx context.Context, mount, path string) (bool, error)
 	DeleteKVMetadata(ctx context.Context, mount, path string) error
 }
@@ -42,24 +43,18 @@ type SecretVaultClientFactory interface {
 	Invalidate(name string)
 }
 
-// buildVaultClient constructs a *vault.Client from a VaultConfig; shared by both
-// the VaultClient and SecretVaultClient factories.
-func buildVaultClient(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig, jwtSrc vault.JWTSource) (*vault.Client, error) {
+// buildVaultClient constructs a *vault.Client from a VaultConfig and its
+// already loaded CA bundle; shared by both factories.
+func buildVaultClient(cfg *vaultv1alpha1.VaultConfig, caBundle []byte, jwtSrc vault.JWTSource, opts VaultClientOptions) (*vault.Client, error) {
 	if jwtSrc == nil {
 		jwtSrc = vault.NewFileJWTSource("")
 	}
 
-	var caBundle []byte
 	var serverName string
 	var insecure bool
 	if cfg.Spec.TLS != nil {
 		serverName = cfg.Spec.TLS.ServerName
 		insecure = cfg.Spec.TLS.InsecureSkipVerify
-		bundle, err := loadCABundle(ctx, cli, cfg.Spec.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("load CA bundle: %w", err)
-		}
-		caBundle = bundle
 	}
 
 	return vault.New(vault.Config{
@@ -67,47 +62,55 @@ func buildVaultClient(ctx context.Context, cli client.Client, cfg *vaultv1alpha1
 		AuthPath:           cfg.Spec.ManagerAuth.MountPath,
 		Role:               cfg.Spec.ManagerAuth.Role,
 		JWTSource:          jwtSrc,
+		Name:               cfg.Name,
 		CABundle:           caBundle,
 		ServerName:         serverName,
 		InsecureSkipVerify: insecure,
+		Timeout:            opts.Timeout,
+		QPS:                opts.QPS,
+		Burst:              opts.Burst,
+		MaxConnsPerHost:    opts.MaxConnsPerHost,
 	})
 }
 
 // DefaultSecretVaultClientFactory caches one SecretVaultClient per VaultConfig
-// name, rebuilding on generation bumps.
+// name. With Shared set it hands out the clients of that factory instead: a
+// process running a VaultConfig probe and a claim controller on one
+// VaultConfig then holds one client and one token, not two.
 type DefaultSecretVaultClientFactory struct {
 	JWTSource vault.JWTSource
+	Options   VaultClientOptions
+	Shared    *DefaultVaultClientFactory
 
-	mu      sync.Mutex
-	entries map[string]*secretFactoryEntry
-}
-
-type secretFactoryEntry struct {
-	generation int64
-	client     *vault.Client
+	cache clientCache
 }
 
 func (f *DefaultSecretVaultClientFactory) For(ctx context.Context, cli client.Client, cfg *vaultv1alpha1.VaultConfig) (SecretVaultClient, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.entries == nil {
-		f.entries = make(map[string]*secretFactoryEntry)
+	var vc *vault.Client
+	var err error
+	if f.Shared != nil {
+		vc, err = f.Shared.client(ctx, cli, cfg)
+	} else {
+		vc, err = f.cache.get(ctx, cli, cfg, f.JWTSource, f.Options)
 	}
-	if entry, ok := f.entries[cfg.Name]; ok && entry.generation == cfg.Generation {
-		return entry.client, nil
-	}
-
-	vc, err := buildVaultClient(ctx, cli, cfg, f.JWTSource)
 	if err != nil {
 		return nil, err
 	}
-	f.entries[cfg.Name] = &secretFactoryEntry{generation: cfg.Generation, client: vc}
 	return vc, nil
 }
 
 func (f *DefaultSecretVaultClientFactory) Invalidate(name string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.entries, name)
+	if f.Shared != nil {
+		f.Shared.Invalidate(name)
+		return
+	}
+	f.cache.invalidate(name)
+}
+
+// RevokeAll revokes the tokens of the clients this factory cached itself; a
+// shared factory's are revoked by their owner.
+func (f *DefaultSecretVaultClientFactory) RevokeAll(ctx context.Context) {
+	if f.Shared == nil {
+		f.cache.revokeAll(ctx)
+	}
 }

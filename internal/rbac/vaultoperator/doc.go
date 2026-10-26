@@ -18,5 +18,9 @@ package vaultoperator
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=vault.in-cloud.io,resources=vaultconfigs/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch
+// Secrets: list and watch feed a metadata-only watch (kubeconfig and CA
+// bundle changes); bodies are read one by one with get. ConfigMaps hold CA
+// bundles and are only read.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch

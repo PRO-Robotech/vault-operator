@@ -29,6 +29,7 @@ path "secret/metadata/system/*"     { capabilities = ["read", "list"] }
 
 path "auth/token/renew-self"        { capabilities = ["update"] }
 path "auth/token/lookup-self"       { capabilities = ["read"] }
+path "auth/token/revoke-self"       { capabilities = ["update"] }
 EOF
 ```
 
@@ -67,7 +68,7 @@ Overlay `config/secret-manager/` содержит:
 
 - `Namespace vault-secret-operator-system`
 - `ServiceAccount vault-secret-operator-controller-manager`
-- **узкий** `ClusterRole` (только `vaultsecretclaims` + `vaultconfigs` + `secrets/configmaps` read + events; **без** доступа к VaultClaim и kubeconfig)
+- **узкий** `ClusterRole` (только `vaultsecretclaims` + `vaultconfigs` + `secrets/configmaps` только `get` (CA bundle VaultConfig, без list/watch) + events; **без** доступа к VaultClaim и kubeconfig)
 - `Deployment` с `command: [/vault-secret-manager]` (тот же образ, другой entrypoint)
 
 > Образ задаётся через `images:` в `config/secret-manager/kustomization.yaml` (по умолчанию `controller:latest`) — переопределите на свой registry/tag.
@@ -88,7 +89,8 @@ kubectl logs -n vault-secret-operator-system -l control-plane=vault-secret-opera
 |---|---|---|
 | `--leader-elect` | (вкл. в overlay) | Один активный процесс |
 | `--health-probe-bind-address` | `:8081` | `/healthz`, `/readyz` |
-| `--metrics-bind-address` | `0` (выкл.) | Метрики (только общие `vault_api_*`; controller-метрик у секрет-оператора нет) |
+| `--metrics-bind-address` | `0` (выкл.) | Метрики: общие `vault_api_*`, `vault_circuit_state`, `vault_operator_claims{kind="VaultSecretClaim"}`; метрик pipeline у секрет-оператора нет |
+| `--vault-qps`, `--requeue-jitter`, `--reconcile-timeout`, `--graceful-shutdown-timeout` | см. [monitoring](monitoring.md#пробы-останов-и-лимиты) | Лимиты, разнесение повторов, дедлайны, останов — общие для трёх процессов |
 | `--pprof-bind-address` | `127.0.0.1:8082` | pprof/диагностика, только через `kubectl port-forward` |
 
 ## 3. VaultConfig для секрет-оператора
