@@ -2,6 +2,8 @@
 IMG ?= controller:latest
 IMG_VAULTSECRET ?= vault-secret-operator:latest
 IMG_BUCKET ?= bucket-operator:latest
+IMG_CMFAKE ?= cmfake:latest
+IMG_S3_SWEEPER ?= s3-sweeper:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -70,11 +72,12 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # make test runs without -race. These packages hold state shared between
-# reconcile workers (the Vault token, the target-cluster client cache) and need
+# reconcile workers (the Vault token, the target-cluster client cache)
+# or between the calls and removal workers of the cmfake store, and need
 # no envtest, so the race detector runs on them on every change.
 .PHONY: test-race
 test-race: ## Run the race detector on the packages with state shared between goroutines.
-	go test -race -count=1 ./internal/vault/... ./internal/target/... ./internal/health/...
+	go test -race -count=1 ./internal/vault/... ./internal/target/... ./internal/health/... ./internal/cloudmanager/cmfake/...
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -154,6 +157,8 @@ build: manifests generate fmt vet ## Build manager binaries.
 	go build -o bin/manager cmd/main.go
 	go build -o bin/vault-secret-manager cmd/vaultsecret/main.go
 	go build -o bin/bucket-operator cmd/bucket/main.go
+	go build -o bin/cmfake ./cmd/cmfake
+	go build -o bin/s3-sweeper ./cmd/s3-sweeper
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -173,6 +178,14 @@ docker-build-vaultsecret: ## Build docker image with the vault-secret-manager.
 .PHONY: docker-build-bucket
 docker-build-bucket: ## Build docker image with the bucket-operator.
 	$(CONTAINER_TOOL) build -f Dockerfile.bucket -t ${IMG_BUCKET} .
+
+.PHONY: docker-build-cmfake
+docker-build-cmfake: ## Build docker image with the cloud-manager double for the kind stand.
+	$(CONTAINER_TOOL) build -f Dockerfile.cmfake -t ${IMG_CMFAKE} .
+
+.PHONY: docker-build-s3-sweeper
+docker-build-s3-sweeper: ## Build docker image with the CI bucket sweeper.
+	$(CONTAINER_TOOL) build -f Dockerfile.s3-sweeper -t ${IMG_S3_SWEEPER} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

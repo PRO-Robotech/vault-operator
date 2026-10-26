@@ -165,3 +165,80 @@ func triggersOf(w workflow) map[string]bool {
 	}
 	return out
 }
+
+// Каждый Dockerfile корня собирается заданием docker-build.yml и публикуется
+// под своим именем образа; двойник cloud-manager (Dockerfile.cmfake) — среди
+// них: образ стенда даёт сборка, а не рука.
+func TestEveryDockerfileIsBuiltByTheImageWorkflow(t *testing.T) {
+	w, ok := readWorkflows(t)["docker-build.yml"]
+	if !ok {
+		t.Fatal("docker-build.yml not read")
+	}
+	built := map[string]string{}
+	for _, j := range w.Jobs {
+		for _, s := range j.Steps {
+			if !strings.HasPrefix(s.Uses, "docker/build-push-action@") {
+				continue
+			}
+			file, _ := s.With["file"].(string)
+			tags, _ := s.With["tags"].(string)
+			built[strings.TrimPrefix(file, "./")] = tags
+		}
+	}
+	files, err := filepath.Glob("../../Dockerfile*")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	read := 0
+	for _, f := range files {
+		name := filepath.Base(f)
+		if strings.HasSuffix(name, ".cross") {
+			continue
+		}
+		read++
+		if _, ok := built[name]; !ok {
+			t.Errorf("%s is not built by docker-build.yml (built: %v)", name, built)
+		}
+	}
+	if read == 0 {
+		t.Fatal("no Dockerfile read")
+	}
+	tags, ok := built["Dockerfile.cmfake"]
+	if !ok {
+		t.Fatalf("Dockerfile.cmfake is not built by docker-build.yml (built: %v)", built)
+	}
+	if !strings.Contains(tags, "/cmfake:${{ steps.sanitize.outputs.branch }}-${{ steps.short-sha.outputs.sha }}") {
+		t.Fatalf("Dockerfile.cmfake tags = %q, want <namespace>/cmfake:<branch>-<sha8>", tags)
+	}
+	t.Logf("Dockerfiles read %d, build steps %d", read, len(built))
+}
+
+// Уборщик бакетов CI (Dockerfile.s3-sweeper) публикуется под своим именем
+// образа той же схемой тега: задание CI берёт его по имени ветки и sha.
+func TestTheS3SweeperImageIsPublishedUnderItsName(t *testing.T) {
+	w, ok := readWorkflows(t)["docker-build.yml"]
+	if !ok {
+		t.Fatal("docker-build.yml not read")
+	}
+	steps := 0
+	for _, j := range w.Jobs {
+		for _, s := range j.Steps {
+			if !strings.HasPrefix(s.Uses, "docker/build-push-action@") {
+				continue
+			}
+			steps++
+			if file, _ := s.With["file"].(string); strings.TrimPrefix(file, "./") != "Dockerfile.s3-sweeper" {
+				continue
+			}
+			tags, _ := s.With["tags"].(string)
+			if !strings.Contains(tags, "/s3-sweeper:${{ steps.sanitize.outputs.branch }}-${{ steps.short-sha.outputs.sha }}") {
+				t.Fatalf("Dockerfile.s3-sweeper tags = %q, want <namespace>/s3-sweeper:<branch>-<sha8>", tags)
+			}
+			if push, _ := s.With["push"].(string); push != "${{ github.event_name == 'push' }}" {
+				t.Fatalf("Dockerfile.s3-sweeper push = %q, want pushes only on push events", push)
+			}
+			return
+		}
+	}
+	t.Fatalf("Dockerfile.s3-sweeper is not built by docker-build.yml (build steps read %d)", steps)
+}

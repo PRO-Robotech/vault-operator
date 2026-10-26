@@ -108,6 +108,17 @@ func (r *S3BucketClaimReconciler) purgeBucket(ctx context.Context, claim *vaultv
 	case cloudmanager.StatusError:
 		return r.deletionStuck(claim, fmt.Sprintf("bucket %q is in ERROR; waiting for cloud-manager", name)), false
 	}
+	switch holder, err := r.bucketHolder(ctx, claim, name); {
+	case err != nil:
+		log.FromContext(ctx).V(1).Info("list S3BucketClaims failed", "err", err.Error())
+		return r.deletionStuck(claim, "listing S3BucketClaims failed; retrying"), false
+	case holder != "":
+		res := r.deletionBlocked(claim, fmt.Sprintf("bucket %q is held by claim %s; not removed while it holds the name", name, holder))
+		// Держание снимает не правка этой заявки, а снятие или правка соседа:
+		// пересчёт идёт с шагом проверки единственности, а не ошибки spec.
+		res.RequeueAfter = bucketRequeueConflict
+		return res, false
+	}
 	switch err := r.Buckets.Remove(ctx, name); {
 	case err == nil:
 		r.event(claim, corev1.EventTypeNormal, "BucketRemoving", fmt.Sprintf("removal of bucket %q requested", name))
@@ -118,6 +129,29 @@ func (r *S3BucketClaimReconciler) purgeBucket(ctx context.Context, claim *vaultv
 		log.FromContext(ctx).V(1).Info("cloud-manager removeBucket failed", "err", err.Error())
 		return r.deletionStuck(claim, fmt.Sprintf("removal of bucket %q failed; retrying", name)), false
 	}
+}
+
+// bucketHolder называет другую живую (без deletionTimestamp) заявку любого
+// пространства имён, у которой то же имя бакета записано в status.bucketName или
+// задано в spec.bucket.name; пустая строка — такой заявки нет. Одно имя может
+// оказаться у двух заявок: ответ create записывается после того, как сосед
+// успел принять тот же бакет. Снимаемая соседом заявка не держит: её Purge
+// снимает тот же бакет, Retain отпускает финализатор сразу.
+func (r *S3BucketClaimReconciler) bucketHolder(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, name string) (string, error) {
+	var list vaultv1alpha1.S3BucketClaimList
+	if err := r.List(ctx, &list); err != nil {
+		return "", err
+	}
+	for i := range list.Items {
+		o := &list.Items[i]
+		if o.UID == claim.UID || !o.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if o.Status.BucketName == name || o.Spec.Bucket.Name == name {
+			return o.Namespace + "/" + o.Name, nil
+		}
+	}
+	return "", nil
 }
 
 func (r *S3BucketClaimReconciler) bucketRemoving(claim *vaultv1alpha1.S3BucketClaim, name string) ctrl.Result {

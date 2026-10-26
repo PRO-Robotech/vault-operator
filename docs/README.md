@@ -37,6 +37,8 @@
 | Документ | Описание |
 |----------|----------|
 | [API Reference](reference/api.md) | Полное описание полей VaultClaim, VaultSecretClaim и VaultConfig |
+| [cmfake](reference/cmfake.md) | Двойник cloud-manager службой для стенда kind: контракт, конфиг, отказы |
+| [s3-sweeper](reference/s3-sweeper.md) | Уборщик бакетов прогонов CI вне кластера: форма имени, режимы job и sweep, коды выхода |
 
 ### Примеры
 
