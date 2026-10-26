@@ -294,7 +294,7 @@ func (r *S3BucketClaimReconciler) ensureBucket(ctx context.Context, claim *vault
 			"Locating", "create in flight; waiting for the bucket to appear")
 		return ctrl.Result{RequeueAfter: bucketRequeueCreating}, false
 	}
-	return r.createBucket(ctx, claim, base, requestedName)
+	return r.createBucket(ctx, claim, base, requestedName, others)
 }
 
 // pendingCreateCandidates keeps the candidates the create recorded in pending
@@ -358,7 +358,7 @@ func (r *S3BucketClaimReconciler) adoptNamed(ctx context.Context, claim *vaultv1
 	return ctrl.Result{}, true
 }
 
-func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, requestedName string) (ctrl.Result, bool) {
+func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim, base *vaultv1alpha1.S3BucketClaimStatus, requestedName string, others []vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
 	// The names taken before the FIRST create of this name: a later pass that
 	// has to locate the bucket a create made never takes one of them. A repeat
@@ -414,7 +414,17 @@ func (r *S3BucketClaimReconciler) createBucket(ctx context.Context, claim *vault
 	switch {
 	case err == nil && realName != "":
 		if !createdNameMatches(realName, claim.Status.PendingCreate) {
-			return r.rejectCreatedName(claim)
+			res, ok := r.rejectCreatedName(claim)
+			// Отказ уже в статусе: имя пишется только вместе с ним, иначе следующий
+			// проход принял бы записанный бакет за подтверждённый.
+			if recordRejectedName(claim, realName, others) {
+				if err := r.persist(ctx, claim, base); err != nil {
+					// Статус дописывает и конец прохода; запись здесь сужает окно,
+					// в котором соседняя заявка могла бы принять этот бакет за свой.
+					logger.V(1).Info("persist rejected bucketName failed", "err", err.Error())
+				}
+			}
+			return res, ok
 		}
 		claim.Status.BucketName = realName
 		claim.Status.BucketOwnership = vaultv1alpha1.BucketOwnershipCreated
@@ -496,8 +506,35 @@ func createdNameMatches(name string, pending *vaultv1alpha1.PendingBucketCreate)
 	return cloudmanager.MatchesRequestedName(name, pending.RequestedName, baseTaken)
 }
 
-// rejectCreatedName оставляет маркер и устойчивый отказ вместо повторных созданий.
-// Неподтверждённое имя не записывается и никогда не становится целью Purge.
+// recordRejectedName записывает имя, которое create выдал этой заявке вне сверки,
+// как созданное ею, чтобы Purge снял бакет и сироты не осталось. Подтверждением имя
+// не становится: отказ CreateNameMismatch остаётся, и проход до учётных данных
+// этого бакета не доходит. Записанное имя видно соседним заявкам как занятое
+// (withoutClaimedBuckets).
+//
+// Не пишется имя, которое держит другая заявка или которое равно базовому имени
+// соседнего кластера того же логина (claimedElsewhere): обе формы отвергнутого
+// имени по построению совпадают с базой соседа, и записанное имя отняло бы у него
+// бакет. Такой бакет остаётся соседу, а pendingCreate — для расследования.
+//
+// Что бакет создан именно этим вызовом, держит уникальность имён на стороне
+// службы облака (имя занято в любом статусе), а не снимок: pendingCreate.existingNames
+// содержит лишь имена по образцу запрошенного, и отвергнутое имя вне образца в
+// нём не бывает. Проверка по снимку отсекает только имя в образце.
+func recordRejectedName(claim *vaultv1alpha1.S3BucketClaim, name string, others []vaultv1alpha1.S3BucketClaim) bool {
+	pending := claim.Status.PendingCreate
+	if name == "" || pending == nil || slices.Contains(pending.ExistingNames, name) || claimedElsewhere(name, others, claim) {
+		return false
+	}
+	claim.Status.BucketName = name
+	claim.Status.BucketOwnership = vaultv1alpha1.BucketOwnershipCreated
+	claim.Status.PendingCreate = nil
+	return true
+}
+
+// rejectCreatedName оставляет устойчивый отказ вместо повторных созданий: при
+// записанном отказе проход до учётных данных не доходит, имя из ответа create
+// снимает лишь Purge (recordRejectedName).
 func (r *S3BucketClaimReconciler) rejectCreatedName(claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
 	r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, bucketCreateNameMismatch,
 		"cloud-manager returned an unexpected bucket name; inspect provisioning and recreate the claim")
