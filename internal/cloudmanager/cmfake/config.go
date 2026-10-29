@@ -55,8 +55,8 @@ type Config struct {
 // fileConfig — форма файла. Ключи S3 в файле не лежат: он называет файлы,
 // которые монтирует Secret стенда.
 type fileConfig struct {
-	ListenAddress  string `json:"listenAddress"`
-	DefaultRegion  string `json:"defaultRegion"`
+	ListenAddress string `json:"listenAddress"`
+	DefaultRegion string `json:"defaultRegion"`
 	// BucketKeys — login (умолчание) либо bucket: своя пара ключей и свой
 	// пользователь хранилища на бакет; bucket требует ключи администратора.
 	BucketKeys     string `json:"bucketKeys"`
