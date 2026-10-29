@@ -11,6 +11,7 @@ You may obtain a copy of the License at
 package cmfake
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -44,9 +45,15 @@ type S3Backend struct {
 	region   string
 	client   *http.Client
 	now      func() time.Time
+	// admin — ключи администратора хранилища; nil — вопросов администратора
+	// нет.
+	admin *Credentials
 }
 
-var _ Backend = (*S3Backend)(nil)
+var (
+	_ Backend   = (*S3Backend)(nil)
+	_ UserAdmin = (*S3Backend)(nil)
+)
 
 // NewS3Backend проверяет адрес (только https) и УЦ хранилища.
 func NewS3Backend(cfg S3Config) (*S3Backend, error) {
@@ -80,7 +87,58 @@ func NewS3Backend(cfg S3Config) (*S3Backend, error) {
 		region:   cfg.SigningRegion,
 		client:   &http.Client{Transport: transport, Timeout: cfg.RequestTimeout},
 		now:      time.Now,
+		admin:    cfg.Admin,
 	}, nil
+}
+
+// userAccount — учётная запись вопроса администратора /create-user в форме
+// versitygw (auth.Account: элементы по именам полей).
+type userAccount struct {
+	XMLName xml.Name `xml:"Account"`
+	Access  string   `xml:"Access"`
+	Secret  string   `xml:"Secret"`
+	Role    string   `xml:"Role"`
+}
+
+// roleUserPlus — роль versitygw: заводит и снимает свои бакеты, к чужим
+// доступа не имеет.
+const roleUserPlus = "userplus"
+
+// CreateUser — PATCH /create-user: пользователь хранилища с ключами cred и
+// ролью userplus, вопрос подписан ключами администратора вместе с хешем тела.
+func (b *S3Backend) CreateUser(ctx context.Context, cred Credentials) error {
+	if b.admin == nil {
+		return errors.New("s3 create user: no admin keys configured")
+	}
+	body, err := xml.Marshal(userAccount{Access: cred.AccessKey, Secret: cred.SecretKey, Role: roleUserPlus})
+	if err != nil {
+		return fmt.Errorf("s3 create user: %w", err)
+	}
+	status, code, _, err := b.doBody(ctx, *b.admin, http.MethodPatch, "/create-user", nil, body)
+	if err != nil {
+		return fmt.Errorf("s3 create user: %w", err)
+	}
+	if status != http.StatusCreated && status != http.StatusOK {
+		return fmt.Errorf("s3 create user: %d %s", status, code)
+	}
+	return nil
+}
+
+// DeleteUser — PATCH /delete-user?access=<ключ>; хранилище принимает снятие
+// отсутствующего пользователя.
+func (b *S3Backend) DeleteUser(ctx context.Context, accessKey string) error {
+	if b.admin == nil {
+		return errors.New("s3 delete user: no admin keys configured")
+	}
+	status, code, _, err := b.doBody(ctx, *b.admin, http.MethodPatch, "/delete-user",
+		url.Values{"access": {accessKey}}, nil)
+	if err != nil {
+		return fmt.Errorf("s3 delete user: %w", err)
+	}
+	if status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("s3 delete user: %d %s", status, code)
+	}
+	return nil
 }
 
 // CreateBucket — PUT /<бакет>. Ответ BucketAlreadyOwnedByYou — успех: бакет
@@ -178,15 +236,28 @@ type s3ErrorBody struct {
 // do шлёт подписанный запрос без тела и возвращает статус, код ошибки
 // хранилища (для не-2xx) и тело ответа.
 func (b *S3Backend) do(ctx context.Context, cred Credentials, method, path string, query url.Values) (int, string, []byte, error) {
+	return b.doBody(ctx, cred, method, path, query, nil)
+}
+
+// doBody — то же, что do, с телом запроса: хеш тела входит в подпись.
+func (b *S3Backend) doBody(ctx context.Context, cred Credentials, method, path string, query url.Values,
+	payload []byte) (int, string, []byte, error) {
 	u := *b.endpoint
 	u.Path = path
 	u.RawPath = canonicalURI(path)
 	u.RawQuery = canonicalQuery(query)
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
+	var reqBody io.Reader
+	payloadHash := emptyPayloadHash
+	if len(payload) > 0 {
+		reqBody = bytes.NewReader(payload)
+		sum := sha256.Sum256(payload)
+		payloadHash = hex.EncodeToString(sum[:])
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), reqBody)
 	if err != nil {
 		return 0, "", nil, err
 	}
-	signV4(req, cred, b.region, "s3", b.now(), emptyPayloadHash, true)
+	signV4(req, cred, b.region, "s3", b.now(), payloadHash, true)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return 0, "", nil, err

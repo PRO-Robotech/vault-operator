@@ -67,7 +67,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger, opts RunOptions) er
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
 	log.Info("cmfake serving", "addr", lis.Addr().String(), "clients", len(cfg.Store.Clients),
-		"configurations", len(cfg.Store.Configurations))
+		"configurations", len(cfg.Store.Configurations), "bucketKeys", cfg.Store.BucketKeys)
 	if opts.Ready != nil {
 		opts.Ready(Started{Addr: lis.Addr(), Store: store})
 	}

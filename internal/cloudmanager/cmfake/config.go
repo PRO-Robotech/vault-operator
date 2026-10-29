@@ -40,6 +40,9 @@ type S3Config struct {
 	CAFile string
 	// RequestTimeout — срок одного запроса к хранилищу.
 	RequestTimeout time.Duration
+	// Admin — ключи администратора хранилища (вопросы /create-user,
+	// /delete-user); nil — режим ключей логина, вопросов нет.
+	Admin *Credentials
 }
 
 // Config — разобранный и проверенный конфиг службы.
@@ -54,6 +57,9 @@ type Config struct {
 type fileConfig struct {
 	ListenAddress  string `json:"listenAddress"`
 	DefaultRegion  string `json:"defaultRegion"`
+	// BucketKeys — login (умолчание) либо bucket: своя пара ключей и свой
+	// пользователь хранилища на бакет; bucket требует ключи администратора.
+	BucketKeys     string `json:"bucketKeys"`
 	Configurations []struct {
 		ID     string `json:"id"`
 		Region string `json:"region"`
@@ -64,6 +70,10 @@ type fileConfig struct {
 		CAFile           string `json:"caFile"`
 		BucketFqdnSuffix string `json:"bucketFqdnSuffix"`
 		RequestTimeout   string `json:"requestTimeout"`
+		// AdminAccessKeyFile и AdminSecretKeyFile — файлы ключей
+		// администратора хранилища (режим bucketKeys: bucket).
+		AdminAccessKeyFile string `json:"adminAccessKeyFile"`
+		AdminSecretKeyFile string `json:"adminSecretKeyFile"`
 	} `json:"s3"`
 	Removal struct {
 		Attempts   int    `json:"attempts"`
@@ -90,9 +100,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
-	// Ёмкость — верхняя граница отказов: адрес S3, две длительности и по два
-	// файла ключей на арендатора.
-	errs := make([]error, 0, 3+2*len(fc.Clients))
+	// Ёмкость — верхняя граница отказов: адрес S3, две длительности, два
+	// файла ключей администратора и по два файла ключей на арендатора.
+	errs := make([]error, 0, 5+2*len(fc.Clients))
 	cfg := &Config{
 		ListenAddress: orDefault(fc.ListenAddress, DefaultListenAddress),
 		S3: S3Config{
@@ -119,6 +129,21 @@ func LoadConfig(path string) (*Config, error) {
 		BackendTimeout:   cfg.S3.RequestTimeout,
 		RemoveAttempts:   attempts,
 		RemoveRetryDelay: retryDelay,
+		BucketKeys:       orDefault(fc.BucketKeys, BucketKeysPerLogin),
+	}
+	adminFiles := fc.S3.AdminAccessKeyFile != "" || fc.S3.AdminSecretKeyFile != ""
+	switch {
+	case st.BucketKeys == BucketKeysPerBucket:
+		ak, err := readKeyFile("s3 admin", "access", fc.S3.AdminAccessKeyFile)
+		errs = append(errs, err)
+		sk, err := readKeyFile("s3 admin", "secret", fc.S3.AdminSecretKeyFile)
+		errs = append(errs, err)
+		cfg.S3.Admin = &Credentials{AccessKey: ak, SecretKey: sk}
+	case adminFiles:
+		// Ключи администратора вне режима bucket не читаются никем: отказ, а
+		// не тихо лежащий в поде секрет.
+		errs = append(errs, fmt.Errorf("s3.adminAccessKeyFile/adminSecretKeyFile are set, but bucketKeys is %q, not %q",
+			st.BucketKeys, BucketKeysPerBucket))
 	}
 	for _, c := range fc.Configurations {
 		st.Configurations = append(st.Configurations, Configuration{ID: c.ID, Region: c.Region})

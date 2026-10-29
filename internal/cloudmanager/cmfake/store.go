@@ -12,6 +12,8 @@ package cmfake
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -132,6 +134,28 @@ type Backend interface {
 	DeleteBucket(ctx context.Context, cred Credentials, bucket string) error
 }
 
+// UserAdmin — вопросы администратора хранилища: заведение пользователя с
+// правом заводить и снимать свои бакеты и его снятие. Нужен режиму ключей на
+// бакет.
+type UserAdmin interface {
+	// CreateUser заводит пользователя хранилища с этими ключами.
+	CreateUser(ctx context.Context, cred Credentials) error
+	// DeleteUser снимает пользователя по ключу доступа; отсутствующий —
+	// успех.
+	DeleteUser(ctx context.Context, accessKey string) error
+}
+
+// Режимы ключей бакета (bucketKeys конфига).
+const (
+	// BucketKeysPerLogin — бакет несёт ключи своего логина: все бакеты
+	// логина открываются одной парой.
+	BucketKeysPerLogin = "login"
+	// BucketKeysPerBucket — у каждого бакета своя пара ключей и свой
+	// пользователь хранилища, как у настоящей службы: ключи одного бакета
+	// другой бакет того же логина не открывают.
+	BucketKeysPerBucket = "bucket"
+)
+
 // ClientConfig — арендатор: логин, потолок бакетов и ключи S3.
 type ClientConfig struct {
 	Login       string
@@ -159,6 +183,9 @@ type StoreConfig struct {
 	RemoveAttempts int
 	// RemoveRetryDelay — пауза между попытками снятия.
 	RemoveRetryDelay time.Duration
+	// BucketKeys — режим ключей бакета: BucketKeysPerLogin (пусто — он же)
+	// либо BucketKeysPerBucket.
+	BucketKeys string
 }
 
 // validate отвергает конфиг, с которым двойник вёл бы себя не как служба
@@ -187,6 +214,11 @@ func (c StoreConfig) validate() error {
 	}
 	if c.RemoveRetryDelay < 0 {
 		errs = append(errs, errors.New("removal.retryDelay is negative"))
+	}
+	switch c.BucketKeys {
+	case "", BucketKeysPerLogin, BucketKeysPerBucket:
+	default:
+		errs = append(errs, fmt.Errorf("bucketKeys %q: want %q or %q", c.BucketKeys, BucketKeysPerLogin, BucketKeysPerBucket))
 	}
 	if len(c.Clients) == 0 {
 		errs = append(errs, errors.New("no clients"))
@@ -264,6 +296,8 @@ func (sc Scope) matches(b *Bucket) bool {
 type Store struct {
 	cfg     StoreConfig
 	backend Backend
+	// users — вопросы администратора; не nil ровно в режиме ключей на бакет.
+	users   UserAdmin
 	log     *slog.Logger
 	clients map[string]ClientConfig
 	configs map[Configuration]bool
@@ -301,6 +335,14 @@ func NewStore(cfg StoreConfig, backend Backend, log *slog.Logger) (*Store, error
 		ctx:     ctx, cancel: cancel,
 		byName: map[string]*Bucket{},
 		idle:   closedChan(),
+	}
+	if cfg.BucketKeys == BucketKeysPerBucket {
+		users, ok := backend.(UserAdmin)
+		if !ok {
+			cancel()
+			return nil, errors.New("cmfake config: bucketKeys bucket needs a storage backend that manages users")
+		}
+		s.users = users
 	}
 	for _, cl := range cfg.Clients {
 		s.clients[cl.Login] = cl
@@ -348,14 +390,19 @@ func (s *Store) Create(ctx context.Context, in CreateInput) (Bucket, error) {
 	if err := ctx.Err(); err != nil {
 		return Bucket{}, err
 	}
-	b, err := s.reserve(client, full, in)
+	cred := client.Credentials
+	if s.users != nil {
+		var err error
+		if cred, err = newBucketCredentials(); err != nil {
+			return Bucket{}, fmt.Errorf("cmfake: bucket keys: %w", err)
+		}
+	}
+	b, err := s.reserve(client, full, in, cred)
 	if err != nil {
 		return Bucket{}, err
 	}
 
-	bctx, cancel := context.WithTimeout(s.ctx, s.cfg.BackendTimeout)
-	err = s.backend.CreateBucket(bctx, client.Credentials, b.Name)
-	cancel()
+	err = s.provision(cred, b.Name)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -369,9 +416,46 @@ func (s *Store) Create(ctx context.Context, in CreateInput) (Bucket, error) {
 	return *b, nil
 }
 
+// provision заводит бакет в хранилище ключами cred. В режиме ключей на бакет
+// сначала заводится пользователь хранилища с этими ключами; не заведённый
+// бакет снимает его тем же заходом, чтобы пользователь без бакета не
+// оставался.
+func (s *Store) provision(cred Credentials, bucket string) error {
+	if s.users != nil {
+		uctx, cancel := context.WithTimeout(s.ctx, s.cfg.BackendTimeout)
+		err := s.users.CreateUser(uctx, cred)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("bucket user: %w", err)
+		}
+	}
+	bctx, cancel := context.WithTimeout(s.ctx, s.cfg.BackendTimeout)
+	err := s.backend.CreateBucket(bctx, cred, bucket)
+	cancel()
+	if err != nil && s.users != nil {
+		uctx, cancel := context.WithTimeout(s.ctx, s.cfg.BackendTimeout)
+		if derr := s.users.DeleteUser(uctx, cred.AccessKey); derr != nil {
+			s.log.Error("bucket user left after failed provisioning", "bucket", bucket, "err", derr.Error())
+		}
+		cancel()
+	}
+	return err
+}
+
+// newBucketCredentials — случайная пара ключей бакета: 10 байт доступа и
+// 20 байт секрета из crypto/rand, шестнадцатеричной строкой.
+func newBucketCredentials() (Credentials, error) {
+	raw := make([]byte, 30)
+	if _, err := rand.Read(raw); err != nil {
+		return Credentials{}, err
+	}
+	return Credentials{AccessKey: hex.EncodeToString(raw[:10]), SecretKey: hex.EncodeToString(raw[10:])}, nil
+}
+
 // reserve под замком проверяет потолок, выбирает свободное имя и заводит
-// строку CREATING: имя занято раньше обращения к хранилищу.
-func (s *Store) reserve(client ClientConfig, full string, in CreateInput) (*Bucket, error) {
+// строку CREATING с ключами бакета cred: имя занято раньше обращения к
+// хранилищу.
+func (s *Store) reserve(client ClientConfig, full string, in CreateInput, cred Credentials) (*Bucket, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
@@ -392,8 +476,8 @@ func (s *Store) reserve(client ClientConfig, full string, in CreateInput) (*Buck
 	b := &Bucket{
 		Name:      name,
 		CustLogin: client.Login,
-		AccessKey: client.Credentials.AccessKey,
-		SecretKey: client.Credentials.SecretKey,
+		AccessKey: cred.AccessKey,
+		SecretKey: cred.SecretKey,
 		Fqdn:      name + "." + s.cfg.BucketFqdnSuffix,
 		Status:    StatusCreating,
 		ManagedBy: managedBy,
@@ -489,6 +573,13 @@ func (s *Store) remove(name string, cred Credentials) {
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, s.cfg.BackendTimeout)
 		err := s.backend.DeleteBucket(ctx, cred, name)
+		if err == nil && s.users != nil {
+			// Пользователь бакета снимается после бакета; повтор попытки
+			// снова зовёт DeleteBucket, а снятый бакет — успех.
+			if uerr := s.users.DeleteUser(ctx, cred.AccessKey); uerr != nil {
+				err = fmt.Errorf("bucket user: %w", uerr)
+			}
+		}
 		cancel()
 		if err == nil {
 			s.finishRemoval(name, StatusRemoved)
