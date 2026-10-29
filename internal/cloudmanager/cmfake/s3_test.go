@@ -12,8 +12,12 @@ package cmfake
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/pem"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,11 +66,59 @@ type s3Stub struct {
 	// pageSize — объектов на страницу листинга (проверка продолжения).
 	pageSize int
 	requests []string
+	// admin — ключ доступа администратора: только он задаёт вопросы
+	// /create-user и /delete-user; roles — роль пользователя, заведённого
+	// администратором.
+	admin string
+	roles map[string]string
+}
+
+// roleOf — роль пользователя, заведённого вопросом администратора; пусто —
+// такого нет.
+func (st *s3Stub) roleOf(access string) string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.roles[access]
+}
+
+// serveAdmin отвечает на вопросы администратора в форме versitygw:
+// PATCH /create-user с телом XML учётной записи и PATCH /delete-user?access=.
+func (st *s3Stub) serveAdmin(w http.ResponseWriter, r *http.Request, ak string, body []byte) {
+	if st.admin == "" || ak != st.admin {
+		writeS3Error(w, http.StatusForbidden, "AccessDenied")
+		return
+	}
+	switch r.URL.Path {
+	case "/create-user":
+		var acc struct {
+			Access string `xml:"Access"`
+			Secret string `xml:"Secret"`
+			Role   string `xml:"Role"`
+		}
+		if err := xml.Unmarshal(body, &acc); err != nil || acc.Access == "" || acc.Secret == "" {
+			writeS3Error(w, http.StatusBadRequest, "MalformedXML")
+			return
+		}
+		if _, ok := st.secrets[acc.Access]; ok {
+			writeS3Error(w, http.StatusConflict, "XAdminUserExists")
+			return
+		}
+		st.secrets[acc.Access] = acc.Secret
+		st.roles[acc.Access] = acc.Role
+		w.WriteHeader(http.StatusCreated)
+	case "/delete-user":
+		access := r.URL.Query().Get("access")
+		delete(st.secrets, access)
+		delete(st.roles, access)
+		w.WriteHeader(http.StatusOK)
+	default:
+		writeS3Error(w, http.StatusNotImplemented, "NotImplemented")
+	}
 }
 
 func newS3Stub(t *testing.T, creds ...Credentials) *s3Stub {
 	st := &s3Stub{t: t, secrets: map[string]string{}, buckets: map[string]string{},
-		objects: map[string]map[string]struct{}{}, pageSize: 1000}
+		objects: map[string]map[string]struct{}{}, pageSize: 1000, roles: map[string]string{}}
 	for _, c := range creds {
 		st.secrets[c.AccessKey] = c.SecretKey
 	}
@@ -100,9 +152,25 @@ func (st *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.requests = append(st.requests, r.Method+" "+r.URL.RequestURI())
+	// Подписанный хеш тела обязан совпасть с телом: иначе подпись не
+	// свидетельствует о том, что пришло.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeS3Error(w, http.StatusBadRequest, "IncompleteBody")
+		return
+	}
+	sum := sha256.Sum256(body)
+	if r.Header.Get("X-Amz-Content-Sha256") != hex.EncodeToString(sum[:]) {
+		writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch")
+		return
+	}
 	ak, ok := st.authenticate(r)
 	if !ok {
 		writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
+	}
+	if r.Method == http.MethodPatch {
+		st.serveAdmin(w, r, ak, body)
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/")

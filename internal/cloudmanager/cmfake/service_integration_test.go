@@ -15,6 +15,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -35,11 +37,24 @@ type runningService struct {
 	store *Store
 	s3    *s3Stub
 	done  chan error
+	// s3Endpoint и s3CA — адрес и УЦ заглушки S3: проба листает бакет
+	// ключами из ответа службы.
+	s3Endpoint string
+	s3CA       string
 }
 
 func startService(t *testing.T) *runningService {
 	t.Helper()
-	st := newS3Stub(t, credA, credB)
+	return startServiceWith(t, nil)
+}
+
+// startServiceWith — то же, что startService; mutate правит текст конфига
+// (каталог файлов конфига, текст) перед чтением. Заглушка S3 знает ключи
+// администратора credAdmin.
+func startServiceWith(t *testing.T, mutate func(dir, y string) string) *runningService {
+	t.Helper()
+	st := newS3Stub(t, credA, credB, credAdmin)
+	st.admin = credAdmin.AccessKey
 	endpoint, caFile := startS3Stub(t, st)
 
 	dir := t.TempDir()
@@ -47,6 +62,9 @@ func startService(t *testing.T) *runningService {
 	y = strings.Replace(y, "https://s3.stand.test:9000", endpoint, 1)
 	y = strings.Replace(y, "caFile: "+dir+"/ca.crt", "caFile: "+caFile, 1)
 	y = strings.Replace(y, "retryDelay: 3s", "retryDelay: 10ms", 1)
+	if mutate != nil {
+		y = mutate(dir, y)
+	}
 	cfg, err := LoadConfig(writeFile(t, dir, "config.yaml", y))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -54,7 +72,7 @@ func startService(t *testing.T) *runningService {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan Started, 1)
-	rs := &runningService{s3: st, done: make(chan error, 1)}
+	rs := &runningService{s3: st, done: make(chan error, 1), s3Endpoint: endpoint, s3CA: caFile}
 	go func() {
 		rs.done <- Run(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), RunOptions{
 			Ready: func(s Started) { started <- s },
@@ -80,6 +98,22 @@ func startService(t *testing.T) *runningService {
 		t.Fatal("service did not start")
 	}
 	return rs
+}
+
+// list — ListObjects бакета ключами cred на заглушке S3 службы: статус и код
+// отказа хранилища.
+func (rs *runningService) list(t *testing.T, cred Credentials, bucket string) (int, string) {
+	t.Helper()
+	be, err := NewS3Backend(S3Config{Endpoint: rs.s3Endpoint, SigningRegion: "us-east-1", CAFile: rs.s3CA,
+		RequestTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("NewS3Backend: %v", err)
+	}
+	code, s3code, _, err := be.do(context.Background(), cred, http.MethodGet, "/"+bucket, url.Values{"list-type": {"2"}})
+	if err != nil {
+		t.Fatalf("list %s: %v", bucket, err)
+	}
+	return code, s3code
 }
 
 func newRealClient(t *testing.T, addr string) *cloudmanager.Client {
