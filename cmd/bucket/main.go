@@ -28,6 +28,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider/beget"
 	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 	"github.com/PRO-Robotech/vault-operator/internal/controller"
 )
@@ -124,12 +125,11 @@ func main() {
 	}
 
 	if err := (&controller.S3BucketClaimReconciler{
-		Client:                 mgr.GetClient(),
-		Scheme:                 mgr.GetScheme(),
-		Recorder:               mgr.GetEventRecorderFor("s3bucketclaim-controller"),
-		VaultFactory:           &controller.DefaultSecretVaultClientFactory{},
-		Buckets:                buckets,
-		DefaultConfigurationID: defaultS3ConfigurationID,
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Recorder:     mgr.GetEventRecorderFor("s3bucketclaim-controller"),
+		VaultFactory: &controller.DefaultSecretVaultClientFactory{},
+		Provider:     beget.New(buckets, defaultS3ConfigurationID),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "S3BucketClaim")
 		os.Exit(1)

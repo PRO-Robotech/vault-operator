@@ -12,6 +12,9 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -20,9 +23,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider"
+	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider/beget"
 	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 )
 
@@ -32,7 +38,7 @@ func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Res
 	})
 }
 
-func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) {
+func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) *vaultv1alpha1.S3BucketClaim {
 	claim := &vaultv1alpha1.S3BucketClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: vaultv1alpha1.S3BucketClaimSpec{
@@ -40,12 +46,13 @@ func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) 
 			ClusterRef:     vaultv1alpha1.SecretClusterRef{Name: name},
 			CustomerLogin:  custLogin,
 			Region:         "ru1",
-			Bucket:         vaultv1alpha1.S3BucketSpec{ManagedBy: cloudmanager.ManagedBySystem, ConfigurationID: "s3_v1"},
+			Bucket:         vaultv1alpha1.S3BucketSpec{ManagedBy: vaultv1alpha1.S3ManagedBySystem, ConfigurationID: "s3_v1"},
 			Vault:          vaultv1alpha1.S3VaultSpec{SecretsPrefix: "clusters/" + name, DestinationPath: defaultS3DestinationPath},
 			DeletionPolicy: vaultv1alpha1.DeletionPolicyPurge,
 		},
 	}
 	Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+	return claim
 }
 
 var _ = Describe("S3BucketClaim Controller", func() {
@@ -61,12 +68,11 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		fakeSV = newFakeSecretVault()
 		buckets = cloudmanager.NewFakeBucketAPI()
 		recon = &S3BucketClaimReconciler{
-			Client:                 k8sClient,
-			Scheme:                 k8sClient.Scheme(),
-			Recorder:               record.NewFakeRecorder(50),
-			VaultFactory:           &fakeSecretVaultFactory{Client: fakeSV},
-			Buckets:                buckets,
-			DefaultConfigurationID: "s3_v1",
+			Client:       k8sClient,
+			Scheme:       k8sClient.Scheme(),
+			Recorder:     record.NewFakeRecorder(50),
+			VaultFactory: &fakeSecretVaultFactory{Client: fakeSV},
+			Provider:     beget.New(buckets, "s3_v1"),
 		}
 	})
 
@@ -74,13 +80,12 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-ready")
 		makeS3BucketClaim(ctx, "s3ready", "s3-cfg-ready", custName)
 
-		// First reconcile adds the finalizer (returns early on Update).
 		_, err := reconcileBucketOnce(recon, "s3ready")
 		Expect(err).NotTo(HaveOccurred())
 		_, err = reconcileBucketOnce(recon, "s3ready")
 		Expect(err).NotTo(HaveOccurred())
 
-		realName := cloudmanager.FakePrefix + bucketBaseName(custName, "s3ready")
+		realName := cloudmanager.FakePrefix + "k8s-cust1-s3ready"
 		got := &vaultv1alpha1.S3BucketClaim{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3ready"}, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
@@ -135,8 +140,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("adopts an existing bucket on AlreadyExists (crash between create and status write)", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-adopt")
-		requested := bucketBaseName(custName, "s3adopt")
-		realName := "c942bd41757d-" + requested
+		realName := "c942bd41757d-k8s-cust1-s3adopt"
 		buckets.Seed(cloudmanager.Bucket{
 			Name: realName, CustLogin: custName, Status: cloudmanager.StatusRunning,
 			AccessKey: "AK-x", SecretKey: "SK-x",
@@ -159,7 +163,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 
 	It("self-heals a claim whose status holds the requested (pre-fix) name", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-heal")
-		requested := bucketBaseName(custName, "s3heal")
+		requested := "k8s-cust1-s3heal"
 		realName := "c942bd41757d-" + requested
 		// Bucket already exists under the real (prefixed) name.
 		buckets.Seed(cloudmanager.Bucket{
@@ -208,6 +212,218 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3purge"}, &vaultv1alpha1.S3BucketClaim{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
+
+	It("records the real bucket name before credentials are available", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-creating")
+		claim := makeS3BucketClaim(ctx, "s3creating", "s3-cfg-creating", custName)
+		key := types.NamespacedName{Namespace: ns, Name: claim.Name}
+		realName := cloudmanager.FakePrefix + "k8s-cust1-s3creating"
+		buckets.FindHook = func(_ context.Context, login, name string) (*cloudmanager.Bucket, error) {
+			Expect(login).To(Equal(custName))
+			Expect(name).To(Equal(realName))
+			return &cloudmanager.Bucket{Name: name, CustLogin: login, Status: cloudmanager.StatusCreating}, nil
+		}
+
+		result, err := reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(15 * time.Second))
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.BucketName).To(Equal(realName))
+		Expect(claim.Status.BucketStatus).To(Equal(cloudmanager.StatusCreating))
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhasePending))
+		Expect(isConditionTrue(claim.Status.Conditions, vaultv1alpha1.ConditionBucketProvisioned)).To(BeTrue())
+		Expect(findCond(claim.Status.Conditions, vaultv1alpha1.ConditionBucketRunning).Reason).To(Equal("Creating"))
+		Expect(fakeSV.writes).To(BeZero())
+
+		buckets.FindHook = nil
+		_, err = reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(buckets.Creates).To(Equal(1))
+	})
+
+	It("retains the bucket and Vault data when the claim is deleted with Retain", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-retain")
+		claim := makeS3BucketClaim(ctx, "s3retain", "s3-cfg-retain", custName)
+		claim.Spec.DeletionPolicy = vaultv1alpha1.DeletionPolicyRetain
+		Expect(k8sClient.Update(ctx, claim)).To(Succeed())
+
+		_, err := reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+		_, err = reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(buckets.Creates).To(Equal(1))
+		Expect(buckets.Removes).To(BeZero())
+		Expect(fakeSV.store["secret|clusters/s3retain/backup/s3"]).NotTo(BeNil())
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: claim.Name}, claim)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("keeps the finalizer until Vault cleanup succeeds after bucket removal", func() {
+		makeHealthyVaultConfig(ctx, "s3-cfg-purge-retry")
+		claim := makeS3BucketClaim(ctx, "s3purgeretry", "s3-cfg-purge-retry", custName)
+		key := types.NamespacedName{Namespace: ns, Name: claim.Name}
+		_, err := reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+
+		fakeSV.loginErr = errors.New("Vault unavailable")
+		result, err := reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(bucketRequeueDeletionStuck))
+		Expect(buckets.Removes).To(Equal(1))
+		Expect(fakeSV.deletes).To(BeZero())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(controllerutil.ContainsFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)).To(BeTrue())
+
+		fakeSV.loginErr = nil
+		_, err = reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(buckets.Removes).To(Equal(1))
+		Expect(fakeSV.deletes).To(Equal(1))
+		Expect(fakeSV.store["secret|clusters/s3purgeretry/backup/s3"]).To(BeNil())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, claim))).To(BeTrue())
+	})
+})
+
+type fakeBucketProvider struct {
+	ensure func(bucketprovider.EnsureRequest) bucketprovider.EnsureResult
+	remove func(bucketprovider.DeleteRequest) bucketprovider.DeleteResult
+}
+
+func (f *fakeBucketProvider) Ensure(_ context.Context, req bucketprovider.EnsureRequest) (bucketprovider.EnsureResult, error) {
+	return f.ensure(req), nil
+}
+
+func (f *fakeBucketProvider) Delete(_ context.Context, req bucketprovider.DeleteRequest) (bucketprovider.DeleteResult, error) {
+	return f.remove(req), nil
+}
+
+var _ = Describe("S3BucketClaim provider orchestration", func() {
+	var (
+		provider *fakeBucketProvider
+		fakeSV   *fakeSecretVaultClient
+		recon    *S3BucketClaimReconciler
+	)
+
+	BeforeEach(func() {
+		provider = &fakeBucketProvider{}
+		fakeSV = newFakeSecretVault()
+		recon = &S3BucketClaimReconciler{
+			Client:       k8sClient,
+			Recorder:     record.NewFakeRecorder(50),
+			VaultFactory: &fakeSecretVaultFactory{Client: fakeSV},
+			Provider:     provider,
+		}
+	})
+
+	It("persists partial observations and publishes the provider connection before Ready", func() {
+		const name = "s3provider"
+		const path = "clusters/" + name + "/backup/s3"
+		makeHealthyVaultConfig(ctx, "s3-cfg-provider")
+		claim := makeS3BucketClaim(ctx, name, "s3-cfg-provider", "cust1")
+		key := types.NamespacedName{Namespace: claim.Namespace, Name: name}
+		fakeSV.seed("secret", path, map[string]any{"existing": "value"})
+
+		provider.ensure = func(req bucketprovider.EnsureRequest) bucketprovider.EnsureResult {
+			Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+			Expect(controllerutil.ContainsFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)).To(BeTrue())
+			Expect(req.BucketName).To(BeEmpty())
+			Expect(fakeSV.writes).To(BeZero())
+			return bucketprovider.EnsureResult{
+				BucketName:  "resolved-name",
+				Provisioned: bucketprovider.Stage{State: bucketprovider.Succeeded, Reason: "Created"},
+				Running:     bucketprovider.Stage{State: bucketprovider.Pending, Reason: "Creating"},
+				RetryAfter:  7 * time.Second,
+			}
+		}
+		result, err := reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(7 * time.Second))
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.BucketName).To(Equal("resolved-name"))
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhasePending))
+		Expect(fakeSV.writes).To(BeZero())
+
+		conn := &bucketprovider.Connection{
+			BucketName: "resolved-name", AccessKey: "access", SecretKey: "secret",
+			Endpoint: "s3.ru2.storage.beget.cloud", Region: "ru2", ForcePathStyle: true, Cname: "cname",
+		}
+		provider.ensure = func(req bucketprovider.EnsureRequest) bucketprovider.EnsureResult {
+			Expect(req.BucketName).To(Equal(conn.BucketName))
+			return bucketprovider.EnsureResult{
+				Running:    bucketprovider.Stage{State: bucketprovider.Succeeded, Reason: "Running"},
+				Connection: conn,
+			}
+		}
+		result, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(10 * time.Minute))
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
+		Expect(claim.Status.Endpoint).To(Equal(conn.Endpoint))
+		Expect(claim.Status.KeysWrittenHash).To(Equal(sha256Hex("access", "secret", "resolved-name", "s3.ru2.storage.beget.cloud")))
+		Expect(fakeSV.store["secret|"+path]).To(Equal(map[string]any{
+			"existing": "value", "bucketName": "resolved-name", "accessKey": "access", "secretKey": "secret",
+			"endpoint": "s3.ru2.storage.beget.cloud", "region": "ru2", "s3ForcePathStyle": "true", "cname": "cname",
+		}))
+
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeSV.writes).To(Equal(1))
+		conn.SecretKey = "rotated"
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeSV.writes).To(Equal(2))
+		Expect(fakeSV.store["secret|"+path]["secretKey"]).To(Equal("rotated"))
+	})
+
+	DescribeTable("applies the claim deletion policy before cleaning up Vault",
+		func(policy string) {
+			name := "s3provider-" + strings.ToLower(policy)
+			path := "clusters/" + name + "/backup/s3"
+			makeHealthyVaultConfig(ctx, "s3-cfg-"+name)
+			claim := makeS3BucketClaim(ctx, name, "s3-cfg-"+name, "cust1")
+			key := types.NamespacedName{Namespace: claim.Namespace, Name: name}
+			claim.Spec.DeletionPolicy = policy
+			controllerutil.AddFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)
+			Expect(k8sClient.Update(ctx, claim)).To(Succeed())
+			fakeSV.seed("secret", path, map[string]any{"bucketName": "existing-name"})
+			Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+
+			calls := 0
+			provider.remove = func(req bucketprovider.DeleteRequest) bucketprovider.DeleteResult {
+				calls++
+				Expect(req.ClusterName).To(Equal(name))
+				Expect(fakeSV.deletes).To(BeZero())
+				if calls == 1 {
+					return bucketprovider.DeleteResult{BucketName: "existing-name", RetryAfter: time.Minute}
+				}
+				Expect(req.BucketName).To(Equal("existing-name"))
+				return bucketprovider.DeleteResult{Done: true}
+			}
+			result, err := reconcileBucketOnce(recon, name)
+			Expect(err).NotTo(HaveOccurred())
+			if policy == vaultv1alpha1.DeletionPolicyPurge {
+				Expect(result.RequeueAfter).To(Equal(time.Minute))
+				Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+				Expect(controllerutil.ContainsFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)).To(BeTrue())
+				_, err = reconcileBucketOnce(recon, name)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(calls).To(Equal(2))
+				Expect(fakeSV.store["secret|"+path]).To(BeNil())
+			} else {
+				Expect(calls).To(BeZero())
+				Expect(fakeSV.store["secret|"+path]).NotTo(BeNil())
+			}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, claim))).To(BeTrue())
+		},
+		Entry("Purge waits for the provider", vaultv1alpha1.DeletionPolicyPurge),
+		Entry("Retain leaves the provider and Vault alone", vaultv1alpha1.DeletionPolicyRetain),
+	)
 })
 
 func findCond(conds []metav1.Condition, condType string) *metav1.Condition {
