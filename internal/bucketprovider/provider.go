@@ -21,6 +21,7 @@ type BucketProvider interface {
 }
 
 type EnsureRequest struct {
+	Claim           ClaimContext
 	BucketName      string
 	CustomerLogin   string
 	ClusterName     string
@@ -31,9 +32,25 @@ type EnsureRequest struct {
 }
 
 type DeleteRequest struct {
+	Claim         ClaimContext
 	BucketName    string
 	CustomerLogin string
 	ClusterName   string
+}
+
+type ClaimContext struct {
+	UID     string
+	Profile string
+	Vault   ClaimVault
+}
+
+// ClaimVault separates provider credentials and private state from agent access.
+type ClaimVault interface {
+	ReadProfile(ctx context.Context, name string) (map[string]any, bool, error)
+	ReadPublished(context.Context) (map[string]any, bool, error)
+	ReadState(ctx context.Context, key string) (map[string]any, int, error)
+	WriteState(ctx context.Context, key string, data map[string]any, version int) error
+	DeleteState(ctx context.Context, key string) error
 }
 
 type State uint8
@@ -58,8 +75,11 @@ type EnsureResult struct {
 	BucketStatus *string
 	Provisioned  Stage
 	Running      Stage
-	Connection   *Connection
-	RetryAfter   time.Duration
+	// Connection can be published while Running is pending.
+	Connection *Connection
+	// Published is set when the provider has checked the current Vault payload.
+	Published  *bool
+	RetryAfter time.Duration
 }
 
 type Connection struct {

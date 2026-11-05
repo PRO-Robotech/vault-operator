@@ -42,6 +42,7 @@ const (
 )
 
 const defaultS3DestinationPath = "backup/s3"
+const bucketDestinationError = "Vault destination must be outside the provider namespace"
 
 // S3BucketClaimReconciler provisions a per-cluster S3 bucket and writes its
 // credentials into Vault.
@@ -50,7 +51,7 @@ type S3BucketClaimReconciler struct {
 	Scheme       *runtime.Scheme
 	Recorder     record.EventRecorder
 	VaultFactory SecretVaultClientFactory
-	Provider     bucketprovider.BucketProvider
+	Providers    map[string]bucketprovider.BucketProvider
 
 	Now func() time.Time
 }
@@ -94,6 +95,15 @@ func (r *S3BucketClaimReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // reconcile mutates claim.Status; on success it requeues to re-check for
 // external key rotation.
 func (r *S3BucketClaimReconciler) reconcile(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, error) {
+	if !bucketDestinationAllowed(bucketVaultPath(claim)) {
+		r.fail(claim, vaultv1alpha1.ConditionKeysWritten, "VaultDestinationInvalid", bucketDestinationError)
+		return ctrl.Result{}, nil
+	}
+	provider := r.Providers[bucketProviderName(claim)]
+	if provider == nil {
+		r.fail(claim, vaultv1alpha1.ConditionBucketProvisioned, "ProviderUnavailable", "bucket provider is not configured")
+		return ctrl.Result{RequeueAfter: bucketRequeueTransient}, nil
+	}
 	vc, cfg, res, ok := r.resolveAndLogin(ctx, claim)
 	if !ok {
 		claim.Status.Phase = vaultv1alpha1.PhasePending
@@ -102,7 +112,11 @@ func (r *S3BucketClaimReconciler) reconcile(ctx context.Context, claim *vaultv1a
 		return res, nil
 	}
 
-	bucket, err := r.Provider.Ensure(ctx, bucketprovider.EnsureRequest{
+	claimVault := bucketVault(claim, func(context.Context) (SecretVaultClient, *vaultv1alpha1.VaultConfig, bool) {
+		return vc, cfg, true
+	})
+	bucket, err := provider.Ensure(ctx, bucketprovider.EnsureRequest{
+		Claim:           claimVault,
 		BucketName:      claim.Status.BucketName,
 		CustomerLogin:   claim.Spec.CustomerLogin,
 		ClusterName:     claim.Spec.ClusterRef.Name,
@@ -126,8 +140,14 @@ func (r *S3BucketClaimReconciler) reconcile(ctx context.Context, claim *vaultv1a
 		return ctrl.Result{RequeueAfter: bucket.RetryAfter}, nil
 	}
 
-	if res, ok := r.writeVault(ctx, vc, cfg, claim, bucket.Connection); !ok {
+	if res, ok := r.writeVault(ctx, vc, cfg, claim, bucket.Connection, bucket.Published); !ok {
 		return res, nil
+	}
+
+	if bucket.Running.State == bucketprovider.Pending {
+		setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation,
+			bucket.Running.Reason, bucket.Running.Message)
+		return ctrl.Result{RequeueAfter: bucket.RetryAfter}, nil
 	}
 
 	r.markReady(claim)
@@ -197,16 +217,15 @@ func (r *S3BucketClaimReconciler) applyBucketStage(claim *vaultv1alpha1.S3Bucket
 }
 
 // writeVault merges the credentials into the Vault path when they changed.
-func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVaultClient, cfg *vaultv1alpha1.VaultConfig, claim *vaultv1alpha1.S3BucketClaim, conn *bucketprovider.Connection) (ctrl.Result, bool) {
+func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVaultClient, cfg *vaultv1alpha1.VaultConfig, claim *vaultv1alpha1.S3BucketClaim, conn *bucketprovider.Connection, published *bool) (ctrl.Result, bool) {
 	hash := sha256Hex(conn.AccessKey, conn.SecretKey, conn.BucketName, conn.Endpoint)
-
-	if hash != claim.Status.KeysWrittenHash {
+	write := hash != claim.Status.KeysWrittenHash
+	if published != nil {
+		write = !*published
+	}
+	if write {
 		mount := cfg.Spec.Storage.KvMountPath
-		destPath := claim.Spec.Vault.DestinationPath
-		if destPath == "" {
-			destPath = defaultS3DestinationPath
-		}
-		path := joinPath(claim.Spec.Vault.SecretsPrefix, destPath)
+		path := bucketVaultPath(claim)
 
 		existing, _, err := vc.ReadKV(ctx, mount, path)
 		if err != nil {
@@ -231,9 +250,9 @@ func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVault
 			claim.Status.Phase = vaultv1alpha1.PhasePending
 			return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 		}
-		claim.Status.KeysWrittenHash = hash
 		r.event(claim, corev1.EventTypeNormal, "KeysWritten", fmt.Sprintf("wrote s3 credentials to %s/%s", mount, path))
 	}
+	claim.Status.KeysWrittenHash = hash
 	claim.Status.Endpoint = conn.Endpoint
 	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionKeysWritten, metav1.ConditionTrue, claim.Generation,
 		"Written", "s3 credentials present in Vault")
@@ -262,7 +281,29 @@ func (r *S3BucketClaimReconciler) handleDeletion(ctx context.Context, claim *vau
 // purge removes the bucket and its Vault path, keeping the finalizer and
 // requeueing if either backend is unavailable.
 func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (ctrl.Result, bool) {
-	result, err := r.Provider.Delete(ctx, bucketprovider.DeleteRequest{
+	if !bucketDestinationAllowed(bucketVaultPath(claim)) {
+		r.event(claim, corev1.EventTypeWarning, "VaultDestinationInvalid", bucketDestinationError)
+		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
+	}
+	provider := r.Providers[bucketProviderName(claim)]
+	if provider == nil {
+		r.event(claim, corev1.EventTypeWarning, "ProviderUnavailable", "bucket provider is not configured")
+		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
+	}
+	var vc SecretVaultClient
+	var cfg *vaultv1alpha1.VaultConfig
+	resolve := func(ctx context.Context) (SecretVaultClient, *vaultv1alpha1.VaultConfig, bool) {
+		if vc == nil {
+			var ok bool
+			vc, cfg, ok = r.clientForDeletion(ctx, claim)
+			if !ok {
+				return nil, nil, false
+			}
+		}
+		return vc, cfg, true
+	}
+	result, err := provider.Delete(ctx, bucketprovider.DeleteRequest{
+		Claim:         bucketVault(claim, resolve),
 		BucketName:    claim.Status.BucketName,
 		CustomerLogin: claim.Spec.CustomerLogin,
 		ClusterName:   claim.Spec.ClusterRef.Name,
@@ -281,16 +322,12 @@ func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha
 		return ctrl.Result{RequeueAfter: result.RetryAfter}, false
 	}
 
-	vc, cfg, ok := r.clientForDeletion(ctx, claim)
+	vc, cfg, ok := resolve(ctx)
 	if !ok {
 		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", "Vault unavailable for purge; retrying")
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
 	}
-	destPath := claim.Spec.Vault.DestinationPath
-	if destPath == "" {
-		destPath = defaultS3DestinationPath
-	}
-	path := joinPath(claim.Spec.Vault.SecretsPrefix, destPath)
+	path := bucketVaultPath(claim)
 	if err := vc.DeleteKVMetadata(ctx, cfg.Spec.Storage.KvMountPath, path); err != nil {
 		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("delete Vault path: %v", err))
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false

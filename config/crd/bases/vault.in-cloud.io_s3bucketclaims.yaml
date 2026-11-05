@@ -56,9 +56,6 @@ spec:
           spec:
             properties:
               bucket:
-                description: |-
-                  S3BucketSpec holds the cloud-manager create parameters. The bucket name is
-                  derived by convention and recorded in status.bucketName.
                 properties:
                   configurationId:
                     description: |-
@@ -73,10 +70,33 @@ spec:
                     - SYSTEM
                     - CUSTOMER
                     type: string
+                  provider:
+                    default: internal
+                    enum:
+                    - internal
+                    - yandex
+                    type: string
+                  providerConfigRef:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                    type: string
                   public:
                     default: false
                     type: boolean
                 type: object
+                x-kubernetes-validations:
+                - fieldPath: .providerConfigRef
+                  message: providerConfigRef is required for yandex
+                  rule: '!has(self.provider) || self.provider != ''yandex'' || has(self.providerConfigRef)'
+                - fieldPath: .provider
+                  message: provider is immutable
+                  rule: '(has(self.provider) ? self.provider : ''internal'') == (has(oldSelf.provider)
+                    ? oldSelf.provider : ''internal'')'
+                - fieldPath: .providerConfigRef
+                  message: providerConfigRef is immutable for yandex
+                  rule: '!has(self.provider) || self.provider != ''yandex'' || (has(oldSelf.providerConfigRef)
+                    && has(self.providerConfigRef) && self.providerConfigRef == oldSelf.providerConfigRef)'
               clusterRef:
                 description: |-
                   SecretClusterRef references the cluster by name. No kubeconfig is needed —
@@ -140,6 +160,11 @@ spec:
               rule: self.customerLogin == oldSelf.customerLogin
             - message: spec.vault.secretsPrefix is immutable
               rule: self.vault.secretsPrefix == oldSelf.vault.secretsPrefix
+            - message: Vault config and destination are immutable for yandex
+              rule: '!has(self.bucket.provider) || self.bucket.provider != ''yandex''
+                || (self.vaultConfigRef.name == oldSelf.vaultConfigRef.name && (has(self.vault.destinationPath)
+                ? self.vault.destinationPath : ''backup/s3'') == (has(oldSelf.vault.destinationPath)
+                ? oldSelf.vault.destinationPath : ''backup/s3''))'
           status:
             properties:
               bucketName:

@@ -14,6 +14,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -28,7 +29,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	vaultv1alpha1 "github.com/PRO-Robotech/vault-operator/api/v1alpha1"
+	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider"
 	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider/beget"
+	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider/yandex"
 	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 	"github.com/PRO-Robotech/vault-operator/internal/controller"
 )
@@ -44,6 +47,13 @@ func init() {
 }
 
 func main() {
+	if err := run(); err != nil {
+		setupLog.Error(err, "bucket-operator failed")
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var probeAddr string
@@ -70,7 +80,7 @@ func main() {
 	flag.StringVar(&pprofAddr, "pprof-bind-address", "",
 		"Address for the pprof/diagnostics endpoint. Empty (default) disables it.")
 	flag.StringVar(&cloudManagerAddr, "cloud-manager-addr", "grpc-internal.svc-cloud-manager.service.consul:50051",
-		"gRPC address of svc-cloud-manager (bucket create/find/remove).")
+		"gRPC address of svc-cloud-manager. An empty address disables the internal bucket provider.")
 	flag.StringVar(&defaultS3ConfigurationID, "default-s3-configuration-id", "s3_v1",
 		"cloud-manager S3 configuration id used when spec.bucket.configurationId is empty.")
 	opts := zap.Options{Development: true}
@@ -105,7 +115,11 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	kubeConfig, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("load Kubernetes config: %w", err)
+	}
+	mgr, err := ctrl.NewManager(kubeConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
@@ -114,25 +128,32 @@ func main() {
 		PprofBindAddress:       pprofAddr,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+		return fmt.Errorf("create manager: %w", err)
 	}
 
-	buckets, err := cloudmanager.New(cloudManagerAddr)
-	if err != nil {
-		setupLog.Error(err, "unable to create cloud-manager client", "addr", cloudManagerAddr)
-		os.Exit(1)
+	providers := map[string]bucketprovider.BucketProvider{
+		vaultv1alpha1.S3ProviderYandex: yandex.New(),
 	}
-
+	if cloudManagerAddr != "" {
+		cloudManager, err := cloudmanager.New(cloudManagerAddr)
+		if err != nil {
+			return fmt.Errorf("create cloud-manager client: %w", err)
+		}
+		defer func() {
+			if err := cloudManager.Close(); err != nil {
+				setupLog.Error(err, "unable to close cloud-manager client")
+			}
+		}()
+		providers[vaultv1alpha1.S3ProviderInternal] = beget.New(cloudManager, defaultS3ConfigurationID)
+	}
 	if err := (&controller.S3BucketClaimReconciler{
 		Client:       mgr.GetClient(),
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorderFor("s3bucketclaim-controller"),
 		VaultFactory: &controller.DefaultSecretVaultClientFactory{},
-		Provider:     beget.New(buckets, defaultS3ConfigurationID),
+		Providers:    providers,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "S3BucketClaim")
-		os.Exit(1)
+		return fmt.Errorf("set up S3BucketClaim controller: %w", err)
 	}
 
 	// Reconcile only this operator's own VaultConfig.
@@ -143,22 +164,19 @@ func main() {
 		VaultFactory:     &controller.DefaultVaultClientFactory{},
 		VaultConfigOwner: vaultv1alpha1.OwnerBucketOperator,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "VaultConfig")
-		os.Exit(1)
+		return fmt.Errorf("set up VaultConfig controller: %w", err)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
+		return fmt.Errorf("set up health check: %w", err)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+		return fmt.Errorf("set up ready check: %w", err)
 	}
 
 	setupLog.Info("starting bucket-operator", "cloud-manager-addr", cloudManagerAddr)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
+		return fmt.Errorf("run manager: %w", err)
 	}
+	return nil
 }

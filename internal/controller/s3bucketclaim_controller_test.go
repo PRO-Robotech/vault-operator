@@ -32,6 +32,8 @@ import (
 	"github.com/PRO-Robotech/vault-operator/internal/cloudmanager"
 )
 
+const testYandexProfile = "system-backups"
+
 func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Result, error) {
 	return r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Namespace: "default", Name: name},
@@ -39,7 +41,13 @@ func reconcileBucketOnce(r *S3BucketClaimReconciler, name string) (reconcile.Res
 }
 
 func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) *vaultv1alpha1.S3BucketClaim {
-	claim := &vaultv1alpha1.S3BucketClaim{
+	claim := newS3BucketClaim(name, configName, custLogin)
+	Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+	return claim
+}
+
+func newS3BucketClaim(name, configName, custLogin string) *vaultv1alpha1.S3BucketClaim {
+	return &vaultv1alpha1.S3BucketClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: vaultv1alpha1.S3BucketClaimSpec{
 			VaultConfigRef: vaultv1alpha1.VaultConfigRef{Name: configName},
@@ -51,9 +59,46 @@ func makeS3BucketClaim(ctx context.Context, name, configName, custLogin string) 
 			DeletionPolicy: vaultv1alpha1.DeletionPolicyPurge,
 		},
 	}
-	Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-	return claim
 }
+
+var _ = Describe("S3BucketClaim provider validation", func() {
+	DescribeTable("validates provider and profile on create",
+		func(name, provider, profile string, valid bool) {
+			claim := newS3BucketClaim(name, "vault-bucket", "cust1")
+			claim.Spec.Bucket.Provider = provider
+			claim.Spec.Bucket.ProviderConfigRef = profile
+			err := k8sClient.Create(ctx, claim)
+			if valid {
+				Expect(err).NotTo(HaveOccurred())
+				if provider == "" {
+					Expect(claim.Spec.Bucket.Provider).To(Equal(vaultv1alpha1.S3ProviderInternal))
+				}
+			} else {
+				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "%v", err)
+			}
+		},
+		Entry("legacy claim", "legacy-bucket", "", "", true),
+		Entry("explicit internal", "internal-bucket", "internal", "", true),
+		Entry("Yandex profile", "yandex-bucket", "yandex", testYandexProfile, true),
+		Entry("missing profile", "no-profile-bucket", "yandex", "", false),
+		Entry("invalid profile", "invalid-profile-bucket", "yandex", " ", false),
+		Entry("unknown provider", "unknown-provider-bucket", "other", "", false),
+	)
+
+	It("rejects changing the effective provider or Yandex profile", func() {
+		internal := makeS3BucketClaim(ctx, "immutable-internal", "vault-bucket", "cust1")
+		internal.Spec.Bucket.Provider = vaultv1alpha1.S3ProviderYandex
+		internal.Spec.Bucket.ProviderConfigRef = testYandexProfile
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, internal))).To(BeTrue())
+
+		claim := newS3BucketClaim("immutable-yandex", "vault-bucket", "cust1")
+		claim.Spec.Bucket.Provider = vaultv1alpha1.S3ProviderYandex
+		claim.Spec.Bucket.ProviderConfigRef = testYandexProfile
+		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+		claim.Spec.Bucket.ProviderConfigRef = "other-backups"
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, claim))).To(BeTrue())
+	})
+})
 
 var _ = Describe("S3BucketClaim Controller", func() {
 	const ns = "default"
@@ -72,7 +117,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 			Scheme:       k8sClient.Scheme(),
 			Recorder:     record.NewFakeRecorder(50),
 			VaultFactory: &fakeSecretVaultFactory{Client: fakeSV},
-			Provider:     beget.New(buckets, "s3_v1"),
+			Providers:    map[string]bucketprovider.BucketProvider{vaultv1alpha1.S3ProviderInternal: beget.New(buckets, "s3_v1")},
 		}
 	})
 
@@ -316,8 +361,62 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 			Client:       k8sClient,
 			Recorder:     record.NewFakeRecorder(50),
 			VaultFactory: &fakeSecretVaultFactory{Client: fakeSV},
-			Provider:     provider,
+			Providers:    map[string]bucketprovider.BucketProvider{vaultv1alpha1.S3ProviderInternal: provider},
 		}
+	})
+
+	It("uses the same Yandex provider and Vault paths for creation and purge", func() {
+		const name = "s3provider-yandex"
+		const vaultConfig = "s3-cfg-yandex"
+		const path = "clusters/" + name + "/backup/s3"
+		makeHealthyVaultConfig(ctx, vaultConfig)
+		recon.Providers[vaultv1alpha1.S3ProviderYandex] = provider
+		claim := newS3BucketClaim(name, vaultConfig, "cust1")
+		claim.Spec.Bucket.Provider = vaultv1alpha1.S3ProviderYandex
+		claim.Spec.Bucket.ProviderConfigRef = testYandexProfile
+		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+		uid := string(claim.UID)
+		fakeSV.seed("providers/yandex/profiles/"+testYandexProfile, map[string]any{"folder_id": "system-folder"})
+		provider.ensure = func(req bucketprovider.EnsureRequest) bucketprovider.EnsureResult {
+			Expect(req.Claim.UID).To(Equal(uid))
+			Expect(req.Claim.Profile).To(Equal(testYandexProfile))
+			profile, found, err := req.Claim.Vault.ReadProfile(ctx, req.Claim.Profile)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(profile["folder_id"]).To(Equal("system-folder"))
+			_, found, err = req.Claim.Vault.ReadPublished(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse())
+			return bucketprovider.EnsureResult{
+				BucketName: "yandex-backups",
+				Running:    bucketprovider.Stage{State: bucketprovider.Pending, Reason: "AwaitingAccessCheck"},
+				RetryAfter: 15 * time.Second,
+				Connection: &bucketprovider.Connection{
+					BucketName: "yandex-backups", AccessKey: "access", SecretKey: "secret", Endpoint: "https://storage.yandexcloud.net",
+					Region: "ru-central1", ForcePathStyle: true,
+				},
+			}
+		}
+		res, err := reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(15 * time.Second))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, claim)).To(Succeed())
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhasePending))
+		Expect(fakeSV.store["secret|"+path]["endpoint"]).To(Equal("https://storage.yandexcloud.net"))
+
+		provider.remove = func(req bucketprovider.DeleteRequest) bucketprovider.DeleteResult {
+			Expect(req.Claim.UID).To(Equal(uid))
+			Expect(req.Claim.Profile).To(Equal(testYandexProfile))
+			data, found, err := req.Claim.Vault.ReadPublished(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(data["bucketName"]).To(Equal("yandex-backups"))
+			return bucketprovider.DeleteResult{Done: true}
+		}
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeSV.store["secret|"+path]).To(BeNil())
 	})
 
 	It("persists partial observations and publishes the provider connection before Ready", func() {
@@ -326,7 +425,7 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 		makeHealthyVaultConfig(ctx, "s3-cfg-provider")
 		claim := makeS3BucketClaim(ctx, name, "s3-cfg-provider", "cust1")
 		key := types.NamespacedName{Namespace: claim.Namespace, Name: name}
-		fakeSV.seed("secret", path, map[string]any{"existing": "value"})
+		fakeSV.seed(path, map[string]any{"existing": "value"})
 
 		provider.ensure = func(req bucketprovider.EnsureRequest) bucketprovider.EnsureResult {
 			Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
@@ -391,7 +490,7 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 			claim.Spec.DeletionPolicy = policy
 			controllerutil.AddFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)
 			Expect(k8sClient.Update(ctx, claim)).To(Succeed())
-			fakeSV.seed("secret", path, map[string]any{"bucketName": "existing-name"})
+			fakeSV.seed(path, map[string]any{"bucketName": "existing-name"})
 			Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
 
 			calls := 0

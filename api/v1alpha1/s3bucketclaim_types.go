@@ -27,11 +27,23 @@ const OwnerBucketOperator = "vault-bucket"
 const (
 	S3ManagedBySystem   = "SYSTEM"
 	S3ManagedByCustomer = "CUSTOMER"
+	S3ProviderInternal  = "internal"
+	S3ProviderYandex    = "yandex"
 )
 
-// S3BucketSpec holds the cloud-manager create parameters. The bucket name is
-// derived by convention and recorded in status.bucketName.
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'yandex' || has(self.providerConfigRef)",message="providerConfigRef is required for yandex",fieldPath=".providerConfigRef"
+// +kubebuilder:validation:XValidation:rule="(has(self.provider) ? self.provider : 'internal') == (has(oldSelf.provider) ? oldSelf.provider : 'internal')",message="provider is immutable",fieldPath=".provider"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'yandex' || (has(oldSelf.providerConfigRef) && has(self.providerConfigRef) && self.providerConfigRef == oldSelf.providerConfigRef)",message="providerConfigRef is immutable for yandex",fieldPath=".providerConfigRef"
 type S3BucketSpec struct {
+	// +kubebuilder:validation:Enum=internal;yandex
+	// +kubebuilder:default=internal
+	Provider string `json:"provider,omitempty"`
+
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+	ProviderConfigRef string `json:"providerConfigRef,omitempty"`
+
 	// +kubebuilder:default=false
 	Public bool `json:"public,omitempty"`
 
@@ -59,6 +71,7 @@ type S3VaultSpec struct {
 // +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="spec.clusterRef.name is immutable"
 // +kubebuilder:validation:XValidation:rule="self.customerLogin == oldSelf.customerLogin",message="spec.customerLogin is immutable"
 // +kubebuilder:validation:XValidation:rule="self.vault.secretsPrefix == oldSelf.vault.secretsPrefix",message="spec.vault.secretsPrefix is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.bucket.provider) || self.bucket.provider != 'yandex' || (self.vaultConfigRef.name == oldSelf.vaultConfigRef.name && (has(self.vault.destinationPath) ? self.vault.destinationPath : 'backup/s3') == (has(oldSelf.vault.destinationPath) ? oldSelf.vault.destinationPath : 'backup/s3'))",message="Vault config and destination are immutable for yandex"
 type S3BucketClaimSpec struct {
 	// +required
 	VaultConfigRef VaultConfigRef `json:"vaultConfigRef"`
