@@ -41,8 +41,8 @@ func newFakeSecretVault() *fakeSecretVaultClient {
 	return &fakeSecretVaultClient{store: map[string]map[string]any{}}
 }
 
-func (f *fakeSecretVaultClient) seed(mount, path string, data map[string]any) {
-	f.store[mount+"|"+path] = cloneData(data)
+func (f *fakeSecretVaultClient) seed(path string, data map[string]any) {
+	f.store["secret|"+path] = cloneData(data)
 }
 
 func (f *fakeSecretVaultClient) Login(context.Context) error { f.loginCalls++; return f.loginErr }
@@ -143,7 +143,7 @@ var _ = Describe("VaultSecretClaim Controller", func() {
 
 	It("applies generate and copy items and becomes Ready", func() {
 		makeHealthyVaultConfig(ctx, "vsc-cfg-ready")
-		fakeSV.seed("secret", "system/dex", map[string]any{"staticClient": "abc123"})
+		fakeSV.seed("system/dex", map[string]any{"staticClient": "abc123"})
 		makeVaultSecretClaim(ctx, "vsready", "vsc-cfg-ready", vaultv1alpha1.DeletionPolicyRetain,
 			[]vaultv1alpha1.SecretListItem{genListItem(), copyListItem()})
 
