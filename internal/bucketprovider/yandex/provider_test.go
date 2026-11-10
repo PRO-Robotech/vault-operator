@@ -197,6 +197,34 @@ func TestEnsureRecoversLostBucketResponseAndInterruptedKey(t *testing.T) {
 	}
 }
 
+func TestEnsureRepublishesEndpointWithoutScheme(t *testing.T) {
+	const host = "storage.yandexcloud.net"
+	provider, claim, vault, api := fixture()
+	req := bucketprovider.EnsureRequest{Claim: claim}
+	result, err := provider.Ensure(t.Context(), req)
+	if err != nil || result.Connection == nil || result.Connection.Endpoint != host {
+		t.Fatal("expected a new connection with a scheme-free endpoint")
+	}
+	conn := result.Connection
+	vault.published = map[string]any{
+		"bucketName": conn.BucketName, "accessKey": conn.AccessKey, "secretKey": conn.SecretKey,
+		"endpoint": "https://" + host, "region": conn.Region, "s3ForcePathStyle": "true",
+	}
+
+	result, err = provider.Ensure(t.Context(), req)
+	if err != nil || result.Published == nil || *result.Published || result.Connection == nil || *result.Connection != *conn {
+		t.Fatal("expected to republish the existing bucket and credentials with a scheme-free endpoint")
+	}
+	vault.published["endpoint"] = result.Connection.Endpoint
+	result, err = provider.Ensure(t.Context(), req)
+	if err != nil || result.Published == nil || !*result.Published || result.Running.State != bucketprovider.Succeeded {
+		t.Fatal("expected the updated Vault record to be accepted without another write")
+	}
+	if api.createCalls != 1 || api.keyCalls != 1 {
+		t.Fatal("endpoint migration should reuse the bucket and access key")
+	}
+}
+
 func TestEnsureRejectsMissingCredentialsBeforeMutating(t *testing.T) {
 	provider, claim, vault, api := fixture()
 	vault.credentials["private_key"] = " "

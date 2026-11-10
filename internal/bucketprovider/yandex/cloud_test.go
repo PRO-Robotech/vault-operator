@@ -105,6 +105,9 @@ func TestCreateAndGetBucketThroughSDK(t *testing.T) {
 func TestEmptyBucketUsesIAMAndDeletesVersions(t *testing.T) {
 	deletes := 0
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Scheme != "https" {
+			t.Fatalf("expected HTTPS for Object Storage, got %q", req.URL.Scheme)
+		}
 		if req.URL.Host != "storage.yandexcloud.net" || req.Header.Get("X-YaCloud-SubjectToken") != "operator-token" {
 			t.Fatal("expected operator IAM authentication for Object Storage")
 		}

@@ -60,7 +60,7 @@ func (c iamStorageHTTP) Do(req *http.Request) (*http.Response, error) {
 
 func storageClient(client aws.HTTPClient, creds aws.CredentialsProvider) *s3.Client {
 	return s3.New(s3.Options{
-		Region: s3Region, BaseEndpoint: aws.String(s3Endpoint), UsePathStyle: true,
+		Region: s3Region, BaseEndpoint: aws.String("https://" + s3Endpoint), UsePathStyle: true,
 		HTTPClient: client, Credentials: creds, RetryMaxAttempts: 2,
 	})
 }

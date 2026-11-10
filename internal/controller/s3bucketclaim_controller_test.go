@@ -369,6 +369,7 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 		const name = "s3provider-yandex"
 		const vaultConfig = "s3-cfg-yandex"
 		const path = "clusters/" + name + "/backup/s3"
+		const endpoint = "storage.yandexcloud.net"
 		makeHealthyVaultConfig(ctx, vaultConfig)
 		recon.Providers[vaultv1alpha1.S3ProviderYandex] = provider
 		claim := newS3BucketClaim(name, vaultConfig, "cust1")
@@ -392,7 +393,7 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 				Running:    bucketprovider.Stage{State: bucketprovider.Pending, Reason: "AwaitingAccessCheck"},
 				RetryAfter: 15 * time.Second,
 				Connection: &bucketprovider.Connection{
-					BucketName: "yandex-backups", AccessKey: "access", SecretKey: "secret", Endpoint: "https://storage.yandexcloud.net",
+					BucketName: "yandex-backups", AccessKey: "access", SecretKey: "secret", Endpoint: endpoint,
 					Region: "ru-central1", ForcePathStyle: true,
 				},
 			}
@@ -402,7 +403,7 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 		Expect(res.RequeueAfter).To(Equal(15 * time.Second))
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: claim.Namespace, Name: name}, claim)).To(Succeed())
 		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhasePending))
-		Expect(fakeSV.store["secret|"+path]["endpoint"]).To(Equal("https://storage.yandexcloud.net"))
+		Expect(fakeSV.store["secret|"+path]["endpoint"]).To(Equal(endpoint))
 
 		provider.remove = func(req bucketprovider.DeleteRequest) bucketprovider.DeleteResult {
 			Expect(req.Claim.UID).To(Equal(uid))
