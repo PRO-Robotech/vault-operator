@@ -104,23 +104,31 @@ func (p *Provider) Ensure(ctx context.Context, req bucketprovider.EnsureRequest)
 	if err != nil {
 		return provisionFailure("ProviderConfigInvalid", err), nil
 	}
-	api, err := p.connect(ctx, profile.key)
-	if err != nil {
-		return provisionFailure("ProviderCredentialsUnavailable", err), nil
-	}
-	defer api.close(ctx)
-	state, err := loadJournal(ctx, claim)
+	state, err := loadJournal(ctx, claim, req.BucketName)
 	if err != nil {
 		return provisionFailure("ProviderStateUnavailable", err), nil
 	}
 	if state.version == 0 {
 		state.folder = profile.folder
-		if err := state.save(ctx); err != nil {
-			return provisionFailure("ProviderStateUnavailable", err), nil
-		}
 	}
 	if state.folder != profile.folder {
 		return provisionFailure(reasonOwnershipConflict, errOwnership), nil
+	}
+	api, err := p.connect(ctx, profile.key)
+	if err != nil {
+		return provisionFailure("ProviderCredentialsUnavailable", err), nil
+	}
+	defer api.close(ctx)
+	if state.bucketName == "" {
+		state.bucketName = state.accountName()
+		if err := state.start(ctx, &state.bucket); err != nil {
+			return provisionFailure("ProviderStateUnavailable", err), nil
+		}
+	}
+	if !state.nameRecorded {
+		if err := state.save(ctx); err != nil {
+			return provisionFailure("ProviderStateUnavailable", err), nil
+		}
 	}
 	if err := state.removeLegacyCandidate(ctx); err != nil {
 		return provisionFailure("ProviderStateUnavailable", err), nil
@@ -168,7 +176,7 @@ func ensureAgent(ctx context.Context, api cloudAPI, state *journal, b *storagepb
 			return nil, false, fmt.Errorf("configure agent access: %w", err)
 		}
 	}
-	return ensureCredentials(ctx, api, state.claim, b.GetName(), account.GetId())
+	return ensureCredentials(ctx, api, state, b.GetName(), account.GetId())
 }
 
 func validateClaim(claim bucketprovider.ClaimContext) error {
@@ -187,6 +195,9 @@ func field(data map[string]any, key string) string {
 func failure(reason string, err error) bucketprovider.Stage {
 	if errors.Is(err, errOwnership) {
 		reason = reasonOwnershipConflict
+	}
+	if errors.Is(err, errBucketNotFound) {
+		reason = "ProviderBucketNotFound"
 	}
 	return bucketprovider.Stage{State: bucketprovider.Failed, Reason: reason, Message: err.Error()}
 }

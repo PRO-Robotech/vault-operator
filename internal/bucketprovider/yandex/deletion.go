@@ -25,7 +25,7 @@ import (
 func (p *Provider) Delete(ctx context.Context, req bucketprovider.DeleteRequest) (bucketprovider.DeleteResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
-	done, err := p.purge(ctx, req.Claim)
+	done, err := p.purge(ctx, req)
 	result := bucketprovider.DeleteResult{Done: done}
 	if !done {
 		result.RetryAfter = retryAfter
@@ -40,23 +40,32 @@ func (p *Provider) Delete(ctx context.Context, req bucketprovider.DeleteRequest)
 	return result, nil
 }
 
-func (p *Provider) purge(ctx context.Context, claim bucketprovider.ClaimContext) (bool, error) {
+func (p *Provider) purge(ctx context.Context, req bucketprovider.DeleteRequest) (bool, error) {
+	claim := req.Claim
 	if err := validateClaim(claim); err != nil {
 		return false, err
 	}
-	state, err := loadJournal(ctx, claim)
+	state, err := loadJournal(ctx, claim, req.BucketName)
 	if err != nil {
 		return false, err
 	}
-	if state.version == 0 {
+	if state.version == 0 && state.bucketName == "" {
 		return true, nil
 	}
 	profile, err := readProfile(ctx, claim)
 	if err != nil {
 		return false, err
 	}
+	if state.version == 0 {
+		state.folder = profile.folder
+	}
 	if state.folder != profile.folder {
 		return false, errOwnership
+	}
+	if !state.nameRecorded {
+		if err := state.save(ctx); err != nil {
+			return false, err
+		}
 	}
 	api, err := p.connect(ctx, profile.key)
 	if err != nil {

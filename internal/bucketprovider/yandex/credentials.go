@@ -12,18 +12,14 @@ package yandex
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider"
 )
 
-func ensureCredentials(ctx context.Context, api cloudAPI, claim bucketprovider.ClaimContext, name, accountID string) (*bucketprovider.Connection, bool, error) {
-	published, _, err := claim.Vault.ReadPublished(ctx)
-	if err != nil {
-		return nil, false, errors.New("unable to read published agent credentials")
-	}
+func ensureCredentials(ctx context.Context, api cloudAPI, state *journal, name, accountID string) (*bucketprovider.Connection, bool, error) {
+	published := state.published
 	keys, err := api.listKeys(ctx, accountID)
 	if err != nil {
 		return nil, false, fmt.Errorf("list agent keys: %w", err)
@@ -31,7 +27,7 @@ func ensureCredentials(ctx context.Context, api cloudAPI, claim bucketprovider.C
 
 	// A key whose secret did not reach Vault can only be revoked and reissued.
 	access, secret := field(published, "accessKey"), field(published, "secretKey")
-	description := "beget:" + claim.UID + ":"
+	description := "beget:" + state.claim.UID + ":"
 	var publishedKeyExists bool
 	for _, key := range keys {
 		if key.GetId() == "" || key.GetKeyId() == "" || !strings.HasPrefix(key.GetDescription(), description) {
