@@ -35,9 +35,12 @@ type stateEntry struct {
 }
 
 type testVault struct {
-	state       map[string]stateEntry
-	credentials map[string]any
-	published   map[string]any
+	state        map[string]stateEntry
+	credentials  map[string]any
+	published    map[string]any
+	stateErr     error
+	publishedErr error
+	writeErr     error
 }
 
 func (v *testVault) ReadProfile(context.Context, string) (map[string]any, bool, error) {
@@ -45,15 +48,18 @@ func (v *testVault) ReadProfile(context.Context, string) (map[string]any, bool, 
 }
 
 func (v *testVault) ReadPublished(context.Context) (map[string]any, bool, error) {
-	return v.published, v.published != nil, nil
+	return v.published, v.published != nil, v.publishedErr
 }
 
 func (v *testVault) ReadState(_ context.Context, name string) (map[string]any, int, error) {
 	entry := v.state[name]
-	return maps.Clone(entry.values), entry.version, nil
+	return maps.Clone(entry.values), entry.version, v.stateErr
 }
 
 func (v *testVault) WriteState(_ context.Context, name string, values map[string]any, version int) error {
+	if v.writeErr != nil {
+		return v.writeErr
+	}
 	if v.state[name].version != version {
 		return errors.New("CAS mismatch")
 	}
@@ -66,26 +72,37 @@ func (v *testVault) DeleteState(_ context.Context, name string) error {
 	return nil
 }
 
+type cloudCall struct {
+	operation, name string
+}
+
 type testCloud struct {
-	bucket        *storagepb.Bucket
-	account       *iampb.ServiceAccount
-	keys          []*keypb.AccessKey
-	createCalls   int
-	keyCalls      int
-	policyCalls   int
-	lostCreate    bool
-	emptyAttempts int
+	buckets        map[string]*storagepb.Bucket
+	account        *iampb.ServiceAccount
+	keys           []*keypb.AccessKey
+	createCalls    int
+	keyCalls       int
+	policyCalls    int
+	lostCreate     bool
+	emptyAttempts  int
+	calls          []cloudCall
+	onCreateBucket func(string, string)
 }
 
 func (c *testCloud) close(context.Context) {}
 
-func (c *testCloud) getBucket(context.Context, string) (*storagepb.Bucket, error) {
-	return c.bucket, nil
+func (c *testCloud) getBucket(_ context.Context, name string) (*storagepb.Bucket, error) {
+	c.calls = append(c.calls, cloudCall{"GetBucket", name})
+	return c.buckets[name], nil
 }
 
-func (c *testCloud) createBucket(_ context.Context, folder, name, uid, _ string) error {
+func (c *testCloud) createBucket(_ context.Context, folder, name, uid, key string) error {
+	c.calls = append(c.calls, cloudCall{"CreateBucket", name})
 	c.createCalls++
-	c.bucket = &storagepb.Bucket{FolderId: folder, Name: name, Tags: []*storagepb.Tag{{Key: ownerLabel, Value: uid}}}
+	if c.onCreateBucket != nil {
+		c.onCreateBucket(name, key)
+	}
+	c.buckets[name] = &storagepb.Bucket{FolderId: folder, Name: name, Tags: []*storagepb.Tag{{Key: ownerLabel, Value: uid}}}
 	if c.lostCreate {
 		c.lostCreate = false
 		return errors.New("response lost")
@@ -93,33 +110,52 @@ func (c *testCloud) createBucket(_ context.Context, folder, name, uid, _ string)
 	return nil
 }
 
-func (c *testCloud) setPolicy(_ context.Context, _ string, policy *structpb.Struct) error {
+func (c *testCloud) setPolicy(_ context.Context, name string, policy *structpb.Struct) error {
+	c.calls = append(c.calls, cloudCall{"SetPolicy", name})
 	c.policyCalls++
-	c.bucket.Policy = policy
+	if c.buckets[name] == nil {
+		return errors.New("bucket not found")
+	}
+	c.buckets[name].Policy = policy
 	return nil
 }
 
-func (c *testCloud) deleteBucket(context.Context, string) error { c.bucket = nil; return nil }
+func (c *testCloud) deleteBucket(_ context.Context, name string) error {
+	c.calls = append(c.calls, cloudCall{"DeleteBucket", name})
+	delete(c.buckets, name)
+	return nil
+}
 
-func (c *testCloud) findAccount(context.Context, string, string) (*iampb.ServiceAccount, error) {
+func (c *testCloud) findAccount(_ context.Context, folder, name string) (*iampb.ServiceAccount, error) {
+	c.calls = append(c.calls, cloudCall{"FindAccount", name})
+	if c.account == nil || c.account.FolderId != folder || c.account.Name != name {
+		return nil, nil
+	}
 	return c.account, nil
 }
 
 func (c *testCloud) createAccount(_ context.Context, folder, name, uid, _ string) error {
+	c.calls = append(c.calls, cloudCall{"CreateAccount", name})
 	c.account = &iampb.ServiceAccount{Id: "agent", Name: name, FolderId: folder, Labels: map[string]string{ownerLabel: uid}}
 	return nil
 }
 
-func (c *testCloud) deleteAccount(context.Context, string) error {
+func (c *testCloud) deleteAccount(_ context.Context, id string) error {
+	c.calls = append(c.calls, cloudCall{"DeleteAccount", id})
+	if c.account == nil || c.account.Id != id {
+		return errors.New("service account not found")
+	}
 	c.account, c.keys = nil, nil
 	return nil
 }
 
-func (c *testCloud) listKeys(context.Context, string) ([]*keypb.AccessKey, error) {
+func (c *testCloud) listKeys(_ context.Context, accountID string) ([]*keypb.AccessKey, error) {
+	c.calls = append(c.calls, cloudCall{"ListKeys", accountID})
 	return slices.Clone(c.keys), nil
 }
 
-func (c *testCloud) createKey(_ context.Context, _, description string) (*keypb.CreateAccessKeyResponse, error) {
+func (c *testCloud) createKey(_ context.Context, accountID, description string) (*keypb.CreateAccessKeyResponse, error) {
+	c.calls = append(c.calls, cloudCall{"CreateKey", accountID})
 	c.keyCalls++
 	key := &keypb.AccessKey{Id: fmt.Sprintf("key-%d", c.keyCalls), KeyId: fmt.Sprintf("access-%d", c.keyCalls), Description: description}
 	c.keys = append(c.keys, key)
@@ -127,19 +163,25 @@ func (c *testCloud) createKey(_ context.Context, _, description string) (*keypb.
 }
 
 func (c *testCloud) deleteKey(_ context.Context, id string) error {
+	c.calls = append(c.calls, cloudCall{"DeleteKey", id})
 	c.keys = slices.DeleteFunc(c.keys, func(key *keypb.AccessKey) bool { return key.GetId() == id })
 	return nil
 }
 
-func (c *testCloud) checkConnection(_ context.Context, _, access, _ string) error {
-	if slices.ContainsFunc(c.keys, func(key *keypb.AccessKey) bool { return key.GetKeyId() == access }) {
+func (c *testCloud) checkConnection(_ context.Context, name, access, _ string) error {
+	c.calls = append(c.calls, cloudCall{"HeadBucket", name})
+	if c.buckets[name] != nil && slices.ContainsFunc(c.keys, func(key *keypb.AccessKey) bool { return key.GetKeyId() == access }) {
 		return nil
 	}
 	return errors.New("invalid key")
 }
 
-func (c *testCloud) emptyBucket(context.Context, string) (bool, error) {
+func (c *testCloud) emptyBucket(_ context.Context, name string) (bool, error) {
+	c.calls = append(c.calls, cloudCall{"EmptyBucket", name})
 	c.emptyAttempts++
+	if c.buckets[name] == nil {
+		return false, errors.New("bucket not found")
+	}
 	if len(c.keys) != 0 {
 		return false, errors.New("keys must be revoked before cleanup")
 	}
@@ -147,7 +189,7 @@ func (c *testCloud) emptyBucket(context.Context, string) (bool, error) {
 }
 
 func fixture() (*Provider, bucketprovider.ClaimContext, *testVault, *testCloud) {
-	api := &testCloud{}
+	api := &testCloud{buckets: map[string]*storagepb.Bucket{}}
 	vault := &testVault{
 		state:       map[string]stateEntry{},
 		credentials: map[string]any{"folder_id": "folder", "id": "key", "service_account_id": "provisioner", "private_key": "pem"},
@@ -213,12 +255,12 @@ func TestPurgeChecksOwnershipAndResumesInBatches(t *testing.T) {
 		t.Fatal("prepare Yandex bucket")
 	}
 	req := bucketprovider.DeleteRequest{Claim: claim}
-	api.bucket.Tags[0].Value = "another-claim"
+	api.buckets[result.BucketName].Tags[0].Value = "another-claim"
 	purge, err := provider.Delete(t.Context(), req)
 	if err != nil || purge.Done || purge.WarningReason != reasonOwnershipConflict || len(api.keys) != 1 || api.emptyAttempts != 0 {
 		t.Fatal("purge must stop before touching a bucket with a foreign owner")
 	}
-	api.bucket.Tags[0].Value = testUID
+	api.buckets[result.BucketName].Tags[0].Value = testUID
 	for range 3 {
 		purge, err = provider.Delete(t.Context(), req)
 		if err != nil || purge.Done || purge.WarningReason != "" {
@@ -226,7 +268,7 @@ func TestPurgeChecksOwnershipAndResumesInBatches(t *testing.T) {
 		}
 	}
 	purge, err = provider.Delete(t.Context(), req)
-	if err != nil || !purge.Done || len(vault.state) != 0 || api.account != nil || api.bucket != nil || len(api.keys) != 0 {
+	if err != nil || !purge.Done || len(vault.state) != 0 || api.account != nil || len(api.buckets) != 0 || len(api.keys) != 0 {
 		t.Fatal("expected all owned resources and private state to be cleaned up")
 	}
 }

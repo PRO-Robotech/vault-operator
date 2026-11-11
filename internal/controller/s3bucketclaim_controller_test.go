@@ -419,6 +419,56 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 		Expect(fakeSV.store["secret|"+path]).To(BeNil())
 	})
 
+	It("preserves the bucket binding and ESO connection on a Yandex identity conflict", func() {
+		const name = "s3provider-identity-conflict"
+		const configName = "s3-cfg-identity-conflict"
+		const bucketName = "security-root"
+		const path = "clusters/" + name + "/backup/s3"
+		makeHealthyVaultConfig(ctx, configName)
+		recon.Providers[vaultv1alpha1.S3ProviderYandex] = provider
+		claim := newS3BucketClaim(name, configName, "cust1")
+		claim.Spec.Bucket.Provider = vaultv1alpha1.S3ProviderYandex
+		claim.Spec.Bucket.ProviderConfigRef = testYandexProfile
+		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+		claim.Status = vaultv1alpha1.S3BucketClaimStatus{
+			Phase: vaultv1alpha1.PhaseReady, BucketName: bucketName, KeysWrittenHash: "existing-hash",
+		}
+		Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
+		connection := map[string]any{
+			"bucketName": bucketName, "accessKey": "existing-access", "secretKey": "existing-secret", "endpoint": "existing-host",
+		}
+		fakeSV.seed(path, connection)
+		provider.ensure = func(req bucketprovider.EnsureRequest) bucketprovider.EnsureResult {
+			Expect(req.BucketName).To(Equal(bucketName))
+			return bucketprovider.EnsureResult{
+				Provisioned: bucketprovider.Stage{State: bucketprovider.Failed, Reason: "ProviderOwnershipConflict"},
+				RetryAfter:  15 * time.Second,
+			}
+		}
+		_, err := reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		key := types.NamespacedName{Namespace: claim.Namespace, Name: name}
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.BucketName).To(Equal(bucketName))
+		Expect(claim.Status.KeysWrittenHash).To(Equal("existing-hash"))
+		Expect(claim.Status.Phase).To(Equal(vaultv1alpha1.PhaseFailed))
+		Expect(fakeSV.store["secret|"+path]).To(Equal(connection))
+		Expect(fakeSV.writes).To(BeZero())
+
+		provider.remove = func(req bucketprovider.DeleteRequest) bucketprovider.DeleteResult {
+			Expect(req.BucketName).To(Equal(bucketName))
+			return bucketprovider.DeleteResult{WarningReason: "ProviderOwnershipConflict", RetryAfter: 15 * time.Second}
+		}
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(claim.Status.BucketName).To(Equal(bucketName))
+		Expect(controllerutil.ContainsFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)).To(BeTrue())
+		Expect(fakeSV.store["secret|"+path]).To(Equal(connection))
+		Expect(fakeSV.deletes).To(BeZero())
+	})
+
 	It("persists partial observations and publishes the provider connection before Ready", func() {
 		const name = "s3provider"
 		const path = "clusters/" + name + "/backup/s3"
