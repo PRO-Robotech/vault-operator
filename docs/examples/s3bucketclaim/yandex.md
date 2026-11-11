@@ -48,5 +48,6 @@ spec:
 The profile's folder and Vault configuration must be available through claim
 deletion. Provisioner key rotation uses the same Vault path. The agent needs
 the endpoint, region and path style from the same Vault record as the bucket
-name and S3 keys. Verify this wiring in the backup chart before assigning the
-template to a cluster.
+name and S3 keys. Vault stores the endpoint as `storage.yandexcloud.net`.
+The backup chart adds `https://` when configuring the agent. Verify this
+wiring before assigning the template to a cluster.

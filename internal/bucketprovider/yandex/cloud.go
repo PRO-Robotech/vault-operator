@@ -43,7 +43,7 @@ import (
 )
 
 const (
-	s3Endpoint = "https://storage.yandexcloud.net"
+	s3Endpoint = "storage.yandexcloud.net"
 	s3Region   = "ru-central1"
 	ownerLabel = "beget-claim-uid"
 )

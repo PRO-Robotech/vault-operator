@@ -86,7 +86,7 @@ type Connection struct {
 	BucketName     string
 	AccessKey      string
 	SecretKey      string
-	Endpoint       string
+	Endpoint       string // S3 host without a URL scheme.
 	Region         string
 	ForcePathStyle bool
 	Cname          string
