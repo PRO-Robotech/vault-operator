@@ -25,6 +25,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -40,7 +41,8 @@ func reply(body string) *http.Response {
 
 type bucketRPC struct {
 	grpc.ClientConnInterface
-	t *testing.T
+	t       *testing.T
+	wantACL *storagepb.ACL
 }
 
 func (c bucketRPC) GetConnection(context.Context, protoreflect.FullName, ...grpc.CallOption) (grpc.ClientConnInterface, error) {
@@ -68,9 +70,22 @@ func (c bucketRPC) Invoke(ctx context.Context, method string, req, response any,
 			c.t.Fatalf("create request = %v, want %v", req, want)
 		}
 		response.(*operationpb.Operation).Id = "create-bucket"
+	case storagepb.BucketService_Update_FullMethodName:
+		want := &storagepb.UpdateBucketRequest{
+			Name: testBucket, Acl: c.wantACL, AnonymousAccessFlags: privateAccessFlags(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"acl", "anonymous_access_flags"}},
+		}
+		if c.wantACL == nil || !proto.Equal(req.(*storagepb.UpdateBucketRequest), want) {
+			c.t.Fatalf("ACL update request = %v, want %v", req, want)
+		}
+		response.(*operationpb.Operation).Id = "update-bucket"
 	case operationpb.OperationService_Get_FullMethodName:
-		if id := req.(*operationpb.GetOperationRequest).GetOperationId(); id != "create-bucket" {
-			c.t.Fatalf("operation ID = %q, want create-bucket", id)
+		wantID := "create-bucket"
+		if c.wantACL != nil {
+			wantID = "update-bucket"
+		}
+		if id := req.(*operationpb.GetOperationRequest).GetOperationId(); id != wantID {
+			c.t.Fatalf("operation ID = %q, want %s", id, wantID)
 		}
 		body, err := anypb.New(bucket)
 		if err != nil {
@@ -89,6 +104,16 @@ func (c bucketRPC) Invoke(ctx context.Context, method string, req, response any,
 		c.t.Fatalf("unexpected RPC %s", method)
 	}
 	return nil
+}
+
+func TestSetAgentACLDoesNotUpdateBucketPolicy(t *testing.T) {
+	acl := &storagepb.ACL{Grants: []*storagepb.ACL_Grant{
+		{GrantType: storagepb.ACL_Grant_GRANT_TYPE_ACCOUNT, GranteeId: "agent", Permission: storagepb.ACL_Grant_PERMISSION_READ},
+	}}
+	api := &cloud{buckets: storagesdk.NewBucketClient(bucketRPC{t: t, wantACL: acl})}
+	if err := api.setAgentACL(t.Context(), testBucket, acl); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCreateAndGetBucketThroughSDK(t *testing.T) {

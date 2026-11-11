@@ -23,7 +23,6 @@ import (
 	keypb "github.com/yandex-cloud/go-genproto/yandex/cloud/iam/v1/awscompatibility"
 	storagepb "github.com/yandex-cloud/go-genproto/yandex/cloud/storage/v1"
 	"github.com/yandex-cloud/go-sdk/v2/pkg/iamkey"
-	"google.golang.org/protobuf/types/known/structpb"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/PRO-Robotech/vault-operator/internal/bucketprovider"
@@ -41,7 +40,7 @@ type cloudAPI interface {
 	close(context.Context)
 	getBucket(context.Context, string) (*storagepb.Bucket, error)
 	createBucket(context.Context, string, string, string, string) error
-	setPolicy(context.Context, string, *structpb.Struct) error
+	setAgentACL(context.Context, string, *storagepb.ACL) error
 	deleteBucket(context.Context, string) error
 	findAccount(context.Context, string, string) (*iampb.ServiceAccount, error)
 	createAccount(context.Context, string, string, string, string) error
@@ -167,12 +166,9 @@ func ensureAgent(ctx context.Context, api cloudAPI, state *journal, b *storagepb
 	if err != nil {
 		return nil, false, err
 	}
-	policy, err := agentPolicy(b.GetName(), account.GetId())
-	if err != nil {
-		return nil, false, err
-	}
-	if !matchesPolicy(b, policy) {
-		if err := api.setPolicy(ctx, b.GetName(), policy); err != nil {
+	acl, changed := agentACL(b, account.GetId())
+	if changed {
+		if err := api.setAgentACL(ctx, b.GetName(), acl); err != nil {
 			return nil, false, fmt.Errorf("configure agent access: %w", err)
 		}
 	}
