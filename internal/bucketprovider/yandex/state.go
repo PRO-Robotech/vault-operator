@@ -25,17 +25,21 @@ import (
 const journalKey = "journal"
 
 var errOwnership = errors.New("resource ownership in Yandex does not match the claim")
+var errBucketNotFound = errors.New("bound Yandex bucket does not exist")
 
 type journal struct {
 	claim           bucketprovider.ClaimContext
 	version         int
 	folder          string
+	bucketName      string
+	nameRecorded    bool
+	published       map[string]any
 	bucket          string
 	account         string
 	legacyCandidate bool
 }
 
-func loadJournal(ctx context.Context, claim bucketprovider.ClaimContext) (*journal, error) {
+func loadJournal(ctx context.Context, claim bucketprovider.ClaimContext, requestedName string) (*journal, error) {
 	data, version, err := claim.Vault.ReadState(ctx, journalKey)
 	if err != nil {
 		return nil, errors.New("unable to read Yandex state from Vault")
@@ -48,17 +52,49 @@ func loadJournal(ctx context.Context, claim bucketprovider.ClaimContext) (*journ
 	if version > 0 && (j.folder == "" || field(data, "uid") != claim.UID) {
 		return nil, errOwnership
 	}
+	published, _, err := claim.Vault.ReadPublished(ctx)
+	if err != nil {
+		return nil, errors.New("unable to read published agent credentials")
+	}
+	j.published = published
+	j.nameRecorded = field(data, "bucketName") != ""
+	names := []any{requestedName, data["bucketName"], published["bucketName"]}
+	if !j.nameRecorded && j.bucket != "" {
+		// Older attempts always targeted the UID-derived bucket name.
+		names = append(names, j.accountName())
+	}
+	for _, value := range names {
+		if value == nil {
+			continue
+		}
+		name, ok := value.(string)
+		if !ok {
+			return nil, errors.New("invalid saved Yandex bucket name")
+		}
+		if name == "" {
+			continue
+		}
+		if j.bucketName != "" && j.bucketName != name {
+			return nil, fmt.Errorf("%w: saved bucket names %q and %q differ", errOwnership, j.bucketName, name)
+		}
+		j.bucketName = name
+	}
+	if j.bucketName == "" && version > 0 {
+		j.bucketName = j.accountName()
+	}
 	return j, nil
 }
 
 func (j *journal) save(ctx context.Context) error {
 	err := j.claim.Vault.WriteState(ctx, journalKey, map[string]any{
-		"uid": j.claim.UID, "folderID": j.folder, "bucketCreate": j.bucket, "accountCreate": j.account,
+		"uid": j.claim.UID, "folderID": j.folder, "bucketName": j.bucketName,
+		"bucketCreate": j.bucket, "accountCreate": j.account,
 	}, j.version)
 	if err != nil {
 		return errors.New("unable to persist Yandex state in Vault")
 	}
 	j.version++
+	j.nameRecorded = true
 	return nil
 }
 
@@ -93,18 +129,15 @@ func (j *journal) finish(ctx context.Context, attempt *string) error {
 	return j.save(ctx)
 }
 
-func (j *journal) name() string { return "beget-backup-" + j.claim.UID }
+func (j *journal) accountName() string { return "beget-backup-" + j.claim.UID }
 
-func ensureBucket(ctx context.Context, api cloudAPI, state *journal, create bool) (*storagepb.Bucket, error) {
-	name := state.name()
+func ensureBucket(ctx context.Context, api cloudAPI, state *journal, required bool) (*storagepb.Bucket, error) {
+	name := state.bucketName
 	b, err := api.getBucket(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("lookup bucket: %w", err)
 	}
-	if b == nil && (create || state.bucket != "") {
-		if err := state.start(ctx, &state.bucket); err != nil {
-			return nil, err
-		}
+	if b == nil && state.bucket != "" {
 		if err := api.createBucket(ctx, state.folder, name, state.claim.UID, state.bucket); err != nil && !isConflict(err) {
 			return nil, fmt.Errorf("create bucket: %w", err)
 		}
@@ -117,6 +150,9 @@ func ensureBucket(ctx context.Context, api cloudAPI, state *journal, create bool
 		}
 	}
 	if b == nil {
+		if required {
+			return nil, errBucketNotFound
+		}
 		return nil, nil
 	}
 	if b.GetFolderId() != state.folder || b.GetName() != name || !hasOwnerTag(b.GetTags(), state.claim.UID) {
@@ -135,7 +171,7 @@ func hasOwnerTag(tags []*storagepb.Tag, uid string) bool {
 }
 
 func ensureAccount(ctx context.Context, api cloudAPI, state *journal, create bool) (*iampb.ServiceAccount, error) {
-	name := state.name()
+	name := state.accountName()
 	account, err := api.findAccount(ctx, state.folder, name)
 	if err != nil {
 		return nil, fmt.Errorf("lookup service account: %w", err)
