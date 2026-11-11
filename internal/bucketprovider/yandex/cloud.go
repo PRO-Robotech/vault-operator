@@ -38,7 +38,6 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -147,10 +146,10 @@ func (c *cloud) createBucket(ctx context.Context, folder, name, uid, key string)
 	})
 }
 
-func (c *cloud) setPolicy(ctx context.Context, name string, policy *structpb.Struct) error {
+func (c *cloud) setAgentACL(ctx context.Context, name string, acl *storagepb.ACL) error {
 	return waitOperation(ctx, c.buckets.Update, &storagepb.UpdateBucketRequest{
-		Name: name, Policy: policy, AnonymousAccessFlags: privateAccessFlags(),
-		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"policy", "anonymous_access_flags"}},
+		Name: name, Acl: acl, AnonymousAccessFlags: privateAccessFlags(),
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"acl", "anonymous_access_flags"}},
 	})
 }
 
