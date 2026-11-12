@@ -84,6 +84,11 @@ spec:
                   public:
                     default: false
                     type: boolean
+                  purgeAdopted:
+                    description: |-
+                      PurgeAdopted разрешает удаление ранее созданного бакета внутреннего провайдера.
+                      Проверки владельца и других заявок действуют и при включённом флаге.
+                    type: boolean
                 type: object
                 x-kubernetes-validations:
                 - fieldPath: .providerConfigRef
@@ -167,6 +172,10 @@ spec:
                 ? oldSelf.vault.destinationPath : ''backup/s3''))'
           status:
             properties:
+              bucketCreated:
+                description: BucketCreated подтверждает создание записанного бакета
+                  этой заявкой.
+                type: boolean
               bucketName:
                 description: |-
                   BucketName is the source of truth for idempotency, fixed on first
@@ -247,6 +256,10 @@ spec:
                 - Ready
                 - Failed
                 - Deleting
+                type: string
+              writtenAt:
+                description: WrittenAt хранит отпечаток назначения последней записи
+                  в Vault.
                 type: string
             type: object
         required:

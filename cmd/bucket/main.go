@@ -148,6 +148,7 @@ func run() error {
 	}
 	if err := (&controller.S3BucketClaimReconciler{
 		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorderFor("s3bucketclaim-controller"),
 		VaultFactory: &controller.DefaultSecretVaultClientFactory{},

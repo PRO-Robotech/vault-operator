@@ -32,6 +32,8 @@ type EnsureRequest struct {
 }
 
 type DeleteRequest struct {
+	ManagedBy     string
+	PurgeAllowed  bool
 	Claim         ClaimContext
 	BucketName    string
 	CustomerLogin string
@@ -71,6 +73,7 @@ type Stage struct {
 // EnsureResult carries observations even while the connection is unavailable.
 // A nil BucketStatus or zero Stage leaves the corresponding status unchanged.
 type EnsureResult struct {
+	Created      bool
 	BucketName   string
 	BucketStatus *string
 	Provisioned  Stage
