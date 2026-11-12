@@ -35,6 +35,11 @@ const (
 // +kubebuilder:validation:XValidation:rule="(has(self.provider) ? self.provider : 'internal') == (has(oldSelf.provider) ? oldSelf.provider : 'internal')",message="provider is immutable",fieldPath=".provider"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'yandex' || (has(oldSelf.providerConfigRef) && has(self.providerConfigRef) && self.providerConfigRef == oldSelf.providerConfigRef)",message="providerConfigRef is immutable for yandex",fieldPath=".providerConfigRef"
 type S3BucketSpec struct {
+	// PurgeAdopted разрешает удаление ранее созданного бакета внутреннего провайдера.
+	// Проверки владельца и других заявок действуют и при включённом флаге.
+	// +optional
+	PurgeAdopted bool `json:"purgeAdopted,omitempty"`
+
 	// +kubebuilder:validation:Enum=internal;yandex
 	// +kubebuilder:default=internal
 	Provider string `json:"provider,omitempty"`
@@ -110,6 +115,14 @@ type S3BucketClaimStatus struct {
 	// create or adopt.
 	// +optional
 	BucketName string `json:"bucketName,omitempty"`
+
+	// BucketCreated подтверждает создание записанного бакета этой заявкой.
+	// +optional
+	BucketCreated bool `json:"bucketCreated,omitempty"`
+
+	// WrittenAt хранит отпечаток назначения последней записи в Vault.
+	// +optional
+	WrittenAt string `json:"writtenAt,omitempty"`
 
 	// +optional
 	BucketStatus string `json:"bucketStatus,omitempty"`
