@@ -48,6 +48,7 @@ const bucketDestinationError = "Vault destination must be outside the provider n
 // credentials into Vault.
 type S3BucketClaimReconciler struct {
 	client.Client
+	APIReader    client.Reader
 	Scheme       *runtime.Scheme
 	Recorder     record.EventRecorder
 	VaultFactory SecretVaultClientFactory
@@ -126,6 +127,9 @@ func (r *S3BucketClaimReconciler) reconcile(ctx context.Context, claim *vaultv1a
 		Public:          claim.Spec.Bucket.Public,
 	})
 	if bucket.BucketName != "" {
+		if bucket.BucketName != claim.Status.BucketName {
+			claim.Status.BucketCreated = bucket.Created
+		}
 		claim.Status.BucketName = bucket.BucketName
 	}
 	if bucket.BucketStatus != nil {
@@ -220,7 +224,10 @@ func (r *S3BucketClaimReconciler) applyBucketStage(claim *vaultv1alpha1.S3Bucket
 func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVaultClient, cfg *vaultv1alpha1.VaultConfig, claim *vaultv1alpha1.S3BucketClaim, conn *bucketprovider.Connection, published *bool) (ctrl.Result, bool) {
 	hash := sha256Hex(conn.AccessKey, conn.SecretKey, conn.BucketName, conn.Endpoint)
 	write := hash != claim.Status.KeysWrittenHash
-	if published != nil {
+	internal := bucketProviderName(claim) == vaultv1alpha1.S3ProviderInternal
+	if internal {
+		write = write || claim.Status.WrittenAt != bucketWrittenAt(cfg, claim)
+	} else if published != nil {
 		write = !*published
 	}
 	if write {
@@ -251,6 +258,9 @@ func (r *S3BucketClaimReconciler) writeVault(ctx context.Context, vc SecretVault
 			return ctrl.Result{RequeueAfter: bucketRequeueTransient}, false
 		}
 		r.event(claim, corev1.EventTypeNormal, "KeysWritten", fmt.Sprintf("wrote s3 credentials to %s/%s", mount, path))
+	}
+	if internal {
+		claim.Status.WrittenAt = bucketWrittenAt(cfg, claim)
 	}
 	claim.Status.KeysWrittenHash = hash
 	claim.Status.Endpoint = conn.Endpoint
@@ -290,6 +300,20 @@ func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha
 		r.event(claim, corev1.EventTypeWarning, "ProviderUnavailable", "bucket provider is not configured")
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
 	}
+	internal := bucketProviderName(claim) == vaultv1alpha1.S3ProviderInternal
+	if internal {
+		if claim.Status.BucketName == "" {
+			return ctrl.Result{}, true
+		}
+		holder, err := r.internalBucketHolder(ctx, claim)
+		if err != nil {
+			return r.bucketDeletionPending(claim, "DeletionStuck", "listing S3BucketClaims failed", bucketRequeueDeletionStuck), false
+		}
+		if holder != "" {
+			return r.bucketDeletionPending(claim, "DeletionBlocked", "bucket is held by claim "+holder, bucketRequeueDeletionStuck), false
+		}
+	}
+
 	var vc SecretVaultClient
 	var cfg *vaultv1alpha1.VaultConfig
 	resolve := func(ctx context.Context) (SecretVaultClient, *vaultv1alpha1.VaultConfig, bool) {
@@ -307,6 +331,8 @@ func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha
 		BucketName:    claim.Status.BucketName,
 		CustomerLogin: claim.Spec.CustomerLogin,
 		ClusterName:   claim.Spec.ClusterRef.Name,
+		ManagedBy:     claim.Spec.Bucket.ManagedBy,
+		PurgeAllowed:  claim.Status.BucketCreated || claim.Spec.Bucket.PurgeAdopted,
 	})
 	if result.BucketName != "" {
 		claim.Status.BucketName = result.BucketName
@@ -315,11 +341,17 @@ func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha
 		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("delete bucket: %v", err))
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
 	}
+	if internal && !result.Done && result.WarningReason != "" {
+		return r.bucketDeletionPending(claim, result.WarningReason, result.Warning, result.RetryAfter), false
+	}
 	if result.WarningReason != "" {
 		r.event(claim, corev1.EventTypeWarning, result.WarningReason, result.Warning)
 	}
 	if !result.Done {
 		return ctrl.Result{RequeueAfter: result.RetryAfter}, false
+	}
+	if internal && claim.Status.WrittenAt == "" {
+		return ctrl.Result{}, true
 	}
 
 	vc, cfg, ok := resolve(ctx)
@@ -327,12 +359,46 @@ func (r *S3BucketClaimReconciler) purge(ctx context.Context, claim *vaultv1alpha
 		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", "Vault unavailable for purge; retrying")
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
 	}
+	if internal {
+		if err := removeInternalBucketKeys(ctx, vc, cfg, claim); err != nil {
+			return r.bucketDeletionPending(claim, "DeletionStuck", "cleaning S3 keys in Vault failed; retrying", bucketRequeueDeletionStuck), false
+		}
+		return ctrl.Result{}, true
+	}
 	path := bucketVaultPath(claim)
 	if err := vc.DeleteKVMetadata(ctx, cfg.Spec.Storage.KvMountPath, path); err != nil {
 		r.event(claim, corev1.EventTypeWarning, "DeletionStuck", fmt.Sprintf("delete Vault path: %v", err))
 		return ctrl.Result{RequeueAfter: bucketRequeueDeletionStuck}, false
 	}
 	return ctrl.Result{}, true
+}
+
+func (r *S3BucketClaimReconciler) internalBucketHolder(ctx context.Context, claim *vaultv1alpha1.S3BucketClaim) (string, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	var claims vaultv1alpha1.S3BucketClaimList
+	if err := reader.List(ctx, &claims); err != nil {
+		return "", err
+	}
+	for i := range claims.Items {
+		other := &claims.Items[i]
+		if client.ObjectKeyFromObject(other) != client.ObjectKeyFromObject(claim) &&
+			other.DeletionTimestamp.IsZero() && bucketProviderName(other) == vaultv1alpha1.S3ProviderInternal &&
+			other.Status.BucketName == claim.Status.BucketName {
+			return client.ObjectKeyFromObject(other).String(), nil
+		}
+	}
+	return "", nil
+}
+
+func (r *S3BucketClaimReconciler) bucketDeletionPending(claim *vaultv1alpha1.S3BucketClaim, reason, message string, retry time.Duration) ctrl.Result {
+	setCondition(&claim.Status.Conditions, vaultv1alpha1.ConditionReady, metav1.ConditionFalse, claim.Generation, reason, message)
+	if reason != "BucketRemoving" {
+		r.event(claim, corev1.EventTypeWarning, reason, message)
+	}
+	return ctrl.Result{RequeueAfter: retry}
 }
 
 // clientForDeletion resolves a logged-in Vault client for Purge, best effort.

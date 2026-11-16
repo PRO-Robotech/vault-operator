@@ -136,6 +136,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		// The stored/used name is the server-assigned real name, not the requested one.
 		Expect(got.Status.BucketName).To(Equal(realName))
+		Expect(got.Status.BucketCreated).To(BeTrue())
 		Expect(got.Status.BucketStatus).To(Equal(cloudmanager.StatusRunning))
 		Expect(isConditionTrue(got.Status.Conditions, vaultv1alpha1.ConditionBucketRunning)).To(BeTrue())
 		Expect(isConditionTrue(got.Status.Conditions, vaultv1alpha1.ConditionKeysWritten)).To(BeTrue())
@@ -204,6 +205,7 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3adopt"}, got)).To(Succeed())
 		Expect(got.Status.Phase).To(Equal(vaultv1alpha1.PhaseReady))
 		Expect(got.Status.BucketName).To(Equal(realName))
+		Expect(got.Status.BucketCreated).To(BeFalse())
 	})
 
 	It("self-heals a claim whose status holds the requested (pre-fix) name", func() {
@@ -234,28 +236,59 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		Expect(buckets.Creates).To(Equal(0))
 	})
 
-	It("purges the bucket and Vault path on deletion", func() {
+	It("waits for REMOVED before removing only the claim's published S3 keys", func() {
+		const name = "s3purge"
+		const destination = "secret|clusters/s3purge/backup/s3"
 		makeHealthyVaultConfig(ctx, "s3-cfg-purge")
-		makeS3BucketClaim(ctx, "s3purge", "s3-cfg-purge", custName)
+		claim := makeS3BucketClaim(ctx, name, "s3-cfg-purge", custName)
 
-		_, err := reconcileBucketOnce(recon, "s3purge")
+		_, err := reconcileBucketOnce(recon, name)
 		Expect(err).NotTo(HaveOccurred())
-		_, err = reconcileBucketOnce(recon, "s3purge")
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		fakeSV.store[destination]["other"] = "preserve"
+		buckets.RemoveHook = func(context.Context, string) error { return nil }
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+
+		_, err = reconcileBucketOnce(recon, name)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(fakeSV.store["secret|clusters/s3purge/backup/s3"]).NotTo(BeNil())
-
-		got := &vaultv1alpha1.S3BucketClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3purge"}, got)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, got)).To(Succeed())
-
-		_, err = reconcileBucketOnce(recon, "s3purge")
-		Expect(err).NotTo(HaveOccurred())
-
 		Expect(buckets.Removes).To(Equal(1))
-		Expect(fakeSV.store["secret|clusters/s3purge/backup/s3"]).To(BeNil())
+		Expect(fakeSV.store[destination]["accessKey"]).NotTo(BeNil())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(findCond(claim.Status.Conditions, vaultv1alpha1.ConditionReady).Reason).To(Equal("BucketRemoving"))
 
-		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "s3purge"}, &vaultv1alpha1.S3BucketClaim{})
-		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		buckets.Seed(cloudmanager.Bucket{
+			Name: claim.Status.BucketName, CustLogin: custName, ManagedBy: cloudmanager.ManagedBySystem, Status: cloudmanager.StatusRemoved,
+		})
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fakeSV.store[destination]).To(Equal(map[string]any{"other": "preserve"}))
+		Expect(fakeSV.deletes).To(BeZero())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, claim))).To(BeTrue())
+	})
+
+	It("protects a bucket held by another claim even with purgeAdopted", func() {
+		const name = "s3shared"
+		const cfg = "s3-cfg-shared"
+		makeHealthyVaultConfig(ctx, cfg)
+		claim := newS3BucketClaim(name, cfg, custName)
+		claim.Spec.Bucket.PurgeAdopted = true
+		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
+		_, err := reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		holder := makeS3BucketClaim(ctx, "s3holder", cfg, custName)
+		holder.Status.BucketName = claim.Status.BucketName
+		Expect(k8sClient.Status().Update(ctx, holder)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+
+		_, err = reconcileBucketOnce(recon, name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
+		Expect(findCond(claim.Status.Conditions, vaultv1alpha1.ConditionReady).Reason).To(Equal("DeletionBlocked"))
+		Expect(buckets.Removes).To(BeZero())
+		Expect(fakeSV.store["secret|clusters/s3shared/backup/s3"]["accessKey"]).NotTo(BeNil())
 	})
 
 	It("records the real bucket name before credentials are available", func() {
@@ -313,7 +346,14 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		key := types.NamespacedName{Namespace: ns, Name: claim.Name}
 		_, err := reconcileBucketOnce(recon, claim.Name)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, claim)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
+		buckets.RemoveHook = func(context.Context, string) error { return nil }
+		_, err = reconcileBucketOnce(recon, claim.Name)
+		Expect(err).NotTo(HaveOccurred())
+		buckets.Seed(cloudmanager.Bucket{
+			Name: claim.Status.BucketName, CustLogin: custName, ManagedBy: cloudmanager.ManagedBySystem, Status: cloudmanager.StatusRemoved,
+		})
 
 		fakeSV.loginErr = errors.New("Vault unavailable")
 		result, err := reconcileBucketOnce(recon, claim.Name)
@@ -328,8 +368,8 @@ var _ = Describe("S3BucketClaim Controller", func() {
 		_, err = reconcileBucketOnce(recon, claim.Name)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(buckets.Removes).To(Equal(1))
-		Expect(fakeSV.deletes).To(Equal(1))
-		Expect(fakeSV.store["secret|clusters/s3purgeretry/backup/s3"]).To(BeNil())
+		Expect(fakeSV.deletes).To(BeZero())
+		Expect(fakeSV.store["secret|clusters/s3purgeretry/backup/s3"]).To(BeEmpty())
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, claim))).To(BeTrue())
 	})
 })
@@ -536,7 +576,11 @@ var _ = Describe("S3BucketClaim provider orchestration", func() {
 			name := "s3provider-" + strings.ToLower(policy)
 			path := "clusters/" + name + "/backup/s3"
 			makeHealthyVaultConfig(ctx, "s3-cfg-"+name)
-			claim := makeS3BucketClaim(ctx, name, "s3-cfg-"+name, "cust1")
+			recon.Providers[vaultv1alpha1.S3ProviderYandex] = provider
+			claim := newS3BucketClaim(name, "s3-cfg-"+name, "cust1")
+			claim.Spec.Bucket.Provider = vaultv1alpha1.S3ProviderYandex
+			claim.Spec.Bucket.ProviderConfigRef = testYandexProfile
+			Expect(k8sClient.Create(ctx, claim)).To(Succeed())
 			key := types.NamespacedName{Namespace: claim.Namespace, Name: name}
 			claim.Spec.DeletionPolicy = policy
 			controllerutil.AddFinalizer(claim, vaultv1alpha1.S3BucketClaimFinalizer)

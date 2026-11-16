@@ -45,7 +45,15 @@ func (p *Provider) Ensure(ctx context.Context, req bucketprovider.EnsureRequest)
 		}
 	}
 
-	bucket, name, err := p.resolve(ctx, req.CustomerLogin, req.ClusterName, result.BucketName)
+	var bucket *cloudmanager.Bucket
+	var name string
+	var err error
+	if result.Created {
+		name = result.BucketName
+		bucket, err = p.buckets.FindByCustomerBucket(ctx, req.CustomerLogin, name)
+	} else {
+		bucket, name, err = p.resolve(ctx, req.CustomerLogin, req.ClusterName, result.BucketName)
+	}
 	result.BucketName = name
 	switch {
 	case errors.Is(err, cloudmanager.ErrBucketNotFound):
@@ -115,6 +123,7 @@ func (p *Provider) create(ctx context.Context, req bucketprovider.EnsureRequest)
 	var result bucketprovider.EnsureResult
 	switch {
 	case err == nil:
+		result.Created = realName != ""
 		if realName == "" {
 			if bucket, findErr := p.buckets.FindByCustomerRequested(ctx, req.CustomerLogin, requestedName); findErr == nil {
 				realName = bucket.Name
@@ -185,29 +194,43 @@ func (p *Provider) resolve(ctx context.Context, customerLogin, clusterName, name
 }
 
 func (p *Provider) Delete(ctx context.Context, req bucketprovider.DeleteRequest) (bucketprovider.DeleteResult, error) {
-	bucket, name, err := p.resolve(ctx, req.CustomerLogin, req.ClusterName, req.BucketName)
-	result := bucketprovider.DeleteResult{BucketName: name}
-	switch {
-	case errors.Is(err, cloudmanager.ErrBucketNotFound):
-		result.Done = true
-	case err != nil:
-		result.WarningReason = "DeletionStuck"
-		result.Warning = fmt.Sprintf("find bucket for purge: %v", err)
-		result.RetryAfter = requeueTransient
-	case !ownedBy(bucket, req.CustomerLogin):
-		result.Done = true
-		result.WarningReason = "ForeignBucket"
-		result.Warning = fmt.Sprintf("refusing to remove bucket %q owned by %q", bucket.Name, bucket.CustLogin)
-	default:
-		if err := p.buckets.Remove(ctx, bucket.Name); err != nil {
-			result.WarningReason = "DeletionStuck"
-			result.Warning = fmt.Sprintf("remove bucket: %v", err)
-			result.RetryAfter = requeueTransient
-			return result, nil
-		}
-		result.Done = true
+	if req.BucketName == "" {
+		return bucketprovider.DeleteResult{Done: true}, nil
 	}
-	return result, nil
+	bucket, err := p.buckets.FindByCustomerBucket(ctx, req.CustomerLogin, req.BucketName)
+	if err != nil {
+		return deletionPending("DeletionStuck", fmt.Sprintf("find recorded bucket for purge: %v", err)), nil
+	}
+	managedBy := req.ManagedBy
+	if managedBy == "" {
+		managedBy = cloudmanager.ManagedBySystem
+	}
+	if bucket.Name != req.BucketName || bucket.CustLogin != req.CustomerLogin || bucket.ManagedBy != managedBy {
+		return deletionPending("DeletionBlocked", "recorded bucket does not match the claim's name, owner or management mode"), nil
+	}
+	if !req.PurgeAllowed {
+		return deletionPending("DeletionBlocked", "bucket creation is unproven; verify ownership and set spec.bucket.purgeAdopted or choose Retain"), nil
+	}
+
+	switch bucket.Status {
+	case cloudmanager.StatusRemoved:
+		return bucketprovider.DeleteResult{Done: true}, nil
+	case cloudmanager.StatusRemoving:
+	case cloudmanager.StatusRunning, cloudmanager.StatusStopped:
+		if err := p.buckets.Remove(ctx, req.BucketName); err != nil {
+			return deletionPending("DeletionStuck", fmt.Sprintf("remove bucket: %v", err)), nil
+		}
+	default:
+		return deletionPending("DeletionStuck", fmt.Sprintf("waiting for bucket in status %q", bucket.Status)), nil
+	}
+	return bucketprovider.DeleteResult{
+		RetryAfter: requeueCreating, WarningReason: "BucketRemoving",
+		Warning: "waiting for cloud-manager to report REMOVED",
+	}, nil
+}
+
+func deletionPending(reason, message string) bucketprovider.DeleteResult {
+	return bucketprovider.DeleteResult{RetryAfter: requeueTransient, WarningReason: reason, Warning: message}
 }
 
 func ownedBy(bucket *cloudmanager.Bucket, customerLogin string) bool {

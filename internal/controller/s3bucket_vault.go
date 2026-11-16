@@ -50,6 +50,37 @@ func bucketDestinationAllowed(destination string) bool {
 	return clean != "/providers" && !strings.HasPrefix(clean, "/providers/")
 }
 
+func bucketWrittenAt(cfg *vaultv1alpha1.VaultConfig, claim *vaultv1alpha1.S3BucketClaim) string {
+	return sha256Hex(string(cfg.UID), cfg.Spec.Address, cfg.Spec.Storage.KvMountPath, bucketVaultPath(claim))
+}
+
+func removeInternalBucketKeys(ctx context.Context, vc SecretVaultClient, cfg *vaultv1alpha1.VaultConfig, claim *vaultv1alpha1.S3BucketClaim) error {
+	if claim.Status.WrittenAt != bucketWrittenAt(cfg, claim) || claim.Status.KeysWrittenHash == "" {
+		return nil
+	}
+	kv, ok := vc.(bucketStateVault)
+	if !ok {
+		return errors.New("versioned KV is unsupported by the Vault client")
+	}
+	mount, destination := cfg.Spec.Storage.KvMountPath, bucketVaultPath(claim)
+	data, version, err := kv.ReadKVVersion(ctx, mount, destination)
+	if err != nil || version == 0 {
+		return err
+	}
+	name, _ := data["bucketName"].(string)
+	accessKey, _ := data["accessKey"].(string)
+	secretKey, _ := data["secretKey"].(string)
+	endpoint, _ := data["endpoint"].(string)
+	if name != claim.Status.BucketName || sha256Hex(accessKey, secretKey, name, endpoint) != claim.Status.KeysWrittenHash {
+		return nil
+	}
+	for _, key := range []string{"accessKey", "secretKey", "bucketName", "endpoint", "region", "s3ForcePathStyle", "cname"} {
+		delete(data, key)
+	}
+	// CAS сохраняет соседние ключи и не удаляет версии записи Vault.
+	return kv.WriteKVCAS(ctx, mount, destination, data, version)
+}
+
 type bucketVaultResolver func(context.Context) (SecretVaultClient, *vaultv1alpha1.VaultConfig, bool)
 
 func bucketVault(claim *vaultv1alpha1.S3BucketClaim, resolve bucketVaultResolver) bucketprovider.ClaimContext {

@@ -63,6 +63,21 @@ func (f *fakeSecretVaultClient) WriteKV(_ context.Context, mount, path string, d
 	return nil
 }
 
+func (f *fakeSecretVaultClient) ReadKVVersion(ctx context.Context, mount, path string) (map[string]any, int, error) {
+	data, found, err := f.ReadKV(ctx, mount, path)
+	if !found {
+		return data, 0, err
+	}
+	return data, 1, err
+}
+
+func (f *fakeSecretVaultClient) WriteKVCAS(ctx context.Context, mount, path string, data map[string]any, version int) error {
+	if version != 1 {
+		return errors.New("unexpected KV version")
+	}
+	return f.WriteKV(ctx, mount, path, data)
+}
+
 func (f *fakeSecretVaultClient) KVMetadataExists(_ context.Context, mount, path string) (bool, error) {
 	_, ok := f.store[mount+"|"+path]
 	return ok, nil

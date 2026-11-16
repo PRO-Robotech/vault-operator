@@ -42,7 +42,7 @@ func TestEnsureUsesCloudManagerDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.BucketName != realName || result.Provisioned.Reason != "Created" || result.Running.State != bucketprovider.Succeeded {
+	if result.BucketName != realName || !result.Created || result.Provisioned.Reason != "Created" || result.Running.State != bucketprovider.Succeeded {
 		t.Fatalf("unexpected bucket observations: %q, %+v, %+v", result.BucketName, result.Provisioned, result.Running)
 	}
 	want := bucketprovider.Connection{
@@ -128,22 +128,34 @@ func TestDeleteOutcomes(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		login     string
+		managedBy string
+		status    string
+		allowed   bool
 		findErr   error
 		removeErr error
 		done      bool
 		reason    string
 		removes   int
 	}{
-		{name: "missing", findErr: cloudmanager.ErrBucketNotFound, done: true},
+		{name: "missing", findErr: cloudmanager.ErrBucketNotFound, reason: "DeletionStuck"},
 		{name: "lookup failure", findErr: errors.New("lookup unavailable"), reason: "DeletionStuck"},
-		{name: "foreign", login: "other", done: true, reason: "ForeignBucket"},
-		{name: "remove failure", login: "user", removeErr: errors.New("remove unavailable"), reason: "DeletionStuck", removes: 1},
-		{name: "removed", login: "user", done: true, removes: 1},
+		{name: "foreign", login: "other", managedBy: "SYSTEM", allowed: true, reason: "DeletionBlocked"},
+		{name: "empty owner", managedBy: "SYSTEM", allowed: true, reason: "DeletionBlocked"},
+		{name: "other management mode", login: "user", managedBy: "CUSTOMER", allowed: true, reason: "DeletionBlocked"},
+		{name: "unproven ownership", login: "user", managedBy: "SYSTEM", status: "RUNNING", reason: "DeletionBlocked"},
+		{name: "remove failure", login: "user", managedBy: "SYSTEM", status: "RUNNING", allowed: true,
+			removeErr: errors.New("remove unavailable"), reason: "DeletionStuck", removes: 1},
+		{name: "removal requested", login: "user", managedBy: "SYSTEM", status: "RUNNING", allowed: true, reason: "BucketRemoving", removes: 1},
+		{name: "removing", login: "user", managedBy: "SYSTEM", status: "REMOVING", allowed: true, reason: "BucketRemoving"},
+		{name: "removed", login: "user", managedBy: "SYSTEM", status: "REMOVED", allowed: true, done: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			api := cloudmanager.NewFakeBucketAPI()
-			api.FindHook = func(context.Context, string, string) (*cloudmanager.Bucket, error) {
-				return &cloudmanager.Bucket{Name: realName, CustLogin: tt.login}, tt.findErr
+			api.FindHook = func(_ context.Context, _ string, name string) (*cloudmanager.Bucket, error) {
+				if name != realName {
+					t.Fatalf("looked up %q, want %q", name, realName)
+				}
+				return &cloudmanager.Bucket{Name: realName, CustLogin: tt.login, ManagedBy: tt.managedBy, Status: tt.status}, tt.findErr
 			}
 			api.RemoveHook = func(_ context.Context, name string) error {
 				if name != realName {
@@ -152,16 +164,13 @@ func TestDeleteOutcomes(t *testing.T) {
 				return tt.removeErr
 			}
 			result, err := New(api, "s3_default").Delete(t.Context(), bucketprovider.DeleteRequest{
-				BucketName: realName, CustomerLogin: "user", ClusterName: "cluster",
+				BucketName: realName, CustomerLogin: "user", ClusterName: "cluster", PurgeAllowed: tt.allowed,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			var retry time.Duration
-			if !tt.done {
-				retry = time.Minute
-			}
-			if result.Done != tt.done || result.WarningReason != tt.reason || result.RetryAfter != retry || api.Removes != tt.removes {
+			if result.Done != tt.done || result.WarningReason != tt.reason ||
+				(result.RetryAfter > 0) == tt.done || api.Removes != tt.removes {
 				t.Fatalf("unexpected deletion outcome: %+v, removes %d", result, api.Removes)
 			}
 		})
