@@ -82,7 +82,7 @@ type testCloud struct {
 	keys           []*keypb.AccessKey
 	createCalls    int
 	keyCalls       int
-	policyCalls    int
+	aclCalls       int
 	lostCreate     bool
 	emptyAttempts  int
 	calls          []cloudCall
@@ -110,13 +110,14 @@ func (c *testCloud) createBucket(_ context.Context, folder, name, uid, key strin
 	return nil
 }
 
-func (c *testCloud) setPolicy(_ context.Context, name string, policy *structpb.Struct) error {
-	c.calls = append(c.calls, cloudCall{"SetPolicy", name})
-	c.policyCalls++
+func (c *testCloud) setAgentACL(_ context.Context, name string, acl *storagepb.ACL) error {
+	c.calls = append(c.calls, cloudCall{"SetAgentACL", name})
+	c.aclCalls++
 	if c.buckets[name] == nil {
 		return errors.New("bucket not found")
 	}
-	c.buckets[name].Policy = policy
+	c.buckets[name].Acl = acl
+	c.buckets[name].AnonymousAccessFlags = privateAccessFlags()
 	return nil
 }
 
@@ -234,8 +235,46 @@ func TestEnsureRecoversLostBucketResponseAndInterruptedKey(t *testing.T) {
 		api.keyCalls != 2 || len(vault.state) != 1 || field(vault.state[journalKey].values, "keyAttempt") != "" {
 		t.Fatal("expected to verify and keep the published key with only the provisioning journal")
 	}
-	if api.policyCalls != 1 {
-		t.Fatalf("policy updates = %d, want 1 across reconciles", api.policyCalls)
+	if api.aclCalls != 1 {
+		t.Fatalf("ACL updates = %d, want 1 across reconciles", api.aclCalls)
+	}
+}
+
+func TestEnsurePreservesProvisionerPolicyAndExistingGrants(t *testing.T) {
+	provider, claim, _, api := existingBucketFixture()
+	bucket := api.buckets[existingBucket]
+	policy, err := structpb.NewStruct(map[string]any{
+		"Version": "2012-10-17",
+		"Statement": []any{map[string]any{
+			"Effect": "Allow", "Principal": map[string]any{"CanonicalUser": "provisioner"},
+			"Action": "s3:ListBucket", "Resource": "arn:aws:s3:::" + existingBucket,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket.Policy = policy
+	observerGrant := &storagepb.ACL_Grant{
+		GranteeId: "observer", GrantType: storagepb.ACL_Grant_GRANT_TYPE_ACCOUNT, Permission: storagepb.ACL_Grant_PERMISSION_READ,
+	}
+	bucket.Acl = &storagepb.ACL{Grants: []*storagepb.ACL_Grant{observerGrant}}
+
+	req := bucketprovider.EnsureRequest{Claim: claim, BucketName: existingBucket}
+	for range 2 {
+		result, err := provider.Ensure(t.Context(), req)
+		if err != nil || result.Running.State != bucketprovider.Succeeded || result.Connection == nil ||
+			result.Connection.AccessKey != "existing-access" {
+			t.Fatal("expected to verify the existing bucket using its published key")
+		}
+	}
+	if bucket.Policy != policy || api.aclCalls != 1 || api.keyCalls != 0 || api.createCalls != 0 {
+		t.Fatal("expected one ACL update while keeping the bucket policy, bucket and access key")
+	}
+	grants := bucket.GetAcl().GetGrants()
+	if len(grants) != 3 || grants[0] != observerGrant ||
+		grants[1].GetGranteeId() != api.account.GetId() || grants[1].GetPermission() != storagepb.ACL_Grant_PERMISSION_READ ||
+		grants[2].GetGranteeId() != api.account.GetId() || grants[2].GetPermission() != storagepb.ACL_Grant_PERMISSION_WRITE {
+		t.Fatal("expected to keep the existing grant and add read and write for the backup agent")
 	}
 }
 

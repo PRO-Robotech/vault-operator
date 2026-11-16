@@ -49,7 +49,7 @@ func assertBucketCalls(t *testing.T, api *testCloud, name string) {
 	t.Helper()
 	for _, call := range api.calls {
 		switch call.operation {
-		case "GetBucket", "CreateBucket", "SetPolicy", "HeadBucket", "EmptyBucket", "DeleteBucket":
+		case "GetBucket", "CreateBucket", "SetAgentACL", "HeadBucket", "EmptyBucket", "DeleteBucket":
 			if call.name != name {
 				t.Fatalf("%s addressed %q, want %q", call.operation, call.name, name)
 			}

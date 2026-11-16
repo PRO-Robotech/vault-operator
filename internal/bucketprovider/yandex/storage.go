@@ -14,37 +14,35 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	storagepb "github.com/yandex-cloud/go-genproto/yandex/cloud/storage/v1"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func agentPolicy(bucketName, accountID string) (*structpb.Struct, error) {
-	resource := "arn:aws:s3:::" + bucketName
-	principal := map[string]any{"CanonicalUser": accountID}
-	allow := func(resource string, actions ...any) map[string]any {
-		return map[string]any{"Effect": "Allow", "Principal": principal, "Action": actions, "Resource": resource}
-	}
-	policy, err := structpb.NewStruct(map[string]any{
-		"Version": "2012-10-17",
-		"Statement": []any{
-			allow(resource, "s3:ListBucket", "s3:GetBucketLocation", "s3:ListBucketMultipartUploads"),
-			allow(resource+"/*", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"),
-		},
-	})
-	if err != nil {
-		return nil, errors.New("unable to encode Yandex bucket policy")
-	}
-	return policy, nil
-}
-
-func matchesPolicy(b *storagepb.Bucket, want *structpb.Struct) bool {
+func agentACL(b *storagepb.Bucket, accountID string) (*storagepb.ACL, bool) {
+	grants := b.GetAcl().GetGrants()
+	acl := &storagepb.ACL{Grants: slices.Clone(grants)}
 	flags := b.GetAnonymousAccessFlags()
-	return proto.Equal(b.GetPolicy(), want) &&
-		!flags.GetRead().GetValue() && !flags.GetList().GetValue() && !flags.GetConfigRead().GetValue()
+	changed := flags.GetRead().GetValue() || flags.GetList().GetValue() || flags.GetConfigRead().GetValue()
+	for _, permission := range []storagepb.ACL_Grant_Permission{
+		storagepb.ACL_Grant_PERMISSION_READ,
+		storagepb.ACL_Grant_PERMISSION_WRITE,
+	} {
+		if slices.ContainsFunc(grants, func(grant *storagepb.ACL_Grant) bool {
+			return grant.GetGrantType() == storagepb.ACL_Grant_GRANT_TYPE_ACCOUNT &&
+				grant.GetGranteeId() == accountID &&
+				(grant.GetPermission() == permission || grant.GetPermission() == storagepb.ACL_Grant_PERMISSION_FULL_CONTROL)
+		}) {
+			continue
+		}
+		acl.Grants = append(acl.Grants, &storagepb.ACL_Grant{
+			GrantType: storagepb.ACL_Grant_GRANT_TYPE_ACCOUNT, GranteeId: accountID, Permission: permission,
+		})
+		changed = true
+	}
+	return acl, changed
 }
 
 type iamStorageHTTP struct {
